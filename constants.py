@@ -24,6 +24,19 @@ MAX_RETRIES = 1
 # ── LLM ───────────────────────────────────────────────────────────────────────
 OLLAMA_URL = "http://localhost:11434"
 OLLAMA_MODEL = "qwen3:4b"
+OLLAMA_FAST_MODEL_CANDIDATES = [
+    "qwen2.5:0.5b",
+    "qwen2.5:1.5b",
+    "qwen3:1.7b",
+    "qwen3:4b",
+]
+OLLAMA_HEAVY_MODEL_CANDIDATES = [
+    "qwen3:8b",
+    "qwen3:4b",
+    "qwen3:1.7b",
+    "qwen2.5:1.5b",
+    "qwen2.5:0.5b",
+]
 
 # Backward-compatible aliases
 MODEL_NAME = OLLAMA_MODEL
