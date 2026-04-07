@@ -1,0 +1,252 @@
+{
+  "timestamp": "2026-04-08T04:06:57.279614",
+  "total": 20,
+  "successes": 1,
+  "success_rate": 5.0,
+  "format_failure_rate": 95.0,
+  "avg_elapsed_seconds": 122.8,
+  "by_category": {
+    "easy": {
+      "total": 5,
+      "successes": 1,
+      "rate": 20.0
+    },
+    "medium": {
+      "total": 5,
+      "successes": 0,
+      "rate": 0.0
+    },
+    "router_stress": {
+      "total": 5,
+      "successes": 0,
+      "rate": 0.0
+    },
+    "messy": {
+      "total": 5,
+      "successes": 0,
+      "rate": 0.0
+    }
+  },
+  "results": [
+    {
+      "prompt": "List all files in the workspace folder",
+      "category": "easy",
+      "expected_path": "llm_task",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Take a screenshot",
+      "category": "easy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "What apps are currently running on my computer?",
+      "category": "easy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Open Notepad",
+      "category": "easy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Mute the audio",
+      "category": "easy",
+      "expected_path": "os_action",
+      "success": true,
+      "elapsed_seconds": 56.4,
+      "format_failure": false,
+      "final_output": "[VOCO] OK Task complete in 56.4s. Steps: 1/1. Result: Toggled system mute (initial state inferred).",
+      "steps_executed": 1,
+      "error_count": 0
+    },
+    {
+      "prompt": "Open Chrome and go to YouTube",
+      "category": "medium",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.2,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.2s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Search for 'MKBHD latest video' on YouTube and click the first result",
+      "category": "medium",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Open Notepad, type 'Hello from VOCO', and take a screenshot",
+      "category": "medium",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Search Google for 'Python tutorials 2026' and show me the first 5 results",
+      "category": "medium",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Create a file called test.txt in the workspace with the content 'VOCO test'",
+      "category": "medium",
+      "expected_path": "llm_task",
+      "success": false,
+      "elapsed_seconds": 126.2,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.2s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Open config.py and tell me the model name",
+      "category": "router_stress",
+      "expected_path": "llm_task",
+      "success": false,
+      "elapsed_seconds": 126.1,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.1s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Open the browser and also check my workspace files",
+      "category": "router_stress",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.4,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.3s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Show me what's in my workspace and also search YouTube for coding tutorials",
+      "category": "router_stress",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.4,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.4s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Find all Python files in workspace",
+      "category": "router_stress",
+      "expected_path": "llm_task",
+      "success": false,
+      "elapsed_seconds": 126.4,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.4s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "Run the main.py file",
+      "category": "router_stress",
+      "expected_path": "llm_task",
+      "success": false,
+      "elapsed_seconds": 126.4,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.4s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "opn chrome and serch for mkbhd",
+      "category": "messy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.3,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.3s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "check the latst vid of mkbhd on youtube",
+      "category": "messy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.4,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.3s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "open files and browser and also like maybe search something",
+      "category": "messy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.2,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.2s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "set volume",
+      "category": "messy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.5,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.5s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    },
+    {
+      "prompt": "i need to see youtube",
+      "category": "messy",
+      "expected_path": "os_action",
+      "success": false,
+      "elapsed_seconds": 126.7,
+      "format_failure": true,
+      "final_output": "[VOCO] FAIL Task complete in 126.7s. Steps: 0/1. Result: Task cannot be completed: retry failed: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)",
+      "steps_executed": 1,
+      "error_count": 2
+    }
+  ]
+}
