@@ -8,12 +8,16 @@ from constants import (
     OLLAMA_FAST_MODEL_CANDIDATES,
     OLLAMA_HEAVY_MODEL_CANDIDATES,
     OLLAMA_MODEL,
+    OLLAMA_NUM_CTX_COMPLEX,
+    OLLAMA_NUM_CTX_MIN,
+    OLLAMA_NUM_CTX_SIMPLE,
     OLLAMA_URL,
 )
 
 
 OLLAMA_CHAT_URL = f"{OLLAMA_URL}/api/chat"
 _last_model_used = OLLAMA_MODEL
+_last_num_ctx_used = OLLAMA_NUM_CTX_SIMPLE
 
 
 def _failure_plan(reason: str, failure_reason: str = "connection error") -> str:
@@ -59,6 +63,22 @@ def _is_complex_task(user_message: str) -> bool:
         " find ",
     ]
     return len(text.split()) > 12 or any(token in text for token in indicators)
+
+
+def _initial_num_ctx(user_message: str) -> int:
+    """Choose initial context window by task complexity."""
+    return OLLAMA_NUM_CTX_COMPLEX if _is_complex_task(user_message) else OLLAMA_NUM_CTX_SIMPLE
+
+
+def _ctx_fallback_chain(initial_ctx: int) -> list[int]:
+    """Return a descending list of context sizes to fit lower-memory devices."""
+    chain = [initial_ctx]
+    for ctx in [4096, 3072, 2048, 1536, 1024]:
+        if ctx < initial_ctx and ctx >= OLLAMA_NUM_CTX_MIN and ctx not in chain:
+            chain.append(ctx)
+    if OLLAMA_NUM_CTX_MIN not in chain:
+        chain.append(OLLAMA_NUM_CTX_MIN)
+    return chain
 
 
 def _candidate_chain(complex_task: bool) -> list[str]:
@@ -108,7 +128,7 @@ def _extract_http_error_detail(response: requests.Response | None) -> str:
         return text[:240] if text else "No error detail"
 
 
-def _post_chat(messages: list[dict], model_name: str, temperature: float) -> requests.Response:
+def _post_chat(messages: list[dict], model_name: str, temperature: float, num_ctx: int) -> requests.Response:
     payload = {
         "model": model_name,
         "messages": messages,
@@ -117,7 +137,7 @@ def _post_chat(messages: list[dict], model_name: str, temperature: float) -> req
             "temperature": temperature,
             "top_p": 0.9,
             "repeat_penalty": 1.1,
-            "num_ctx": 8192,
+            "num_ctx": num_ctx,
         },
     }
     return requests.post(OLLAMA_CHAT_URL, json=payload, timeout=60)
@@ -125,34 +145,70 @@ def _post_chat(messages: list[dict], model_name: str, temperature: float) -> req
 
 def _generate_internal(messages: list[dict], user_message: str, temperature: float) -> str:
     """Shared model request path with automatic model fallback."""
-    global _last_model_used
+    global _last_model_used, _last_num_ctx_used
     available_models = _fetch_available_models()
     selected_model = _select_model(user_message, available_models)
     _last_model_used = selected_model
+    initial_ctx = _initial_num_ctx(user_message)
+    primary_ctx_chain = _ctx_fallback_chain(initial_ctx)
+    last_http_detail = ""
 
-    try:
-        response = _post_chat(messages=messages, model_name=selected_model, temperature=temperature)
-        response.raise_for_status()
-        return response.json()["message"]["content"]
-    except requests.exceptions.ConnectionError:
-        return _failure_plan("LLM connection failed (Ollama unreachable).")
-    except requests.exceptions.Timeout:
-        return _failure_plan("LLM request timed out after 60s.")
-    except requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "unknown"
-        detail = _extract_http_error_detail(exc.response)
-        if status == 500 and "requires more system memory" in detail.lower():
-            for fallback_model in _fallback_models(selected_model, user_message, available_models):
-                try:
-                    response = _post_chat(messages=messages, model_name=fallback_model, temperature=temperature)
-                    response.raise_for_status()
-                    _last_model_used = fallback_model
-                    return response.json()["message"]["content"]
-                except Exception:
+    for ctx in primary_ctx_chain:
+        try:
+            response = _post_chat(
+                messages=messages,
+                model_name=selected_model,
+                temperature=temperature,
+                num_ctx=ctx,
+            )
+            response.raise_for_status()
+            _last_num_ctx_used = ctx
+            return response.json()["message"]["content"]
+        except requests.exceptions.ConnectionError:
+            return _failure_plan("LLM connection failed (Ollama unreachable).")
+        except requests.exceptions.Timeout:
+            return _failure_plan("LLM request timed out after 60s.")
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            detail = _extract_http_error_detail(exc.response)
+            last_http_detail = f"LLM server returned HTTP {status}: {detail}"
+            if status == 500 and "requires more system memory" in detail.lower():
+                # keep trying with smaller context for same model
+                continue
+            return _failure_plan(last_http_detail)
+        except Exception as exc:
+            return _failure_plan(f"LLM unexpected error: {exc}")
+
+    # If primary model still fails under lowest context, try alternate installed models.
+    for fallback_model in _fallback_models(selected_model, user_message, available_models):
+        for ctx in primary_ctx_chain:
+            try:
+                response = _post_chat(
+                    messages=messages,
+                    model_name=fallback_model,
+                    temperature=temperature,
+                    num_ctx=ctx,
+                )
+                response.raise_for_status()
+                _last_model_used = fallback_model
+                _last_num_ctx_used = ctx
+                return response.json()["message"]["content"]
+            except requests.exceptions.Timeout:
+                last_http_detail = "LLM request timed out after 60s."
+                break
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else "unknown"
+                detail = _extract_http_error_detail(exc.response)
+                last_http_detail = f"LLM server returned HTTP {status}: {detail}"
+                if status == 500 and "requires more system memory" in detail.lower():
                     continue
-        return _failure_plan(f"LLM server returned HTTP {status}: {detail}")
-    except Exception as exc:
-        return _failure_plan(f"LLM unexpected error: {exc}")
+                break
+            except Exception:
+                break
+
+    if last_http_detail:
+        return _failure_plan(last_http_detail)
+    return _failure_plan("LLM request failed after adaptive model/context fallback.")
 
 
 def generate(system_prompt: str, user_message: str, temperature: float = 0.1) -> str:
@@ -200,3 +256,8 @@ def check_ollama_running() -> bool:
 def get_last_model_used() -> str:
     """Return the model name used by the latest generate/generate_with_history call."""
     return _last_model_used
+
+
+def get_last_num_ctx_used() -> int:
+    """Return the num_ctx value used by the latest generate/generate_with_history call."""
+    return _last_num_ctx_used

@@ -19,7 +19,13 @@ from constants import (
     OLLAMA_MODEL,
 )
 from context import AgentContext
-from llm import check_ollama_running, generate, generate_with_history, get_last_model_used
+from llm import (
+    check_ollama_running,
+    generate,
+    generate_with_history,
+    get_last_model_used,
+    get_last_num_ctx_used,
+)
 from memory import append_event
 from tools import TOOL_REGISTRY, dispatch_tool
 from _prompt import build_correction_prompt, build_system_prompt, parse_response
@@ -45,6 +51,29 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
     format_failures = 0
     retries = 0
     raw_response = ""
+
+    direct_response = _build_local_direct_response(task)
+    if direct_response is not None:
+        context.router_decision = "local_direct"
+        context.router_confidence = 1.0
+        emit("[VOCO] Using local direct response path.", "info")
+        elapsed = round(time.time() - start_time, 1)
+        summary = f"[VOCO] OK {direct_response}"
+        emit(summary, "success")
+        _log_execution(
+            task=task,
+            success=True,
+            steps_completed=0,
+            format_failures=0,
+            retries=0,
+            final_output=direct_response,
+            error=None,
+            elapsed_seconds=elapsed,
+            router_decision=context.router_decision,
+            router_confidence=context.router_confidence,
+            model_used="local-direct",
+        )
+        return summary
 
     local_plan = _build_local_fastpath_plan(task)
     if local_plan is not None:
@@ -82,7 +111,7 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
         emit("[VOCO] Generating action plan...", "info")
         raw_response = generate(system_prompt=system_prompt, user_message=task)
         model_used = get_last_model_used()
-        emit(f"[VOCO] Model selected: {model_used}", "info")
+        emit(f"[VOCO] Model selected: {model_used} (num_ctx={get_last_num_ctx_used()})", "info")
         status, plan = parse_response(raw_response)
 
         if status == "format_failure":
@@ -96,6 +125,7 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
             corrected_response = generate_with_history(system_prompt, correction_messages)
             retries += 1
             model_used = get_last_model_used()
+            emit(f"[VOCO] Correction model: {model_used} (num_ctx={get_last_num_ctx_used()})", "info")
             status, plan = parse_response(corrected_response)
             _log_format_failure(
                 task=task,
@@ -340,5 +370,28 @@ def _build_local_fastpath_plan(task: str) -> list[dict] | None:
                 "reason": "Direct local command for listing active windows.",
             }
         ]
+
+    return None
+
+
+def _build_local_direct_response(task: str) -> str | None:
+    """Return a direct non-LLM response for pure greeting/ack messages."""
+    text = task.lower().strip()
+    greetings = {
+        "hi",
+        "hello",
+        "hey",
+        "hii",
+        "hiii",
+        "hi voco",
+        "hello voco",
+        "hey voco",
+    }
+    if text in greetings:
+        return "Hi! I am ready. Tell me what task to execute."
+
+    acknowledgements = {"thanks", "thank you", "thx"}
+    if text in acknowledgements:
+        return "You are welcome. Tell me the next task."
 
     return None
