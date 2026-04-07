@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -340,10 +341,10 @@ class VocoApp(App):
 
         self._handle_user_input(command)
 
-    def _update_output(self, formatted: str) -> None:
+    def _update_output(self, message: str, style: str) -> None:
         """Write a formatted status line to the output panel."""
         chat_log = self._activate_conversation()
-        chat_log.write(formatted)
+        chat_log.write(Text(message, style=style))
 
     def _emit_to_ui(self, message: str, level: str = "info") -> None:
         """
@@ -356,8 +357,8 @@ class VocoApp(App):
             "error": "red",
         }
         color = color_map.get(level, "white")
-        formatted = f"[{color}]{message}[/{color}]"
-        self.call_from_thread(self._update_output, formatted)
+        safe_message = escape(message).replace("\r", "").strip()
+        self.call_from_thread(self._update_output, safe_message, color)
 
     def _handle_user_input(self, task: str) -> None:
         """Run orchestrator task in a background thread to keep the TUI responsive."""

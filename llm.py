@@ -1,11 +1,37 @@
 """Ollama client for VOCO JSON action-plan generation."""
 
+import json
+
 import requests
 
 from constants import OLLAMA_MODEL, OLLAMA_URL
 
 
 OLLAMA_CHAT_URL = f"{OLLAMA_URL}/api/chat"
+
+
+def _failure_plan(reason: str, failure_reason: str = "connection error") -> str:
+    """Return a one-step report_failure plan JSON."""
+    plan = [{"tool": "report_failure", "args": {"reason": reason}, "reason": failure_reason}]
+    return json.dumps(plan, ensure_ascii=False)
+
+
+def _extract_http_error_detail(response: requests.Response | None) -> str:
+    """Extract a short human-readable error detail from an HTTP response."""
+    if response is None:
+        return "No response body"
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            if payload.get("error"):
+                return str(payload["error"])
+            if payload.get("message"):
+                return str(payload["message"])
+            return json.dumps(payload, ensure_ascii=False)[:240]
+        return str(payload)[:240]
+    except ValueError:
+        text = response.text.strip()
+        return text[:240] if text else "No error detail"
 
 
 def generate(system_prompt: str, user_message: str, temperature: float = 0.1) -> str:
@@ -34,15 +60,15 @@ def generate(system_prompt: str, user_message: str, temperature: float = 0.1) ->
         data = response.json()
         return data["message"]["content"]
     except requests.exceptions.ConnectionError:
-        return "[]"
+        return _failure_plan("LLM connection failed (Ollama unreachable).")
     except requests.exceptions.Timeout:
-        return "[]"
+        return _failure_plan("LLM request timed out after 60s.")
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        detail = _extract_http_error_detail(exc.response)
+        return _failure_plan(f"LLM server returned HTTP {status}: {detail}")
     except Exception as exc:
-        return (
-            "[{\"tool\": \"report_failure\", "
-            f"\"args\": {{\"reason\": \"LLM error: {exc}\"}}, "
-            "\"reason\": \"connection error\"}]"
-        )
+        return _failure_plan(f"LLM unexpected error: {exc}")
 
 
 def generate_with_history(system_prompt: str, messages: list, temperature: float = 0.05) -> str:
@@ -66,12 +92,16 @@ def generate_with_history(system_prompt: str, messages: list, temperature: float
         response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=60)
         response.raise_for_status()
         return response.json()["message"]["content"]
+    except requests.exceptions.ConnectionError:
+        return _failure_plan("Retry failed: LLM connection failed.", "retry error")
+    except requests.exceptions.Timeout:
+        return _failure_plan("Retry failed: LLM request timed out after 60s.", "retry error")
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        detail = _extract_http_error_detail(exc.response)
+        return _failure_plan(f"Retry failed: LLM HTTP {status}: {detail}", "retry error")
     except Exception as exc:
-        return (
-            "[{\"tool\": \"report_failure\", "
-            f"\"args\": {{\"reason\": \"retry failed: {exc}\"}}, "
-            "\"reason\": \"retry error\"}]"
-        )
+        return _failure_plan(f"Retry failed: unexpected LLM error: {exc}", "retry error")
 
 
 def check_ollama_running() -> bool:
