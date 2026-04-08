@@ -1,5 +1,9 @@
 # VOCO - Local Windows Automation Agent
 
+<p align="center">
+  <img src="assets/voco-logo.png" alt="VOCO logo" width="260" />
+</p>
+
 ![Python](https://img.shields.io/badge/Python-3.13-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011-0078D6?logo=windows)
 ![Runtime](https://img.shields.io/badge/LLM-Ollama-black?logo=ollama)
@@ -124,7 +128,8 @@ Sem4-AIOT/
 │       ├── CONTEXT.md
 │       └── failures.jsonl
 └── assets/
-    └── ui-screenshot.png
+    ├── ui-screenshot.png
+    └── voco-logo.png
 ```
 
 ---
