@@ -415,7 +415,147 @@ def _build_local_fastpath_plan(task: str) -> list[dict] | None:
             }
         ]
 
+    app_name = _extract_core_app_name(text)
+    if app_name is not None:
+        return [
+            {
+                "tool": "open_app",
+                "args": {"app_name": app_name},
+                "reason": "Direct local command for opening a core demo application.",
+            }
+        ]
+
+    browser_plan = _build_browser_fastpath_plan(task=task, text=text)
+    if browser_plan is not None:
+        return browser_plan
+
+    file_plan = _build_file_generation_fastpath_plan(task=task, text=text)
+    if file_plan is not None:
+        return file_plan
+
     return None
+
+
+def _extract_core_app_name(text: str) -> str | None:
+    app_patterns = [
+        (r"\bopen\s+notepad\b", "notepad"),
+        (r"\bopen\s+calculator\b|\bopen\s+calc\b", "calculator"),
+        (r"\bopen\s+file\s+explorer\b|\bopen\s+explorer\b", "explorer"),
+        (r"\bopen\s+settings\b", "settings"),
+    ]
+    for pattern, app_name in app_patterns:
+        if re.search(pattern, text):
+            return app_name
+    return None
+
+
+def _build_browser_fastpath_plan(task: str, text: str) -> list[dict] | None:
+    browser_tokens = [
+        "open browser",
+        "open chrome",
+        "open edge",
+        "open firefox",
+        "open google",
+        "open youtube",
+        "go to ",
+    ]
+    if not any(token in text for token in browser_tokens):
+        return None
+
+    url = _extract_browser_url(task=task, text=text)
+    if url is None:
+        url = "https://www.google.com"
+
+    return [
+        {
+            "tool": "run_shell_command",
+            "args": {"command": f'Start-Process "{url}"'},
+            "reason": "Direct local command to open a URL in the default browser.",
+        }
+    ]
+
+
+def _extract_browser_url(task: str, text: str) -> str | None:
+    explicit_match = re.search(r"(https?://[^\s\"']+)", task, flags=re.IGNORECASE)
+    if explicit_match:
+        return explicit_match.group(1)
+
+    go_to_match = re.search(
+        r"\bgo to\s+([a-z0-9\-\.]+\.[a-z]{2,}(?:/[^\s]*)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if go_to_match:
+        return f"https://{go_to_match.group(1)}"
+
+    if "youtube" in text:
+        return "https://www.youtube.com"
+    if "google" in text:
+        return "https://www.google.com"
+    return None
+
+
+def _build_file_generation_fastpath_plan(task: str, text: str) -> list[dict] | None:
+    write_tokens = ["write", "create", "generate", "make"]
+    if not any(token in text for token in write_tokens):
+        return None
+    if ".py" not in text and "python file" not in text and "python script" not in text:
+        return None
+
+    filename = _extract_python_filename(task=task, text=text)
+    if filename is None:
+        filename = "generated_script.py"
+    content = _build_python_template_content(text=text)
+
+    return [
+        {
+            "tool": "write_file",
+            "args": {"path": filename, "content": content},
+            "reason": "Direct local command to create a demo Python file in workspace.",
+        }
+    ]
+
+
+def _extract_python_filename(task: str, text: str) -> str | None:
+    file_match = re.search(r"([a-zA-Z0-9_\-]+\.py)\b", task)
+    if file_match:
+        return file_match.group(1)
+
+    named_match = re.search(r"\bnamed\s+([a-z0-9_\-]+)\b", text)
+    if named_match:
+        return f"{named_match.group(1)}.py"
+
+    if "odd" in text and "even" in text:
+        return "odd_even_checker.py"
+    return None
+
+
+def _build_python_template_content(text: str) -> str:
+    if "odd" in text and "even" in text:
+        return (
+            "def is_even(number: int) -> bool:\n"
+            "    return number % 2 == 0\n\n"
+            "def main() -> None:\n"
+            "    raw_value = input(\"Enter an integer: \").strip()\n"
+            "    try:\n"
+            "        number = int(raw_value)\n"
+            "    except ValueError:\n"
+            "        print(\"Please enter a valid integer.\")\n"
+            "        return\n\n"
+            "    if is_even(number):\n"
+            "        print(f\"{number} is even.\")\n"
+            "    else:\n"
+            "        print(f\"{number} is odd.\")\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    main()\n"
+        )
+
+    return (
+        "def main() -> None:\n"
+        "    print(\"TODO: implement this script\")\n\n"
+        "if __name__ == \"__main__\":\n"
+        "    main()\n"
+    )
 
 
 def _is_conversational_prompt(task: str) -> bool:

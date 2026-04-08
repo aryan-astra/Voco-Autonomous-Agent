@@ -7,6 +7,8 @@ import re
 import yaml
 
 from constants import (
+    DEMO_INCLUDE_HISTORY_CONTEXT,
+    DEMO_INCLUDE_PROFILE_CONTEXT,
     HISTORY_BUDGET,
     HISTORY_FILE,
     SYSTEM_PROMPT_BUDGET,
@@ -22,9 +24,21 @@ def build_system_prompt(context: AgentContext) -> str:
     The model must output only a JSON array of action steps.
     """
     _ = context
-    user_profile_text = _load_user_profile()
-    history_text = _load_recent_history(max_events=10)
     tool_spec = _build_tool_spec()
+    profile_block = ""
+    history_block = ""
+    if DEMO_INCLUDE_PROFILE_CONTEXT:
+        user_profile_text = _load_user_profile()
+        profile_block = f"""
+USER PROFILE:
+{user_profile_text}
+"""
+    if DEMO_INCLUDE_HISTORY_CONTEXT:
+        history_text = _load_recent_history(max_events=10)
+        history_block = f"""
+RECENT HISTORY (last 10 actions):
+{history_text}
+"""
 
     system_prompt = f"""You are VOCO, a Windows OS automation agent. You DO NOT chat. You DO NOT explain. You DO NOT ask questions.
 
@@ -42,12 +56,7 @@ NEVER OUTPUT ANYTHING EXCEPT THE JSON ARRAY.
 
 AVAILABLE TOOLS:
 {tool_spec}
-
-USER PROFILE:
-{user_profile_text}
-
-RECENT HISTORY (last 10 actions):
-{history_text}
+{profile_block}{history_block}
 
 RULES:
 1. Break the task into the minimum number of steps needed.

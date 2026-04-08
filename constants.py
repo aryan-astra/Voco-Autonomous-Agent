@@ -56,6 +56,8 @@ USER_PROFILE_BUDGET = 1000
 HISTORY_BUDGET = 3000
 TASK_BUDGET = 4000
 ROUTER_CONFIDENCE_THRESHOLD = 0.75
+DEMO_INCLUDE_PROFILE_CONTEXT = False
+DEMO_INCLUDE_HISTORY_CONTEXT = False
 
 # ── Sandbox ───────────────────────────────────────────────────────────────────
 ALLOWED_EXTENSIONS = {".py", ".txt", ".md", ".json", ".csv", ".yaml", ".yml"}
