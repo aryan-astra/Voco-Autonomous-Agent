@@ -8,9 +8,12 @@ from constants import (
     OLLAMA_FAST_MODEL_CANDIDATES,
     OLLAMA_HEAVY_MODEL_CANDIDATES,
     OLLAMA_MODEL,
+    OLLAMA_CONVERSATION_TIMEOUT_SECONDS,
+    OLLAMA_NUM_CTX_CONVERSATION,
     OLLAMA_NUM_CTX_COMPLEX,
     OLLAMA_NUM_CTX_MIN,
     OLLAMA_NUM_CTX_SIMPLE,
+    OLLAMA_REQUEST_TIMEOUT_SECONDS,
     OLLAMA_URL,
 )
 
@@ -81,15 +84,17 @@ def _ctx_fallback_chain(initial_ctx: int) -> list[int]:
     return chain
 
 
-def _candidate_chain(complex_task: bool) -> list[str]:
+def _candidate_chain(complex_task: bool, prefer_fast: bool = False) -> list[str]:
+    if prefer_fast:
+        return OLLAMA_FAST_MODEL_CANDIDATES + OLLAMA_HEAVY_MODEL_CANDIDATES
     if complex_task:
         return OLLAMA_HEAVY_MODEL_CANDIDATES + OLLAMA_FAST_MODEL_CANDIDATES
     return OLLAMA_FAST_MODEL_CANDIDATES + OLLAMA_HEAVY_MODEL_CANDIDATES
 
 
-def _select_model(user_message: str, available_models: list[str]) -> str:
+def _select_model(user_message: str, available_models: list[str], prefer_fast: bool = False) -> str:
     """Pick the best installed model using fast/heavy preference."""
-    chain = _candidate_chain(_is_complex_task(user_message))
+    chain = _candidate_chain(_is_complex_task(user_message), prefer_fast=prefer_fast)
     seen: set[str] = set()
     for candidate in chain:
         resolved = _resolve_candidate(candidate, available_models)
@@ -99,9 +104,14 @@ def _select_model(user_message: str, available_models: list[str]) -> str:
     return OLLAMA_MODEL
 
 
-def _fallback_models(current_model: str, user_message: str, available_models: list[str]) -> list[str]:
+def _fallback_models(
+    current_model: str,
+    user_message: str,
+    available_models: list[str],
+    prefer_fast: bool = False,
+) -> list[str]:
     """Return smaller/alternative installed models after a failed attempt."""
-    chain = _candidate_chain(_is_complex_task(user_message))
+    chain = _candidate_chain(_is_complex_task(user_message), prefer_fast=prefer_fast)
     resolved_models: list[str] = []
     for candidate in chain:
         resolved = _resolve_candidate(candidate, available_models)
@@ -128,7 +138,14 @@ def _extract_http_error_detail(response: requests.Response | None) -> str:
         return text[:240] if text else "No error detail"
 
 
-def _post_chat(messages: list[dict], model_name: str, temperature: float, num_ctx: int) -> requests.Response:
+def _post_chat(
+    messages: list[dict],
+    model_name: str,
+    temperature: float,
+    num_ctx: int,
+    timeout_seconds: int,
+    num_predict: int | None = None,
+) -> requests.Response:
     payload = {
         "model": model_name,
         "messages": messages,
@@ -140,34 +157,47 @@ def _post_chat(messages: list[dict], model_name: str, temperature: float, num_ct
             "num_ctx": num_ctx,
         },
     }
-    return requests.post(OLLAMA_CHAT_URL, json=payload, timeout=60)
+    if num_predict is not None:
+        payload["options"]["num_predict"] = num_predict
+    return requests.post(OLLAMA_CHAT_URL, json=payload, timeout=timeout_seconds)
 
 
-def _generate_internal(messages: list[dict], user_message: str, temperature: float) -> str:
-    """Shared model request path with automatic model fallback."""
+def _generate_result_internal(
+    messages: list[dict],
+    user_message: str,
+    temperature: float,
+    *,
+    prefer_fast: bool = False,
+    preferred_ctx: int | None = None,
+    timeout_seconds: int = OLLAMA_REQUEST_TIMEOUT_SECONDS,
+    num_predict: int | None = None,
+) -> tuple[bool, str]:
+    """Shared model request path with automatic model/context fallback."""
     global _last_model_used, _last_num_ctx_used
     available_models = _fetch_available_models()
-    selected_model = _select_model(user_message, available_models)
+    selected_model = _select_model(user_message, available_models, prefer_fast=prefer_fast)
     _last_model_used = selected_model
-    initial_ctx = _initial_num_ctx(user_message)
+    initial_ctx = preferred_ctx if preferred_ctx is not None else _initial_num_ctx(user_message)
     primary_ctx_chain = _ctx_fallback_chain(initial_ctx)
     last_http_detail = ""
 
     for ctx in primary_ctx_chain:
         try:
+            _last_num_ctx_used = ctx
             response = _post_chat(
                 messages=messages,
                 model_name=selected_model,
                 temperature=temperature,
                 num_ctx=ctx,
+                timeout_seconds=timeout_seconds,
+                num_predict=num_predict,
             )
             response.raise_for_status()
-            _last_num_ctx_used = ctx
-            return response.json()["message"]["content"]
+            return True, response.json()["message"]["content"]
         except requests.exceptions.ConnectionError:
-            return _failure_plan("LLM connection failed (Ollama unreachable).")
+            return False, "LLM connection failed (Ollama unreachable)."
         except requests.exceptions.Timeout:
-            return _failure_plan("LLM request timed out after 60s.")
+            return False, f"LLM request timed out after {timeout_seconds}s."
         except requests.exceptions.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else "unknown"
             detail = _extract_http_error_detail(exc.response)
@@ -175,26 +205,33 @@ def _generate_internal(messages: list[dict], user_message: str, temperature: flo
             if status == 500 and "requires more system memory" in detail.lower():
                 # keep trying with smaller context for same model
                 continue
-            return _failure_plan(last_http_detail)
+            return False, last_http_detail
         except Exception as exc:
-            return _failure_plan(f"LLM unexpected error: {exc}")
+            return False, f"LLM unexpected error: {exc}"
 
     # If primary model still fails under lowest context, try alternate installed models.
-    for fallback_model in _fallback_models(selected_model, user_message, available_models):
+    for fallback_model in _fallback_models(
+        selected_model,
+        user_message,
+        available_models,
+        prefer_fast=prefer_fast,
+    ):
         for ctx in primary_ctx_chain:
             try:
+                _last_num_ctx_used = ctx
                 response = _post_chat(
                     messages=messages,
                     model_name=fallback_model,
                     temperature=temperature,
                     num_ctx=ctx,
+                    timeout_seconds=timeout_seconds,
+                    num_predict=num_predict,
                 )
                 response.raise_for_status()
                 _last_model_used = fallback_model
-                _last_num_ctx_used = ctx
-                return response.json()["message"]["content"]
+                return True, response.json()["message"]["content"]
             except requests.exceptions.Timeout:
-                last_http_detail = "LLM request timed out after 60s."
+                last_http_detail = f"LLM request timed out after {timeout_seconds}s."
                 break
             except requests.exceptions.HTTPError as exc:
                 status = exc.response.status_code if exc.response is not None else "unknown"
@@ -207,8 +244,20 @@ def _generate_internal(messages: list[dict], user_message: str, temperature: flo
                 break
 
     if last_http_detail:
-        return _failure_plan(last_http_detail)
-    return _failure_plan("LLM request failed after adaptive model/context fallback.")
+        return False, last_http_detail
+    return False, "LLM request failed after adaptive model/context fallback."
+
+
+def _generate_internal(messages: list[dict], user_message: str, temperature: float) -> str:
+    """Generate a JSON plan response, converting transport errors into report_failure plans."""
+    success, content = _generate_result_internal(
+        messages=messages,
+        user_message=user_message,
+        temperature=temperature,
+    )
+    if success:
+        return content
+    return _failure_plan(content)
 
 
 def generate(system_prompt: str, user_message: str, temperature: float = 0.1) -> str:
@@ -224,6 +273,28 @@ def generate(system_prompt: str, user_message: str, temperature: float = 0.1) ->
         user_message=user_message,
         temperature=temperature,
     )
+
+
+def generate_conversation(user_message: str, temperature: float = 0.2) -> tuple[bool, str]:
+    """Generate a model-based conversational response (no JSON planning)."""
+    system_prompt = (
+        "You are VOCO, a local desktop assistant. "
+        "Reply naturally in plain text and keep responses concise."
+    )
+    success, content = _generate_result_internal(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        user_message=user_message,
+        temperature=temperature,
+        prefer_fast=True,
+        preferred_ctx=OLLAMA_NUM_CTX_CONVERSATION,
+        timeout_seconds=OLLAMA_CONVERSATION_TIMEOUT_SECONDS,
+    )
+    if success and not content.strip():
+        return False, "LLM returned an empty response."
+    return success, content.strip()
 
 
 def generate_with_history(system_prompt: str, messages: list, temperature: float = 0.05) -> str:

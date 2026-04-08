@@ -21,6 +21,7 @@ from constants import (
 from context import AgentContext
 from llm import (
     check_ollama_running,
+    generate_conversation,
     generate,
     generate_with_history,
     get_last_model_used,
@@ -52,37 +53,80 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
     retries = 0
     raw_response = ""
 
-    direct_response = _build_local_direct_response(task)
-    if direct_response is not None:
-        context.router_decision = "local_direct"
-        context.router_confidence = 1.0
-        emit("[VOCO] Using local direct response path.", "info")
-        elapsed = round(time.time() - start_time, 1)
-        summary = f"[VOCO] OK {direct_response}"
-        emit(summary, "success")
-        _log_execution(
-            task=task,
-            success=True,
-            steps_completed=0,
-            format_failures=0,
-            retries=0,
-            final_output=direct_response,
-            error=None,
-            elapsed_seconds=elapsed,
-            router_decision=context.router_decision,
-            router_confidence=context.router_confidence,
-            model_used="local-direct",
-        )
-        return summary
-
     local_plan = _build_local_fastpath_plan(task)
     if local_plan is not None:
-        status = "ok"
         plan = local_plan
         context.router_decision = "local_fastpath"
         context.router_confidence = 1.0
         emit("[VOCO] Using local fast-path for basic OS command.", "info")
+    elif _is_conversational_prompt(task):
+        context.router_decision = "llm_conversation"
+        context.router_confidence = 0.95
+        emit("[VOCO] Checking Ollama connection...", "info")
+        if not check_ollama_running():
+            error_msg = (
+                "Conversation model is unavailable. "
+                f"Run: ollama serve && ollama pull {OLLAMA_MODEL}"
+            )
+            emit(f"[VOCO] ERROR: {error_msg}", "error")
+            _log_execution(
+                task=task,
+                success=False,
+                steps_completed=0,
+                format_failures=0,
+                retries=0,
+                final_output=error_msg,
+                error=error_msg,
+                elapsed_seconds=round(time.time() - start_time, 1),
+                router_decision=context.router_decision,
+                router_confidence=context.router_confidence,
+                model_used="none",
+            )
+            return error_msg
+
+        emit("[VOCO] Generating conversational response...", "info")
+        conversation_ok, conversation_reply = generate_conversation(user_message=task)
+        model_used = get_last_model_used()
+        emit(f"[VOCO] Model selected: {model_used} (num_ctx={get_last_num_ctx_used()})", "info")
+        elapsed = round(time.time() - start_time, 1)
+
+        if conversation_ok:
+            summary = f"[VOCO] OK {conversation_reply}"
+            emit(summary, "success")
+            _log_execution(
+                task=task,
+                success=True,
+                steps_completed=0,
+                format_failures=0,
+                retries=0,
+                final_output=conversation_reply,
+                error=None,
+                elapsed_seconds=elapsed,
+                router_decision=context.router_decision,
+                router_confidence=context.router_confidence,
+                model_used=model_used,
+            )
+            return summary
+
+        error_msg = f"Task cannot be completed: {conversation_reply}"
+        emit(f"[VOCO] ERROR: {error_msg}", "error")
+        _log_execution(
+            task=task,
+            success=False,
+            steps_completed=0,
+            format_failures=0,
+            retries=0,
+            final_output=error_msg,
+            error=conversation_reply,
+            elapsed_seconds=elapsed,
+            router_decision=context.router_decision,
+            router_confidence=context.router_confidence,
+            model_used=model_used,
+        )
+        return error_msg
     else:
+        context.router_decision = "llm_plan"
+        context.router_confidence = 0.9
         emit("[VOCO] Checking Ollama connection...", "info")
         if not check_ollama_running():
             error_msg = (
@@ -374,24 +418,19 @@ def _build_local_fastpath_plan(task: str) -> list[dict] | None:
     return None
 
 
-def _build_local_direct_response(task: str) -> str | None:
-    """Return a direct non-LLM response for pure greeting/ack messages."""
+def _is_conversational_prompt(task: str) -> bool:
+    """Return True when the input should be handled as conversational chat."""
     text = task.lower().strip()
-    greetings = {
-        "hi",
-        "hello",
-        "hey",
-        "hii",
-        "hiii",
-        "hi voco",
-        "hello voco",
-        "hey voco",
-    }
-    if text in greetings:
-        return "Hi! I am ready. Tell me what task to execute."
+    if not text:
+        return True
 
-    acknowledgements = {"thanks", "thank you", "thx"}
-    if text in acknowledgements:
-        return "You are welcome. Tell me the next task."
-
-    return None
+    conversational_patterns = [
+        r"^(hi+|hello|hey+)(\s+voco)?[!.?]*$",
+        r"^(thanks|thank you|thx)[!.?]*$",
+        r"^what(?:'s| is)\s+your\s+name[?.!]*$",
+        r"^who\s+are\s+you[?.!]*$",
+        r"^what\s+can\s+you\s+do[?.!]*$",
+        r"^how\s+are\s+you[?.!]*$",
+        r"^tell me about yourself[?.!]*$",
+    ]
+    return any(re.match(pattern, text) for pattern in conversational_patterns)
