@@ -1,2 +1,8 @@
 # Private local working notes (do not commit)
 updated-till-now.md
+
+# Local runtime/debug artifacts
+__pycache__/
+*.pyc
+report.*.json
+workspace/screenshot_*.png
