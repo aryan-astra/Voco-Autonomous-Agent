@@ -23,26 +23,20 @@ MAX_RETRIES = 1
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 OLLAMA_URL = "http://localhost:11434"
-OLLAMA_MODEL = "qwen3:4b"
+OLLAMA_MODEL = "gemma4:e2b"
 OLLAMA_FAST_MODEL_CANDIDATES = [
-    "qwen2.5:0.5b",
-    "qwen2.5:1.5b",
-    "qwen3:1.7b",
-    "qwen3:4b",
+    "gemma4:e2b",
 ]
 OLLAMA_HEAVY_MODEL_CANDIDATES = [
-    "qwen3:8b",
-    "qwen3:4b",
-    "qwen3:1.7b",
-    "qwen2.5:1.5b",
-    "qwen2.5:0.5b",
+    "gemma4:e2b",
 ]
 OLLAMA_NUM_CTX_SIMPLE = 2048
 OLLAMA_NUM_CTX_COMPLEX = 4096
-OLLAMA_NUM_CTX_MIN = 1024
-OLLAMA_NUM_CTX_CONVERSATION = 1024
-OLLAMA_REQUEST_TIMEOUT_SECONDS = 60
-OLLAMA_CONVERSATION_TIMEOUT_SECONDS = 180
+OLLAMA_NUM_CTX_MIN = 512
+OLLAMA_NUM_CTX_CONVERSATION = 2048
+OLLAMA_CTX_FALLBACK_LEVELS = [8192, 6144, 4096, 3072, 2048, 1536, 1024, 768, 512]
+OLLAMA_REQUEST_TIMEOUT_SECONDS = 75
+OLLAMA_CONVERSATION_TIMEOUT_SECONDS = 90
 
 # Backward-compatible aliases
 MODEL_NAME = OLLAMA_MODEL

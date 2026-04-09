@@ -17,6 +17,10 @@ class AgentContext:
     workspace: str = str(WORKSPACE_PATH)
     router_decision: str = "unknown"
     router_confidence: float = 0.0
+    decomposition_used: bool = False
+    decomposed_steps: list[str] = field(default_factory=list)
+    step_routes: list[dict] = field(default_factory=list)
+    access_level_policy: str = "L1-L3"
 
 
 def create_context() -> AgentContext:
@@ -32,4 +36,7 @@ def reset_context(ctx: AgentContext) -> AgentContext:
     ctx.history.clear()
     ctx.router_decision = "unknown"
     ctx.router_confidence = 0.0
+    ctx.decomposition_used = False
+    ctx.decomposed_steps.clear()
+    ctx.step_routes.clear()
     return ctx

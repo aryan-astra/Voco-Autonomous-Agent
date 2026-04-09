@@ -1,10 +1,12 @@
 """Ollama client for VOCO JSON action-plan generation."""
 
 import json
+import time
 
 import requests
 
 from constants import (
+    OLLAMA_CTX_FALLBACK_LEVELS,
     OLLAMA_FAST_MODEL_CANDIDATES,
     OLLAMA_HEAVY_MODEL_CANDIDATES,
     OLLAMA_MODEL,
@@ -21,6 +23,9 @@ from constants import (
 OLLAMA_CHAT_URL = f"{OLLAMA_URL}/api/chat"
 _last_model_used = OLLAMA_MODEL
 _last_num_ctx_used = OLLAMA_NUM_CTX_SIMPLE
+_model_cache: list[str] = []
+_model_cache_expires_at = 0.0
+_MODEL_CACHE_TTL_SECONDS = 5
 
 
 def _failure_plan(reason: str, failure_reason: str = "connection error") -> str:
@@ -31,12 +36,21 @@ def _failure_plan(reason: str, failure_reason: str = "connection error") -> str:
 
 def _fetch_available_models() -> list[str]:
     """Return available local Ollama model names."""
+    global _model_cache, _model_cache_expires_at
+    now = time.time()
+    if _model_cache and now < _model_cache_expires_at:
+        return list(_model_cache)
     try:
         response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
         response.raise_for_status()
         models = [item.get("name", "") for item in response.json().get("models", [])]
-        return [name for name in models if name]
+        filtered = [name for name in models if name]
+        _model_cache = filtered
+        _model_cache_expires_at = now + _MODEL_CACHE_TTL_SECONDS
+        return list(filtered)
     except Exception:
+        if _model_cache:
+            return list(_model_cache)
         return []
 
 
@@ -52,10 +66,10 @@ def _is_complex_task(user_message: str) -> bool:
     """Heuristic complexity estimate for dual-model routing."""
     text = user_message.lower()
     indicators = [
-        " and ",
         " then ",
-        " after ",
-        " also ",
+        " after that ",
+        " step by step ",
+        " one by one ",
         " compare ",
         " analyze ",
         " explain ",
@@ -64,8 +78,9 @@ def _is_complex_task(user_message: str) -> bool:
         " second ",
         " search ",
         " find ",
+        " why ",
     ]
-    return len(text.split()) > 12 or any(token in text for token in indicators)
+    return len(text.split()) > 18 or any(token in text for token in indicators)
 
 
 def _initial_num_ctx(user_message: str) -> int:
@@ -76,7 +91,7 @@ def _initial_num_ctx(user_message: str) -> int:
 def _ctx_fallback_chain(initial_ctx: int) -> list[int]:
     """Return a descending list of context sizes to fit lower-memory devices."""
     chain = [initial_ctx]
-    for ctx in [4096, 3072, 2048, 1536, 1024]:
+    for ctx in OLLAMA_CTX_FALLBACK_LEVELS:
         if ctx < initial_ctx and ctx >= OLLAMA_NUM_CTX_MIN and ctx not in chain:
             chain.append(ctx)
     if OLLAMA_NUM_CTX_MIN not in chain:
@@ -85,11 +100,14 @@ def _ctx_fallback_chain(initial_ctx: int) -> list[int]:
 
 
 def _candidate_chain(complex_task: bool, prefer_fast: bool = False) -> list[str]:
+    chain: list[str]
     if prefer_fast:
-        return OLLAMA_FAST_MODEL_CANDIDATES + OLLAMA_HEAVY_MODEL_CANDIDATES
-    if complex_task:
-        return OLLAMA_HEAVY_MODEL_CANDIDATES + OLLAMA_FAST_MODEL_CANDIDATES
-    return OLLAMA_FAST_MODEL_CANDIDATES + OLLAMA_HEAVY_MODEL_CANDIDATES
+        chain = OLLAMA_FAST_MODEL_CANDIDATES + OLLAMA_HEAVY_MODEL_CANDIDATES
+    elif complex_task:
+        chain = OLLAMA_HEAVY_MODEL_CANDIDATES + OLLAMA_FAST_MODEL_CANDIDATES
+    else:
+        chain = OLLAMA_FAST_MODEL_CANDIDATES + OLLAMA_HEAVY_MODEL_CANDIDATES
+    return list(dict.fromkeys(chain))
 
 
 def _select_model(user_message: str, available_models: list[str], prefer_fast: bool = False) -> str:
@@ -291,6 +309,7 @@ def generate_conversation(user_message: str, temperature: float = 0.2) -> tuple[
         prefer_fast=True,
         preferred_ctx=OLLAMA_NUM_CTX_CONVERSATION,
         timeout_seconds=OLLAMA_CONVERSATION_TIMEOUT_SECONDS,
+        num_predict=160,
     )
     if success and not content.strip():
         return False, "LLM returned an empty response."
@@ -314,14 +333,9 @@ def generate_with_history(system_prompt: str, messages: list, temperature: float
 
 
 def check_ollama_running() -> bool:
-    """Return True if Ollama is reachable and at least one model is installed."""
-    try:
-        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
-        response.raise_for_status()
-        models = [model.get("name", "") for model in response.json().get("models", [])]
-        return any(models)
-    except Exception:
-        return False
+    """Return True if Ollama is reachable and the configured model is installed."""
+    models = _fetch_available_models()
+    return _resolve_candidate(OLLAMA_MODEL, models) is not None
 
 
 def get_last_model_used() -> str:

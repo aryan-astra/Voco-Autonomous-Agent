@@ -1,6 +1,8 @@
 """VOCO TUI frontend prototype using Textual (no backend logic)."""
 
 import asyncio
+import os
+import queue
 import threading
 from rich.markup import escape
 from rich.text import Text
@@ -9,11 +11,13 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Footer, Input, Label, RichLog, Rule, Static
 
+from constants import OLLAMA_MODEL
 from context import AgentContext
 from orchestrator import run as orchestrator_run
 
 
 _agent_context = AgentContext()
+_MODEL_META_LABEL = f"{OLLAMA_MODEL} • Local LLM"
 
 
 class VocoApp(App):
@@ -210,6 +214,11 @@ class VocoApp(App):
     def __init__(self) -> None:
         super().__init__()
         self._mascot_index = 0
+        self._task_queue: queue.Queue[str | None] = queue.Queue()
+        self._worker_stop = threading.Event()
+        self._worker_thread = threading.Thread(target=self._task_worker_loop, daemon=True)
+        self._voice_agent = None
+        self._voice_enabled = False
 
     def compose(self) -> ComposeResult:
         # The UI is split into three vertical bands:
@@ -225,7 +234,7 @@ class VocoApp(App):
                         with Vertical(id="left-column"):
                             yield Label("Welcome back, Developer!", classes="welcome")
                             yield Static(self.MASCOT_FRAMES[0], id="mascot")
-                            yield Label("Qwen 2.5 Coder • Local LLM", classes="meta")
+                            yield Label(_MODEL_META_LABEL, classes="meta")
                             yield Label("/workspace/voco/apps", classes="meta")
 
                         # Right activity/information column.
@@ -258,6 +267,19 @@ class VocoApp(App):
         self.query_one("#dashboard", Container).border_title = " VOCO v1.0.0 "
         self.query_one("#command-input", Input).focus()
         self.set_interval(1.2, self._animate_mascot)
+        if not self._worker_thread.is_alive():
+            self._worker_thread.start()
+
+    def on_unmount(self) -> None:
+        self._worker_stop.set()
+        self._task_queue.put_nowait(None)
+        if self._voice_agent is not None:
+            try:
+                self._voice_agent.stop()
+            except Exception:
+                pass
+            self._voice_agent = None
+            self._voice_enabled = False
 
     def _animate_mascot(self) -> None:
         """Animate mascot while dashboard is visible for subtle liveliness."""
@@ -279,6 +301,8 @@ class VocoApp(App):
         chat_log.write(Text("  /agents           Spawn mock sub-agent", style="#D4D4D4"))
         chat_log.write(Text("  /security-review  Start mock security pass", style="#D4D4D4"))
         chat_log.write(Text("  /resume           Continue last workflow", style="#D4D4D4"))
+        chat_log.write(Text("  /index            Build full file index", style="#D4D4D4"))
+        chat_log.write(Text("  /index-app        Build installed app index", style="#D4D4D4"))
         chat_log.write(Text("  Ctrl+V            Mock voice input", style="#D4D4D4"))
 
     async def _handle_slash_command(self, command: str, chat_log: RichLog) -> bool:
@@ -308,6 +332,16 @@ class VocoApp(App):
             chat_log.write(Text("Ready for next instruction.", style="#D4D4D4"))
             return True
 
+        if normalized == "/index":
+            chat_log.write(Text("[VOCO] Starting full file index build...", style="#C96B45"))
+            self._handle_user_input("index files on my pc")
+            return True
+
+        if normalized == "/index-app":
+            chat_log.write(Text("[VOCO] Starting application index build...", style="#C96B45"))
+            self._handle_user_input("index apps")
+            return True
+
         if normalized == "/back":
             chat_log.write(Text("[VOCO] Already on home dashboard.", style="#C96B45"))
             return True
@@ -316,7 +350,7 @@ class VocoApp(App):
             await asyncio.sleep(0.15)
             chat_log.write(Text("[VOCO] Workspace", style="#C96B45"))
             chat_log.write(Text("  Root   /workspace/voco/apps", style="#D4D4D4"))
-            chat_log.write(Text("  Model  Qwen 2.5 Coder • Local LLM", style="#D4D4D4"))
+            chat_log.write(Text(f"  Model  {_MODEL_META_LABEL}", style="#D4D4D4"))
             chat_log.write(Text("  Files  12 indexed  •  3 modified", style="#D4D4D4"))
             return True
 
@@ -358,14 +392,31 @@ class VocoApp(App):
         }
         color = color_map.get(level, "white")
         safe_message = escape(message).replace("\r", "").strip()
+        app_thread_id = getattr(self, "_thread_id", None)
+        if app_thread_id is not None and app_thread_id == threading.get_ident():
+            self._update_output(safe_message, color)
+            return
         self.call_from_thread(self._update_output, safe_message, color)
 
     def _handle_user_input(self, task: str) -> None:
-        """Run orchestrator task in a background thread to keep the TUI responsive."""
+        """Queue user tasks for a single persistent worker thread."""
         if not task.strip():
             return
+        self._task_queue.put(task)
+        pending = self._task_queue.qsize()
+        self._update_output(f"[VOCO] Queued task ({pending} pending).", "white")
 
-        def run_task() -> None:
+    def _task_worker_loop(self) -> None:
+        """Run tasks sequentially in one worker thread for tool/runtime stability."""
+        while not self._worker_stop.is_set():
+            try:
+                task = self._task_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if task is None:
+                self._task_queue.task_done()
+                break
+
             try:
                 orchestrator_run(
                     task=task,
@@ -374,14 +425,43 @@ class VocoApp(App):
                 )
             except Exception as exc:
                 self._emit_to_ui(f"[VOCO] FATAL ERROR: {exc}", "error")
-
-        thread = threading.Thread(target=run_task, daemon=True)
-        thread.start()
+            finally:
+                self._task_queue.task_done()
 
     def action_voice_toggle(self) -> None:
-        # Ctrl+V now works from both dashboard and conversation views.
         chat_log = self._activate_conversation()
-        chat_log.write(Text("[VOCO VOICE] Listening...", style="#C96B45"))
+        if self._voice_enabled and self._voice_agent is not None:
+            try:
+                self._voice_agent.stop()
+            except Exception as exc:
+                chat_log.write(Text(f"[VOCO VOICE] Stop failed: {exc}", style="red"))
+                return
+            self._voice_enabled = False
+            self._voice_agent = None
+            chat_log.write(Text("[VOCO VOICE] Stopped.", style="#C96B45"))
+            return
+
+        access_key = os.environ.get("PORCUPINE_ACCESS_KEY", "").strip()
+        if not access_key:
+            chat_log.write(
+                Text("[VOCO VOICE] PORCUPINE_ACCESS_KEY is missing. Voice not started.", style="red")
+            )
+            return
+
+        try:
+            from voice.wake_voice import VocoVoice
+
+            self._voice_agent = VocoVoice(
+                on_command_callback=lambda spoken: self.call_from_thread(self._handle_user_input, spoken),
+                porcupine_access_key=access_key,
+            )
+            self._voice_agent.start()
+            self._voice_enabled = True
+            chat_log.write(Text("[VOCO VOICE] Wake word listener started.", style="#C96B45"))
+        except Exception as exc:
+            self._voice_agent = None
+            self._voice_enabled = False
+            chat_log.write(Text(f"[VOCO VOICE] Failed to start: {exc}", style="red"))
 
 
 if __name__ == "__main__":

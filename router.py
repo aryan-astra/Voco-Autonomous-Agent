@@ -1,0 +1,620 @@
+"""Lightweight tool-first router and deterministic argument extraction."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
+
+
+INTENT_CATALOG: dict[str, dict] = {
+    "open_file": {
+        "tool": "read_file",
+        "required_args": ("path",),
+        "examples": [
+            "open file notes.txt",
+            "read file config.py",
+            "show file logs/output.txt",
+        ],
+    },
+    "list_files": {
+        "tool": "list_files",
+        "required_args": tuple(),
+        "examples": [
+            "list files",
+            "show files in workspace",
+            "show directory contents",
+        ],
+    },
+    "open_app": {
+        "tool": "open_app",
+        "required_args": ("app_name",),
+        "examples": [
+            "open notepad",
+            "open calculator",
+            "launch chrome",
+            "start spotify",
+        ],
+    },
+    "browser_navigate": {
+        "tool": "browser_navigate",
+        "required_args": ("url",),
+        "examples": [
+            "open youtube",
+            "go to chatgpt.com",
+            "visit github.com",
+            "open browser and go to google",
+        ],
+    },
+    "browser_switch_profile": {
+        "tool": "browser_switch_profile",
+        "required_args": ("profile_mode",),
+        "examples": [
+            "switch chrome profile to default",
+            "set browser profile to snapshot",
+            "change edge profile to automation",
+        ],
+    },
+    "browser_type": {
+        "tool": "browser_type",
+        "required_args": ("text",),
+        "examples": [
+            "type hello in browser",
+            "search for mkbhd",
+            "write hi and press enter",
+        ],
+    },
+    "browser_click": {
+        "tool": "browser_click",
+        "required_args": ("element_name",),
+        "examples": [
+            "click first video",
+            "click sign in button",
+            "open latest result",
+        ],
+    },
+    "search_local_paths": {
+        "tool": "search_local_paths",
+        "required_args": ("query",),
+        "examples": [
+            "find AIOT-content folder on my pc",
+            "search local file report.pdf",
+            "locate folder in this pc",
+        ],
+    },
+    "search_in_explorer": {
+        "tool": "search_in_explorer",
+        "required_args": ("query",),
+        "examples": [
+            "open file explorer and find AIOT-content folder",
+            "search in explorer for project folder",
+        ],
+    },
+    "write_in_notepad": {
+        "tool": "write_in_notepad",
+        "required_args": ("text",),
+        "examples": [
+            "open notepad and write hello",
+            "type this in notepad",
+            "paste text into notepad",
+        ],
+    },
+    "save_text_to_desktop_file": {
+        "tool": "save_text_to_desktop_file",
+        "required_args": ("content",),
+        "examples": [
+            "save this text to desktop file",
+            "save content in notes.txt on desktop",
+        ],
+    },
+    "open_existing_document": {
+        "tool": "open_existing_document",
+        "required_args": ("extension",),
+        "examples": [
+            "open pdf file",
+            "open existing ppt file",
+            "open powerpoint file on my pc",
+        ],
+    },
+    "youtube_comment_pipeline": {
+        "tool": "youtube_comment_pipeline",
+        "required_args": ("query",),
+        "examples": [
+            "open youtube and search mkbhd and save comments",
+            "youtube comment pipeline for latest tech video",
+        ],
+    },
+    "web_codegen_autofix": {
+        "tool": "web_codegen_autofix",
+        "required_args": ("request",),
+        "examples": [
+            "write a python file for odd even checker",
+            "create .py file and run it",
+            "generate code and fix runtime errors",
+        ],
+    },
+}
+
+
+_BROWSER_KEYWORDS = ("youtube", "video", "browser", "website", "web", "chatgpt", "x.com", "google")
+_APP_ALIASES = (
+    "notepad",
+    "calculator",
+    "chrome",
+    "edge",
+    "firefox",
+    "spotify",
+    "explorer",
+    "powerpoint",
+)
+_PROFILE_MODES = ("default", "snapshot", "automation")
+_ACTION_VERBS = (
+    "open",
+    "search",
+    "find",
+    "locate",
+    "switch",
+    "set",
+    "change",
+    "go",
+    "visit",
+    "click",
+    "type",
+    "write",
+    "paste",
+    "save",
+    "play",
+    "pause",
+    "extract",
+    "copy",
+    "run",
+    "create",
+    "generate",
+)
+
+
+@dataclass(frozen=True)
+class RouteDecision:
+    intent: str
+    confidence: float
+    tool: str
+    args: dict[str, object]
+    missing_args: list[str]
+    rejected_reason: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "intent": self.intent,
+            "confidence": round(self.confidence, 4),
+            "tool": self.tool,
+            "args": self.args,
+            "missing_args": self.missing_args,
+            "rejected_reason": self.rejected_reason,
+        }
+
+
+def _extract_quoted_values(text: str) -> list[str]:
+    quoted = re.findall(r'"([^"]+)"|\'([^\']+)\'', text)
+    values: list[str] = []
+    for left, right in quoted:
+        value = (left or right).strip()
+        if value:
+            values.append(value)
+    return values
+
+
+def _extract_url(text: str) -> str | None:
+    explicit = re.search(r"(https?://[^\s\"']+)", text, flags=re.IGNORECASE)
+    if explicit:
+        return explicit.group(1).rstrip(".,;:!?)")
+
+    domain = re.search(r"\b([a-z0-9][a-z0-9\-]*(?:\.[a-z0-9\-]+)+(?:/[^\s\"']*)?)", text, flags=re.IGNORECASE)
+    if domain:
+        value = domain.group(1).strip().rstrip(".,;:!?)")
+        if not value.lower().startswith(("http://", "https://")):
+            return f"https://{value}"
+        return value
+
+    if "youtube" in text.lower():
+        return "https://www.youtube.com"
+    if "chatgpt" in text.lower():
+        return "https://chatgpt.com"
+    if "google" in text.lower():
+        return "https://www.google.com"
+    return None
+
+
+def _extract_path_token(text: str) -> str | None:
+    windows_path = re.search(r"([a-zA-Z]:\\[^\"'\r\n]+)", text)
+    if windows_path:
+        return windows_path.group(1).strip().rstrip(".,;:!?")
+
+    token_with_ext = re.search(r"\b([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]{1,10})\b", text)
+    if token_with_ext:
+        return token_with_ext.group(1).strip().rstrip(".,;:!?")
+    return None
+
+
+def _extract_filename(text: str, extension: str) -> str | None:
+    match = re.search(rf"\b([a-zA-Z0-9_\-]+\.{re.escape(extension)})\b", text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _extract_browser_from_text(text: str) -> str | None:
+    lower = text.lower()
+    if "chrome" in lower:
+        return "chrome"
+    if "edge" in lower:
+        return "edge"
+    if "firefox" in lower:
+        return "firefox"
+    return None
+
+
+def _clean_phrase(raw: str) -> str:
+    cleaned = str(raw).strip().strip("\"'").strip()
+    cleaned = cleaned.rstrip(".,;:!?")
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def _extract_search_query(text: str) -> str | None:
+    match = re.search(r"\bsearch(?:\s+for)?\s+(.+)$", text, flags=re.IGNORECASE)
+    if match:
+        return _clean_phrase(match.group(1))
+    return None
+
+
+def _extract_notepad_text(text: str) -> str | None:
+    quoted = _extract_quoted_values(text)
+    if quoted:
+        return quoted[0]
+    match = re.search(
+        r"\b(?:write|type|paste)\s+(.+?)(?:\s+(?:in|into)\s+notepad|\s*$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return _clean_phrase(match.group(1))
+    return None
+
+
+def _extract_local_search_query(text: str) -> str | None:
+    pattern = r"\b(?:search|find|locate)\s+(?:for\s+)?(.+?)(?:\s+(?:on|in)\s+(?:my|this)\s+(?:pc|computer)|\s*$)"
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    if match:
+        return _clean_phrase(match.group(1))
+    trailing = re.search(r"\b(?:search|find|locate)\s+(?:for\s+)?(.+)$", text, flags=re.IGNORECASE)
+    if trailing:
+        return _clean_phrase(trailing.group(1))
+    return None
+
+
+def _extract_open_app_name(text: str) -> str | None:
+    lower = text.lower()
+    for app in _APP_ALIASES:
+        if re.search(rf"\b{re.escape(app)}\b", lower):
+            return app
+    match = re.search(r"\b(?:open|launch|start)\s+([a-z0-9][a-z0-9 \-]{1,40})$", text, flags=re.IGNORECASE)
+    if match:
+        return _clean_phrase(match.group(1))
+    return None
+
+
+def extract_args(intent: str, text: str) -> dict[str, object]:
+    task = str(text or "")
+    lower = task.lower()
+    args: dict[str, object] = {}
+
+    if intent == "open_file":
+        path = _extract_path_token(task)
+        if path:
+            args["path"] = path
+        return args
+
+    if intent == "list_files":
+        quoted = _extract_quoted_values(task)
+        if quoted:
+            args["directory"] = quoted[0]
+        return args
+
+    if intent == "open_app":
+        app_name = _extract_open_app_name(task)
+        if app_name:
+            args["app_name"] = app_name
+        return args
+
+    if intent == "browser_navigate":
+        url = _extract_url(task)
+        if url:
+            args["url"] = url
+        browser = _extract_browser_from_text(task)
+        if browser:
+            args["browser"] = browser
+        return args
+
+    if intent == "browser_switch_profile":
+        for mode in _PROFILE_MODES:
+            if re.search(rf"\b{mode}\b", lower):
+                args["profile_mode"] = mode
+                break
+        browser = _extract_browser_from_text(task)
+        if browser:
+            args["browser"] = browser
+        args["relaunch"] = True
+        return args
+
+    if intent == "browser_type":
+        query = _extract_search_query(task)
+        if query:
+            args["text"] = query
+            if "search" in lower:
+                args["element_name"] = "search"
+            return args
+        quoted = _extract_quoted_values(task)
+        if quoted:
+            args["text"] = quoted[0]
+            return args
+        fallback = re.search(r"\b(?:type|write)\s+(.+)$", task, flags=re.IGNORECASE)
+        if fallback:
+            args["text"] = _clean_phrase(fallback.group(1))
+        return args
+
+    if intent == "browser_click":
+        match = re.search(r"\b(?:click|open|play)\s+(?:the\s+)?(.+)$", task, flags=re.IGNORECASE)
+        if match:
+            args["element_name"] = _clean_phrase(match.group(1))
+        return args
+
+    if intent in {"search_local_paths", "search_in_explorer"}:
+        query = _extract_local_search_query(task)
+        if query:
+            args["query"] = query
+        if intent == "search_local_paths":
+            if any(token in lower for token in ("folder", "directory")):
+                args["kind"] = "folder"
+            else:
+                args["kind"] = "all"
+            args["open_first"] = any(token in lower for token in ("open", "go to", "navigate"))
+        if intent == "search_in_explorer":
+            args["folders_only"] = True
+        return args
+
+    if intent == "write_in_notepad":
+        content = _extract_notepad_text(task)
+        if content:
+            args["text"] = content
+        return args
+
+    if intent == "save_text_to_desktop_file":
+        quoted = _extract_quoted_values(task)
+        if quoted:
+            args["content"] = quoted[0]
+        file_name = _extract_filename(task, "txt")
+        if file_name:
+            args["filename"] = file_name
+        if "notepad" in lower:
+            args["open_in_notepad"] = True
+        return args
+
+    if intent == "open_existing_document":
+        if "pdf" in lower:
+            args["extension"] = ".pdf"
+        elif "pptx" in lower or "powerpoint" in lower or re.search(r"\bppt\b", lower):
+            args["extension"] = ".pptx"
+        return args
+
+    if intent == "youtube_comment_pipeline":
+        query = _extract_search_query(task)
+        if not query:
+            query = "latest technology video"
+        args["query"] = query
+        output_name = _extract_filename(task, "txt")
+        if output_name:
+            args["output_filename"] = output_name
+        if "notepad" in lower:
+            args["open_in_notepad"] = True
+        return args
+
+    if intent == "web_codegen_autofix":
+        args["request"] = _clean_phrase(task)
+        filename = re.search(r"\b([a-zA-Z0-9_\-]+\.py)\b", task)
+        if filename:
+            args["filename"] = filename.group(1)
+        return args
+
+    return args
+
+
+def _guardrail_rejection(intent: str, text: str, args: dict[str, object]) -> str:
+    lower = str(text or "").lower()
+
+    if intent == "search_local_paths":
+        query = str(args.get("query", "")).lower()
+        if any(token in query for token in _BROWSER_KEYWORDS):
+            return "browser_terms_detected_for_local_file_search"
+        if any(token in lower for token in ("youtube", "video")) and "on my pc" not in lower:
+            return "browser_media_request_should_not_route_to_local_search"
+
+    if intent == "open_app":
+        app_name = str(args.get("app_name", "")).lower()
+        if app_name in {"youtube", "chatgpt", "google"}:
+            return "web_destination_should_use_browser_navigation"
+
+    return ""
+
+
+class IntentRouter:
+    """Predict intent and extract deterministic args without LLM dependency."""
+
+    def __init__(self, catalog: dict[str, dict]) -> None:
+        self._catalog = catalog
+        self._labels: list[str] = []
+        self._vectorizer = None
+        self._classifier = None
+        self._fallback_keywords: dict[str, set[str]] = {}
+        self._train()
+
+    def _train(self) -> None:
+        texts: list[str] = []
+        labels: list[str] = []
+        fallback_keywords: dict[str, set[str]] = {}
+
+        for intent, spec in self._catalog.items():
+            examples = [str(item).strip().lower() for item in spec.get("examples", []) if str(item).strip()]
+            if not examples:
+                continue
+            for sample in examples:
+                texts.append(sample)
+                labels.append(intent)
+                tokens = set(re.findall(r"[a-z0-9_.:/\\-]+", sample))
+                fallback_keywords.setdefault(intent, set()).update(tokens)
+
+        self._labels = sorted(set(labels))
+        self._fallback_keywords = fallback_keywords
+
+        if not SKLEARN_AVAILABLE or not texts or len(self._labels) < 2:
+            return
+
+        try:
+            vectorizer = TfidfVectorizer(ngram_range=(1, 2), lowercase=True)
+            matrix = vectorizer.fit_transform(texts)
+            classifier = RandomForestClassifier(
+                n_estimators=120,
+                random_state=42,
+                class_weight="balanced",
+                min_samples_leaf=1,
+            )
+            classifier.fit(matrix, labels)
+            self._vectorizer = vectorizer
+            self._classifier = classifier
+        except Exception:
+            self._vectorizer = None
+            self._classifier = None
+
+    def _predict_with_ml(self, text: str) -> tuple[str, float] | None:
+        if self._vectorizer is None or self._classifier is None:
+            return None
+        try:
+            matrix = self._vectorizer.transform([text.lower()])
+            probabilities = self._classifier.predict_proba(matrix)[0]
+            best_index = int(probabilities.argmax())
+            labels = list(self._classifier.classes_)
+            return str(labels[best_index]), float(probabilities[best_index])
+        except Exception:
+            return None
+
+    def _predict_with_keywords(self, text: str) -> tuple[str, float]:
+        tokens = set(re.findall(r"[a-z0-9_.:/\\-]+", text.lower()))
+        best_intent = ""
+        best_score = 0.0
+        for intent, keywords in self._fallback_keywords.items():
+            if not keywords:
+                continue
+            overlap = len(tokens & keywords)
+            score = overlap / max(len(keywords), 1)
+            if score > best_score:
+                best_score = score
+                best_intent = intent
+        if not best_intent:
+            return "unknown", 0.0
+        return best_intent, min(0.79, 0.35 + best_score)
+
+    def predict(self, text: str) -> RouteDecision:
+        content = str(text or "").strip()
+        if not content:
+            return RouteDecision(
+                intent="unknown",
+                confidence=0.0,
+                tool="",
+                args={},
+                missing_args=[],
+                rejected_reason="empty_input",
+            )
+
+        ml_prediction = self._predict_with_ml(content)
+        if ml_prediction is not None:
+            intent, confidence = ml_prediction
+        else:
+            intent, confidence = self._predict_with_keywords(content)
+
+        if intent not in self._catalog:
+            return RouteDecision(
+                intent="unknown",
+                confidence=0.0,
+                tool="",
+                args={},
+                missing_args=[],
+                rejected_reason="no_supported_intent",
+            )
+
+        spec = self._catalog[intent]
+        tool = str(spec.get("tool", "")).strip()
+        args = extract_args(intent, content)
+        required = [str(arg) for arg in spec.get("required_args", ())]
+        missing_args = [name for name in required if name not in args or str(args.get(name, "")).strip() == ""]
+        rejected_reason = _guardrail_rejection(intent, content, args)
+        final_confidence = confidence if not rejected_reason else 0.0
+
+        return RouteDecision(
+            intent=intent,
+            confidence=max(0.0, min(1.0, float(final_confidence))),
+            tool=tool,
+            args=args,
+            missing_args=missing_args,
+            rejected_reason=rejected_reason,
+        )
+
+
+ROUTER = IntentRouter(INTENT_CATALOG)
+
+
+def predict_route(text: str) -> dict[str, object]:
+    """Return normalized route decision for one atomic step."""
+    return ROUTER.predict(text).to_dict()
+
+
+def should_split_task(text: str) -> bool:
+    """Return True for non-trivial requests that should be decomposed first."""
+    content = str(text or "").strip()
+    if not content:
+        return False
+    token_count = len(re.findall(r"[a-z0-9_.:/\\-]+", content.lower()))
+    connectors = re.search(r"\b(?:and then|then|after that|afterwards|and)\b", content, flags=re.IGNORECASE)
+    action_count = len(re.findall(r"\b(?:open|search|find|locate|switch|set|change|go|visit|click|type|write|paste|save|play|pause|extract|copy|run|create|generate)\b", content, flags=re.IGNORECASE))
+    return token_count >= 9 or bool(connectors) or action_count >= 2
+
+
+def split_task_into_steps(text: str) -> list[str]:
+    """Split non-trivial user text into short atomic steps."""
+    content = str(text or "").strip()
+    if not content:
+        return []
+    if not should_split_task(content):
+        return [content]
+
+    normalized = re.sub(r"\s+", " ", content).strip()
+    raw_steps = re.split(r"\b(?:and then|then|after that|afterwards|and)\b", normalized, flags=re.IGNORECASE)
+    steps: list[str] = []
+    for item in raw_steps:
+        step = _clean_phrase(item)
+        if not step:
+            continue
+        if len(step.split()) < 2:
+            continue
+        if not any(re.search(rf"\b{verb}\b", step, flags=re.IGNORECASE) for verb in _ACTION_VERBS):
+            continue
+        steps.append(step)
+
+    if not steps:
+        return [content]
+    return steps
