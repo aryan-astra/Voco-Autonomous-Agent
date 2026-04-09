@@ -541,6 +541,72 @@ class IntentRouter:
                 rejected_reason="empty_input",
             )
 
+        lowered = content.lower()
+        if re.match(r"^\s*search(?:\s+for)?\s+", content, flags=re.IGNORECASE):
+            if "explorer" in lowered or "file explorer" in lowered:
+                intent = "search_in_explorer"
+                confidence = 0.93
+            elif any(
+                token in lowered
+                for token in (
+                    "on my pc",
+                    "on this pc",
+                    "in my pc",
+                    "in this pc",
+                    "local file",
+                    "local folder",
+                    "file on pc",
+                    "folder on pc",
+                    "directory",
+                    "folder",
+                    "path",
+                )
+            ):
+                intent = "search_local_paths"
+                confidence = 0.92
+            else:
+                intent = "browser_type"
+                confidence = 0.94
+
+            spec = self._catalog.get(intent, {})
+            tool = str(spec.get("tool", "")).strip()
+            args = extract_args(intent, content)
+            required = [str(arg) for arg in spec.get("required_args", ())]
+            missing_args = [name for name in required if name not in args or str(args.get(name, "")).strip() == ""]
+            rejected_reason = _guardrail_rejection(intent, content, args)
+            final_confidence = confidence if not rejected_reason else 0.0
+            return RouteDecision(
+                intent=intent,
+                confidence=max(0.0, min(1.0, float(final_confidence))),
+                tool=tool,
+                args=args,
+                missing_args=missing_args,
+                rejected_reason=rejected_reason,
+            )
+
+        if (
+            re.search(r"\b(?:play|click|open)\b", lowered)
+            and any(token in lowered for token in ("video", "result", "1st", "first", "latest"))
+            and not any(token in lowered for token in ("file", "folder", "directory", "path", "on my pc", "on this pc"))
+        ):
+            intent = "browser_click"
+            confidence = 0.91
+            spec = self._catalog.get(intent, {})
+            tool = str(spec.get("tool", "")).strip()
+            args = extract_args(intent, content)
+            required = [str(arg) for arg in spec.get("required_args", ())]
+            missing_args = [name for name in required if name not in args or str(args.get(name, "")).strip() == ""]
+            rejected_reason = _guardrail_rejection(intent, content, args)
+            final_confidence = confidence if not rejected_reason else 0.0
+            return RouteDecision(
+                intent=intent,
+                confidence=max(0.0, min(1.0, float(final_confidence))),
+                tool=tool,
+                args=args,
+                missing_args=missing_args,
+                rejected_reason=rejected_reason,
+            )
+
         ml_prediction = self._predict_with_ml(content)
         if ml_prediction is not None:
             intent, confidence = ml_prediction

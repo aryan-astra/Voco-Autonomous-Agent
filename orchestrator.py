@@ -503,6 +503,20 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
 
 
 _ROUTER_DIRECT_THRESHOLD = 0.85
+_ROUTER_LOW_CONF_DIRECT_THRESHOLD = 0.30
+_ROUTER_LOW_CONF_DIRECT_TOOLS = {
+    "open_app",
+    "browser_navigate",
+    "browser_switch_profile",
+    "browser_type",
+    "browser_click",
+    "browser_press_key",
+    "write_in_notepad",
+    "save_text_to_desktop_file",
+    "search_local_paths",
+    "search_in_explorer",
+    "open_existing_document",
+}
 _ACCESS_LEVEL_BY_TOOL: dict[str, str] = {
     # L1: UI automation / app interaction
     "focus_window": "L1",
@@ -642,14 +656,20 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
             missing_args = []
 
         route_path = "router_unresolved"
-        if (
-            tool_name
-            and tool_name in TOOL_REGISTRY
-            and confidence >= _ROUTER_DIRECT_THRESHOLD
-            and not missing_args
-            and not rejected_reason
-        ):
-            route_path = "router_direct"
+        has_valid_route = bool(tool_name and tool_name in TOOL_REGISTRY and not missing_args and not rejected_reason)
+        can_route_direct = bool(
+            has_valid_route
+            and (
+                confidence >= _ROUTER_DIRECT_THRESHOLD
+                or (
+                    confidence >= _ROUTER_LOW_CONF_DIRECT_THRESHOLD
+                    and tool_name in _ROUTER_LOW_CONF_DIRECT_TOOLS
+                )
+            )
+        )
+
+        if can_route_direct:
+            route_path = "router_direct" if confidence >= _ROUTER_DIRECT_THRESHOLD else "router_direct_low_conf"
             plan.append(
                 {
                     "tool": tool_name,
@@ -662,6 +682,27 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                     ),
                 }
             )
+            should_submit_search = bool(
+                tool_name == "browser_type"
+                and (
+                    str(args.get("element_name", "")).strip().lower() == "search"
+                    or bool(re.search(r"\bsearch\b", step_text, flags=re.IGNORECASE))
+                )
+                and not bool(re.search(r"\b(?:press|hit)\s+enter\b", step_text, flags=re.IGNORECASE))
+            )
+            if should_submit_search:
+                plan.append(
+                    {
+                        "tool": "browser_press_key",
+                        "args": {"key": "Enter"},
+                        "reason": _annotate_step_reason(
+                            step_text=step_text,
+                            route_path=route_path,
+                            base_reason="Submit browser search after typing query.",
+                            tool_name="browser_press_key",
+                        ),
+                    }
+                )
         else:
             fallback_plan = _build_local_fastpath_plan(step_text)
             if fallback_plan is not None:
@@ -684,6 +725,26 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                             ),
                         }
                     )
+            elif tool_name and tool_name in TOOL_REGISTRY and missing_args:
+                route_path = "router_missing_args"
+                missing_arg_names = [str(arg).strip() for arg in missing_args if str(arg).strip()]
+                missing_suffix = ", ".join(missing_arg_names) if missing_arg_names else "unspecified"
+                failure_reason = (
+                    f"Missing required argument(s) for '{tool_name}': {missing_suffix}. "
+                    f"Clarify this step: {step_text}"
+                )
+                plan.append(
+                    {
+                        "tool": "report_failure",
+                        "args": {"reason": failure_reason},
+                        "reason": _annotate_step_reason(
+                            step_text=step_text,
+                            route_path=route_path,
+                            base_reason=failure_reason,
+                            tool_name="report_failure",
+                        ),
+                    }
+                )
             else:
                 unresolved_steps.append(step_text)
 
