@@ -1,0 +1,7 @@
+# Template for local vault user data.
+# Copy to USER.yaml locally and keep runtime values out of Git.
+profile:
+  name: "<your-name>"
+  role: "<your-role>"
+preferences:
+  language: "en"

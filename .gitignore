@@ -6,3 +6,10 @@ __pycache__/
 *.pyc
 report.*.json
 workspace/screenshot_*.png
+
+# Sensitive local vault runtime files
+memory/vault/*
+!memory/vault/README.md
+!memory/vault/*.template.yaml
+!memory/vault/*.template.md
+!memory/vault/*.template.jsonl
