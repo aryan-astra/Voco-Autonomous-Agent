@@ -91,6 +91,24 @@ INTENT_CATALOG: dict[str, dict] = {
             "get comments from this tab",
         ],
     },
+    "get_page_title": {
+        "tool": "get_page_title",
+        "required_args": tuple(),
+        "examples": [
+            "get the page title",
+            "read the video title",
+            "copy the title of the current tab",
+        ],
+    },
+    "copy_text_to_clipboard": {
+        "tool": "copy_text_to_clipboard",
+        "required_args": ("text",),
+        "examples": [
+            "copy text hello world to clipboard",
+            "copy to clipboard \"deployment complete\"",
+            "copy this sentence to clipboard",
+        ],
+    },
     "search_local_paths": {
         "tool": "search_local_paths",
         "required_args": ("query",),
@@ -186,6 +204,10 @@ _OPEN_APP_GENERIC_TOKENS = {
 _OPEN_APP_VERB_REGEX = re.compile(r"\b(?:open|launch|start)\b", flags=re.IGNORECASE)
 _BROWSER_STATE_VERB_REGEX = re.compile(r"\b(?:copy|read|extract|get)\b", flags=re.IGNORECASE)
 _BROWSER_STATE_TARGET_REGEX = re.compile(r"\b(?:content|comments?|description)\b", flags=re.IGNORECASE)
+_TITLE_VERB_REGEX = re.compile(r"\b(?:copy|read|extract|get|show|grab|fetch|what(?:'s| is))\b", flags=re.IGNORECASE)
+_TITLE_TARGET_REGEX = re.compile(r"\b(?:page|video|tab|site|website|browser|current)?\s*title\b", flags=re.IGNORECASE)
+_CLIPBOARD_VERB_REGEX = re.compile(r"\bcopy\b", flags=re.IGNORECASE)
+_CLIPBOARD_TARGET_REGEX = re.compile(r"\bclipboard\b|\bcopy\s+text\b", flags=re.IGNORECASE)
 _NOTEPAD_PASTE_REGEX = re.compile(r"\bpaste\b", flags=re.IGNORECASE)
 _DESKTOP_SAVE_REFERENCE_REGEX = re.compile(r"\bsave\s+(?:it|this|that)\b", flags=re.IGNORECASE)
 _DESKTOP_SAVE_FILE_REGEX = re.compile(
@@ -459,6 +481,36 @@ def _extract_notepad_text(text: str) -> str | None:
     return None
 
 
+def _extract_clipboard_text(text: str) -> str | None:
+    quoted = _extract_quoted_values(text)
+    if quoted:
+        return _clean_phrase(quoted[0])
+
+    match = re.search(
+        r"\bcopy\s+(?:text\s+)?(.+?)\s+to\s+clipboard\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        candidate = _clean_phrase(match.group(1))
+        if candidate and candidate.lower() not in {"to", "clipboard"}:
+            return candidate
+
+    match = re.search(r"\bcopy\s+to\s+clipboard\s*[:\-]?\s*(.+)$", text, flags=re.IGNORECASE)
+    if match:
+        candidate = _clean_phrase(match.group(1))
+        if candidate and candidate.lower() not in {"to", "clipboard"}:
+            return candidate
+
+    match = re.search(r"\bcopy\s+text\s*[:\-]?\s*(.+)$", text, flags=re.IGNORECASE)
+    if match:
+        candidate = _clean_phrase(match.group(1))
+        if candidate and candidate.lower() not in {"to", "clipboard"}:
+            return candidate
+
+    return None
+
+
 def _extract_local_search_query(text: str) -> str | None:
     pattern = r"\b(?:search|find|locate)\s+(?:for\s+)?(.+?)(?:\s+(?:on|in)\s+(?:my|this)\s+(?:pc|computer)|\s*$)"
     match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -532,6 +584,38 @@ def _looks_like_browser_state_read_request(text: str) -> bool:
     if has_browser_signal:
         return True
     return re.search(r"\b(?:comments?|description)\b", source, flags=re.IGNORECASE) is not None
+
+
+def _looks_like_page_title_request(text: str) -> bool:
+    source = str(text or "")
+    lower = source.lower()
+    if "title" not in lower:
+        return False
+    if _TITLE_VERB_REGEX.search(source) is None:
+        return False
+    if _TITLE_TARGET_REGEX.search(source) is None:
+        return False
+
+    if any(token in lower for token in ("book title", "song title", "movie title", "job title")):
+        return False
+
+    has_browser_signal = (
+        any(token in lower for token in _BROWSER_KEYWORDS)
+        or _extract_url(source) is not None
+        or re.search(r"\b(?:page|tab|site|website|video|browser|current)\b", source, flags=re.IGNORECASE) is not None
+    )
+    return has_browser_signal
+
+
+def _looks_like_clipboard_copy_request(text: str) -> bool:
+    source = str(text or "")
+    if _CLIPBOARD_VERB_REGEX.search(source) is None:
+        return False
+    if _CLIPBOARD_TARGET_REGEX.search(source) is None:
+        return False
+    if _looks_like_page_title_request(source):
+        return False
+    return True
 
 
 def _coerce_browser_state_max_elements(value: int) -> int:
@@ -652,6 +736,15 @@ def extract_args(intent: str, text: str) -> dict[str, object]:
             args["copy_to_clipboard"] = True
         return args
 
+    if intent == "get_page_title":
+        return args
+
+    if intent == "copy_text_to_clipboard":
+        content = _extract_clipboard_text(task)
+        if content:
+            args["text"] = content
+        return args
+
     if intent in {"search_local_paths", "search_in_explorer"}:
         query = _extract_local_search_query(task)
         if query:
@@ -755,6 +848,10 @@ def _guardrail_rejection(intent: str, text: str, args: dict[str, object]) -> str
         from_clipboard = bool(args.get("from_clipboard"))
         if not has_content and not from_clipboard:
             return "desktop_save_requires_content_or_clipboard_source"
+
+    if intent == "copy_text_to_clipboard":
+        if not bool(str(args.get("text", "")).strip()):
+            return "copy_text_to_clipboard_requires_text"
 
     return ""
 
@@ -874,6 +971,44 @@ class IntentRouter:
                 intent = "browser_type"
                 confidence = 0.94
 
+            spec = self._catalog.get(intent, {})
+            tool = str(spec.get("tool", "")).strip()
+            args = extract_args(intent, content)
+            required = [str(arg) for arg in spec.get("required_args", ())]
+            missing_args = [name for name in required if name not in args or str(args.get(name, "")).strip() == ""]
+            rejected_reason = _guardrail_rejection(intent, content, args)
+            final_confidence = confidence if not rejected_reason else 0.0
+            return RouteDecision(
+                intent=intent,
+                confidence=max(0.0, min(1.0, float(final_confidence))),
+                tool=tool,
+                args=args,
+                missing_args=missing_args,
+                rejected_reason=rejected_reason,
+            )
+
+        if _looks_like_page_title_request(content):
+            intent = "get_page_title"
+            confidence = 0.93
+            spec = self._catalog.get(intent, {})
+            tool = str(spec.get("tool", "")).strip()
+            args = extract_args(intent, content)
+            required = [str(arg) for arg in spec.get("required_args", ())]
+            missing_args = [name for name in required if name not in args or str(args.get(name, "")).strip() == ""]
+            rejected_reason = _guardrail_rejection(intent, content, args)
+            final_confidence = confidence if not rejected_reason else 0.0
+            return RouteDecision(
+                intent=intent,
+                confidence=max(0.0, min(1.0, float(final_confidence))),
+                tool=tool,
+                args=args,
+                missing_args=missing_args,
+                rejected_reason=rejected_reason,
+            )
+
+        if _looks_like_clipboard_copy_request(content):
+            intent = "copy_text_to_clipboard"
+            confidence = 0.91
             spec = self._catalog.get(intent, {})
             tool = str(spec.get("tool", "")).strip()
             args = extract_args(intent, content)

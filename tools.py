@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import difflib
 import hashlib
 import importlib.util
 import inspect
@@ -1151,8 +1152,50 @@ def _summarize_python_failure(run_result: dict) -> str:
     return lines[-1][:260]
 
 
+_ELEMENT_NOISE_WORDS = {
+    "on",
+    "the",
+    "a",
+    "an",
+    "this",
+    "that",
+    "these",
+    "those",
+    "please",
+    "kindly",
+    "to",
+    "for",
+    "of",
+    "click",
+    "open",
+    "play",
+    "select",
+}
+_GENERIC_CLICK_TRIGGER_WORDS = {
+    "video",
+    "result",
+    "item",
+    "link",
+    "article",
+    "post",
+    "entry",
+}
+_FUZZY_CLICK_MIN_SCORE = 0.58
+
+
+def _strip_element_noise(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not normalized:
+        return ""
+    tokens = re.findall(r"[a-z0-9]+", normalized)
+    filtered = [token for token in tokens if token not in _ELEMENT_NOISE_WORDS]
+    if filtered:
+        return " ".join(filtered).strip()
+    return normalized
+
+
 def _resolve_ordinal(text: str, default: int = 1) -> tuple[str, int]:
-    cleaned = str(text).strip()
+    cleaned = _strip_element_noise(str(text).strip())
     if not cleaned:
         return "", max(1, int(default))
 
@@ -1160,15 +1203,17 @@ def _resolve_ordinal(text: str, default: int = 1) -> tuple[str, int]:
     for word, value in ordinals.items():
         if re.search(rf"\b{word}\b", cleaned, flags=re.IGNORECASE):
             cleaned = re.sub(rf"\b(?:the\s+)?{word}\b", "", cleaned, flags=re.IGNORECASE).strip()
+            cleaned = _strip_element_noise(cleaned)
             return cleaned, value
 
     numeric = re.search(r"\b(\d+)(?:st|nd|rd|th)?\b", cleaned, flags=re.IGNORECASE)
     if numeric:
         value = max(1, int(numeric.group(1)))
         cleaned = re.sub(r"\b\d+(?:st|nd|rd|th)?\b", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = _strip_element_noise(cleaned)
         return cleaned, value
 
-    return cleaned, max(1, int(default))
+    return _strip_element_noise(cleaned), max(1, int(default))
 
 
 def _browser_runtime_state() -> dict:
@@ -1322,6 +1367,29 @@ def browser_get_state(
         return _err(f"Failed to read browser state: {exc}")
 
 
+def get_page_title() -> dict:
+    try:
+        page = _get_browser_page()
+        title = str(page.title() or "").strip()
+        if not title:
+            return _err("Active browser page title is empty.")
+        payload = {"title": title, "url": page.url}
+        return _ok(payload, f"Read active browser page title: {title}")
+    except Exception as exc:
+        return _err(f"Failed to read browser page title: {exc}")
+
+
+def copy_text_to_clipboard(text: str) -> dict:
+    value = str(text or "")
+    if not value.strip():
+        return _err("No text provided to copy to clipboard.")
+    copied, error = _set_clipboard_text(value)
+    if not copied:
+        return _err(f"Failed to copy text to clipboard: {error}")
+    payload = {"text": value, "characters": len(value)}
+    return _ok(payload, f"Copied {len(value)} characters to clipboard.")
+
+
 def browser_navigate(url: str, browser: str | None = None) -> dict:
     target_url = _normalize_navigation_url(url)
     try:
@@ -1464,6 +1532,7 @@ def browser_click(element_name: str, role: str | None = None, occurrence: int = 
         return _err("Element name is required for browser click.")
 
     cleaned_name, resolved_occurrence = _resolve_ordinal(raw_name, default=occurrence)
+    cleaned_name = _strip_element_noise(cleaned_name)
     occurrence_index = max(0, resolved_occurrence - 1)
     role_name = str(role or "").strip().lower() or None
 
@@ -1496,8 +1565,14 @@ def browser_click(element_name: str, role: str | None = None, occurrence: int = 
                 except Exception:
                     target_locator = None
 
-        fallback_key = cleaned_name.lower().strip()
-        if target_locator is None and fallback_key in {"video", "result", "item", ""}:
+        cleaned_tokens = set(re.findall(r"[a-z0-9]+", cleaned_name.lower()))
+        raw_tokens = set(re.findall(r"[a-z0-9]+", raw_name.lower()))
+        fallback_trigger = (
+            not cleaned_name
+            or bool(cleaned_tokens & _GENERIC_CLICK_TRIGGER_WORDS)
+            or bool(raw_tokens & _GENERIC_CLICK_TRIGGER_WORDS)
+        )
+        if target_locator is None and fallback_trigger:
             fallback_selectors = [
                 "ytd-video-renderer #video-title",
                 "a#video-title",
@@ -1513,6 +1588,41 @@ def browser_click(element_name: str, role: str | None = None, occurrence: int = 
                         break
                 except Exception:
                     continue
+
+        if target_locator is None and cleaned_name:
+            try:
+                candidate_locator = page.locator("a, button, [role='link'], [role='button']")
+                candidate_count = min(candidate_locator.count(), 120)
+                scored_candidates: list[tuple[float, object]] = []
+                lowered_target = cleaned_name.lower()
+                for idx in range(candidate_count):
+                    node = candidate_locator.nth(idx)
+                    try:
+                        label = ""
+                        try:
+                            label = str(node.inner_text(timeout=300) or "").strip()
+                        except Exception:
+                            label = ""
+                        if not label:
+                            for attr in ("aria-label", "title"):
+                                attr_value = str(node.get_attribute(attr) or "").strip()
+                                if attr_value:
+                                    label = attr_value
+                                    break
+                        if not label:
+                            continue
+                        score = difflib.SequenceMatcher(None, lowered_target, label.lower()).ratio()
+                        scored_candidates.append((score, node))
+                    except Exception:
+                        continue
+
+                scored_candidates.sort(key=lambda item: item[0], reverse=True)
+                if len(scored_candidates) > occurrence_index:
+                    best_score, best_node = scored_candidates[occurrence_index]
+                    if best_score >= _FUZZY_CLICK_MIN_SCORE:
+                        target_locator = best_node
+            except Exception:
+                target_locator = None
 
         if target_locator is None:
             return _err(f"No browser element matched '{raw_name}'.")
@@ -4726,6 +4836,16 @@ TOOL_REGISTRY = {
             "text_limit": "integer (optional)",
             "copy_to_clipboard": "boolean (optional)",
         },
+    },
+    "get_page_title": {
+        "fn": get_page_title,
+        "description": "Read the title of the active browser page.",
+        "args": {},
+    },
+    "copy_text_to_clipboard": {
+        "fn": copy_text_to_clipboard,
+        "description": "Copy explicit text to the system clipboard.",
+        "args": {"text": "string"},
     },
     "browser_switch_profile": {
         "fn": browser_switch_profile,

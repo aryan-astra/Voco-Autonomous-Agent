@@ -420,18 +420,24 @@ class VocoApp(App):
 
         if not dep_status["available"]:
             missing = ", ".join(str(name) for name in dep_status["missing"])
+            install_hint = str(dep_status.get("install_hint", "")).strip()
             self._voice_degraded = True
             self._set_voice_status_indicator("DEGRADED", "missing deps", "yellow")
-            self._update_output(f"[VOCO VOICE] Voice unavailable (missing: {missing}).", "yellow")
+            message = f"[VOCO VOICE] Voice unavailable (missing: {missing})."
+            if install_hint:
+                message = f"{message} Install with: {install_hint}"
+            self._update_output(message, "yellow")
             return
 
         if not dep_status["runtime_ready"]:
+            runtime_hint = str(dep_status.get("runtime_hint", "")).strip()
             self._voice_degraded = True
             self._set_voice_status_indicator("DEGRADED", "wake model unavailable", "red")
-            self._update_output(
-                f"[VOCO VOICE] Wake model unavailable: {dep_status['error']}",
-                "red",
-            )
+            runtime_error = str(dep_status.get("error", "")).strip()
+            message = f"[VOCO VOICE] Wake model unavailable: {runtime_error or 'unknown runtime error'}"
+            if runtime_hint:
+                message = f"{message}. {runtime_hint}"
+            self._update_output(message, "red")
             return
 
         if dep_status["vad_mode"] == "webrtcvad":

@@ -6,6 +6,7 @@ Flow: task -> prompt -> LLM plan -> parse -> dispatch tools -> summarize.
 from __future__ import annotations
 
 import datetime
+import difflib
 import importlib.util
 import json
 import os
@@ -487,15 +488,17 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
             )
             return error_msg
 
-    max_steps_to_run = min(len(plan), MAX_STEPS)
+    bounded_plan = list(plan[:MAX_STEPS])
+    max_steps_to_run = len(bounded_plan)
     max_step_retries = max(0, int(MAX_RETRIES))
     emit(f"[VOCO] Plan has {len(plan)} steps. Executing up to {max_steps_to_run}.", "info")
 
     steps_completed = 0
+    injected_step_counter = 0
     execution_failed = False
     final_output = ""
 
-    for index, step in enumerate(plan[:MAX_STEPS], start=1):
+    for index, step in enumerate(bounded_plan, start=1):
         requires_approval = False
         human_approved = False
         privileged_action = False
@@ -519,6 +522,11 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
             tool_args = step.get("args", {})
             reason = str(step.get("reason", "")).strip()
             if tool_name in TOOL_REGISTRY and isinstance(tool_args, dict):
+                tool_args = _resolve_dynamic_tool_args(
+                    tool_name=tool_name,
+                    tool_args=dict(tool_args),
+                    context=context,
+                )
                 requires_approval = tool_requires_approval(tool_name)
                 privileged_action = _is_privileged_tool_action(
                     tool_name=tool_name,
@@ -721,6 +729,86 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 emit(f"  OK {result['message']} (self-heal recovered after {retry_count} retry)", "success")
             else:
                 emit(f"  OK {result['message']}", "success")
+
+            if index < len(bounded_plan):
+                next_step = bounded_plan[index]
+                if isinstance(step, dict) and isinstance(next_step, dict) and _should_inject_state_check(step, next_step):
+                    injected_step_counter += 1
+                    injected_step = _inject_get_state_step()
+                    injected_tool = str(injected_step.get("tool", "")).strip() or "browser_get_state"
+                    injected_args = injected_step.get("args", {})
+                    if not isinstance(injected_args, dict):
+                        injected_args = {}
+                    emit("[VOCO] Injected state check before upcoming browser click.", "info")
+                    injected_result = dispatch_tool(injected_tool, injected_args)
+
+                    injected_policy_metadata = _build_policy_metadata(
+                        tool_name=injected_tool,
+                        requires_approval=False,
+                        human_approved=False,
+                        policy_scope=context.access_level_policy,
+                        approval_error_code="",
+                    )
+                    injected_reason = _format_step_reason_with_policy(
+                        reason=str(injected_step.get("reason", "")).strip(),
+                        policy_metadata=injected_policy_metadata,
+                    )
+                    injected_step_index = max_steps_to_run + injected_step_counter
+                    injected_safe_args = _sanitize_tool_args(tool_name=injected_tool, args=injected_args)
+                    context.steps.append(
+                        {
+                            "step": injected_step_index,
+                            "tool": injected_tool,
+                            "args": injected_safe_args,
+                            "reason": injected_reason,
+                            "requires_approval": False,
+                            "human_approved": False,
+                            "access_level": injected_policy_metadata["access_level"],
+                            "policy": injected_policy_metadata,
+                            "retry": {
+                                "max_retries": 0,
+                                "retry_count": 0,
+                                "retries_exhausted": False,
+                                "trigger_failure_class": "",
+                                "known_fix": "",
+                                "attempts": [],
+                            },
+                            "_injected": True,
+                        }
+                    )
+                    context.tool_results.append(
+                        {
+                            "step": injected_step_index,
+                            "tool": injected_tool,
+                            "args": injected_safe_args,
+                            "access_level": injected_policy_metadata["access_level"],
+                            "policy": injected_policy_metadata,
+                            "result": summarize_tool_result(
+                                result=injected_result,
+                                max_tokens=_DEFAULT_TOOL_RESULT_SUMMARY_TOKENS,
+                            ),
+                            "retry": {
+                                "max_retries": 0,
+                                "retry_count": 0,
+                                "retries_exhausted": False,
+                                "trigger_failure_class": "",
+                                "known_fix": "",
+                                "attempts": [],
+                            },
+                            "_injected": True,
+                        }
+                    )
+
+                    if str(injected_result.get("status", "")).strip().lower() == "success":
+                        resolved_next_step = _resolve_click_from_state(next_step, injected_result)
+                        if isinstance(resolved_next_step, dict) and resolved_next_step is not next_step:
+                            next_step.clear()
+                            next_step.update(resolved_next_step)
+                            emit("[VOCO] Resolved next click target from injected browser state.", "info")
+                    else:
+                        injected_message = str(injected_result.get("message", "")).strip()
+                        if injected_message:
+                            emit(f"[VOCO] Injected state check failed: {injected_message}", "error")
             continue
 
         if result["status"] == "failure":
@@ -786,6 +874,8 @@ _ROUTER_LOW_CONF_DIRECT_TOOLS = {
     "browser_click",
     "browser_press_key",
     "browser_get_state",
+    "get_page_title",
+    "copy_text_to_clipboard",
     "write_in_notepad",
     "save_text_to_desktop_file",
     "search_local_paths",
@@ -808,6 +898,8 @@ _ACCESS_LEVEL_BY_TOOL: dict[str, str] = {
     "browser_click": "L2",
     "browser_press_key": "L2",
     "browser_get_state": "L2",
+    "get_page_title": "L2",
+    "copy_text_to_clipboard": "L2",
     "browser_switch_profile": "L2",
     "search_local_paths": "L2",
     "search_in_explorer": "L2",
@@ -894,6 +986,158 @@ def _annotate_step_reason(step_text: str, route_path: str, base_reason: str, too
     access_level = _get_tool_access_level(tool_name)
     detail = base_reason.strip() or "Tool-first execution step."
     return f"[{access_level}|{route_path}] {step_text} -> {detail}"
+
+
+_TITLE_COPY_STEP_REGEX = re.compile(r"\bcopy\b.*\btitle\b|\btitle\b.*\bcopy\b", flags=re.IGNORECASE)
+_STATE_INJECTION_GENERIC_CLICK_WORDS = {"video", "result", "item", "link", "article", "post", "entry"}
+_STATE_INJECTION_FUZZY_MIN_SCORE = 0.58
+
+
+def _step_requests_title_copy(step_text: str) -> bool:
+    return _TITLE_COPY_STEP_REGEX.search(str(step_text or "")) is not None
+
+
+def _extract_recent_clipboard_text(context: AgentContext) -> str | None:
+    if not isinstance(context.tool_results, list):
+        return None
+
+    for entry in reversed(context.tool_results):
+        if not isinstance(entry, dict):
+            continue
+        summarized = entry.get("result")
+        if not isinstance(summarized, dict):
+            continue
+        payload = summarized.get("result")
+        if isinstance(payload, dict):
+            for key in ("title", "text", "content"):
+                candidate = str(payload.get(key, "")).strip()
+                if candidate:
+                    return candidate
+            preview_lines = payload.get("text_preview")
+            if isinstance(preview_lines, list):
+                joined = "\n".join(str(line).strip() for line in preview_lines if str(line).strip()).strip()
+                if joined:
+                    return joined
+        elif isinstance(payload, str):
+            candidate = payload.strip()
+            if candidate:
+                return candidate
+    return None
+
+
+def _resolve_dynamic_tool_args(tool_name: str, tool_args: dict[str, object], context: AgentContext) -> dict[str, object]:
+    if str(tool_name).strip() != "copy_text_to_clipboard":
+        return tool_args
+
+    resolved_args = dict(tool_args)
+    explicit_text = str(resolved_args.get("text", "")).strip()
+    if explicit_text:
+        return resolved_args
+
+    inferred_text = _extract_recent_clipboard_text(context)
+    if inferred_text:
+        resolved_args["text"] = inferred_text
+    return resolved_args
+
+
+def _should_inject_state_check(current_step: dict, next_step: dict) -> bool:
+    current_tool = str(current_step.get("tool", "")).strip()
+    next_tool = str(next_step.get("tool", "")).strip()
+    if next_tool != "browser_click":
+        return False
+
+    current_args = current_step.get("args", {})
+    if not isinstance(current_args, dict):
+        current_args = {}
+    page_changed = (
+        current_tool == "browser_navigate"
+        or (current_tool == "browser_type" and bool(current_args.get("submit")))
+        or current_tool == "browser_press_key"
+    )
+    return page_changed
+
+
+def _inject_get_state_step() -> dict:
+    return {
+        "tool": "browser_get_state",
+        "args": {"max_elements": 100},
+        "reason": "Injected runtime state check before browser click.",
+        "_injected": True,
+    }
+
+
+def _extract_elements_from_state_result(state_result: dict) -> list[dict]:
+    if not isinstance(state_result, dict):
+        return []
+    payload = state_result.get("result")
+    if not isinstance(payload, dict):
+        return []
+    elements = payload.get("elements")
+    if not isinstance(elements, list):
+        return []
+    return [item for item in elements if isinstance(item, dict)]
+
+
+def _resolve_click_from_state(click_step: dict, state_result: dict) -> dict:
+    if not isinstance(click_step, dict):
+        return click_step
+    if str(click_step.get("tool", "")).strip() != "browser_click":
+        return click_step
+
+    args = click_step.get("args", {})
+    if not isinstance(args, dict):
+        return click_step
+
+    original_name = str(args.get("element_name", "")).strip()
+    if not original_name:
+        return click_step
+
+    elements = _extract_elements_from_state_result(state_result)
+    if not elements:
+        return click_step
+
+    clickable = [
+        item for item in elements
+        if str(item.get("role", "")).strip().lower() in {"link", "button"} and str(item.get("name", "")).strip()
+    ]
+    if not clickable:
+        return click_step
+
+    occurrence = max(1, _safe_int(args.get("occurrence"), 1))
+    normalized_name = original_name.lower().strip()
+    name_tokens = set(re.findall(r"[a-z0-9]+", normalized_name))
+    is_generic_name = not normalized_name or bool(name_tokens & _STATE_INJECTION_GENERIC_CLICK_WORDS)
+
+    resolved_name = ""
+    if is_generic_name:
+        resolved_index = min(len(clickable) - 1, occurrence - 1)
+        resolved_name = str(clickable[resolved_index].get("name", "")).strip()
+    else:
+        scored: list[tuple[float, str]] = []
+        for item in clickable:
+            candidate_name = str(item.get("name", "")).strip()
+            if not candidate_name:
+                continue
+            score = difflib.SequenceMatcher(None, normalized_name, candidate_name.lower()).ratio()
+            scored.append((score, candidate_name))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        if len(scored) >= occurrence and scored[occurrence - 1][0] >= _STATE_INJECTION_FUZZY_MIN_SCORE:
+            resolved_name = scored[occurrence - 1][1]
+
+    if not resolved_name:
+        return click_step
+
+    resolved_step = dict(click_step)
+    resolved_args = dict(args)
+    resolved_args["element_name"] = resolved_name
+    resolved_args["occurrence"] = 1
+    resolved_step["args"] = resolved_args
+
+    reason = str(resolved_step.get("reason", "")).strip()
+    suffix = f" [resolved_click_target='{resolved_name}']"
+    if suffix not in reason:
+        resolved_step["reason"] = f"{reason}{suffix}".strip()
+    return resolved_step
 
 
 def _plan_single_step_with_llm(step_task: str, context: AgentContext) -> dict:
@@ -1221,8 +1465,8 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                     if normalized_text:
                         direct_args["text"] = normalized_text
                 if _browser_multiline_requested(step_text) or "\n" in str(direct_args.get("text", "")):
-                    direct_args.setdefault("multiline", True)
-                    direct_args.setdefault("newline_mode", "shift_enter")
+                        direct_args.setdefault("multiline", True)
+                        direct_args.setdefault("newline_mode", "shift_enter")
             args = direct_args
             _append_plan_step(
                 {
@@ -1237,6 +1481,20 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                 },
                 source_step_text=step_text,
             )
+            if tool_name == "get_page_title" and _step_requests_title_copy(step_text):
+                _append_plan_step(
+                    {
+                        "tool": "copy_text_to_clipboard",
+                        "args": {},
+                        "reason": _annotate_step_reason(
+                            step_text=step_text,
+                            route_path="router_direct_followup",
+                            base_reason="Copy the retrieved page title to clipboard.",
+                            tool_name="copy_text_to_clipboard",
+                        ),
+                    },
+                    source_step_text=step_text,
+                )
         else:
             fallback_plan = _build_local_fastpath_plan(step_text)
             if fallback_plan is not None:

@@ -45,6 +45,23 @@ class VocoVoice:
     SILENCE_THRESHOLD = 0.012
     TRAILING_SILENCE_SECONDS = 0.9
     WAKE_LABEL_HINT = "jarvis"
+    DEFAULT_WHISPER_MODEL = "base.en"
+    VOICE_BASE_INSTALL_HINT = "pip install openwakeword sounddevice numpy faster-whisper"
+    VOICE_VAD_INSTALL_HINT = "pip install webrtcvad"
+    _DEPENDENCY_PACKAGE_MAP = {
+        "openwakeword": "openwakeword",
+        "sounddevice": "sounddevice",
+        "numpy": "numpy",
+        "faster-whisper": "faster-whisper",
+    }
+
+    @classmethod
+    def _build_install_hint(cls, missing: list[str]) -> str:
+        packages = [cls._DEPENDENCY_PACKAGE_MAP[name] for name in missing if name in cls._DEPENDENCY_PACKAGE_MAP]
+        unique_packages = list(dict.fromkeys(packages))
+        if not unique_packages:
+            return cls.VOICE_BASE_INSTALL_HINT
+        return f"pip install {' '.join(unique_packages)}"
 
     @classmethod
     def dependency_status(cls) -> dict[str, object]:
@@ -58,10 +75,13 @@ class VocoVoice:
         if WhisperModel is None:
             missing.append("faster-whisper")
 
+        install_hint = cls._build_install_hint(missing)
         return {
             "available": len(missing) == 0,
             "missing": missing,
             "vad_mode": "webrtcvad" if webrtcvad is not None else "silence-heuristic",
+            "install_hint": install_hint,
+            "vad_install_hint": cls.VOICE_VAD_INSTALL_HINT,
         }
 
     @classmethod
@@ -69,7 +89,10 @@ class VocoVoice:
         status = cls.dependency_status()
         status["runtime_ready"] = False
         status["error"] = ""
+        status["runtime_hint"] = ""
+        status["whisper_model_default"] = cls.DEFAULT_WHISPER_MODEL
         if not status["available"]:
+            status["runtime_hint"] = str(status.get("install_hint", cls.VOICE_BASE_INSTALL_HINT))
             return status
 
         errors = []
@@ -82,22 +105,36 @@ class VocoVoice:
                 errors.append(exc)
 
         status["error"] = str(errors[-1])
+        status["runtime_hint"] = (
+            "Ensure openwakeword ONNX models are available "
+            "(or install tflite-runtime for tflite models)."
+        )
         return status
 
     def __init__(
         self,
         on_command_callback: Callable[[str], None],
-        whisper_model_size: str = "base.en",
+        whisper_model_size: str = DEFAULT_WHISPER_MODEL,
         wake_threshold: float | None = None,
         on_status_callback: Callable[[str, str], None] | None = None,
     ):
         dep_status = self.dependency_status()
         if not dep_status["available"]:
             missing = ", ".join(dep_status["missing"])
-            raise RuntimeError(f"Voice dependencies missing: {missing}")
+            install_hint = str(dep_status.get("install_hint", self.VOICE_BASE_INSTALL_HINT)).strip()
+            raise RuntimeError(f"Voice dependencies missing: {missing}. Install with: {install_hint}")
 
         self._wake_model = self._create_wake_model()
-        self.whisper = WhisperModel(whisper_model_size, device="cpu", compute_type="int8")
+        self._whisper_model_size = str(whisper_model_size or self.DEFAULT_WHISPER_MODEL).strip() or self.DEFAULT_WHISPER_MODEL
+        try:
+            self.whisper = WhisperModel(self._whisper_model_size, device="cpu", compute_type="int8")
+        except Exception as exc:
+            hint = (
+                f"Failed to initialize faster-whisper model '{self._whisper_model_size}'. "
+                f"Install or repair dependencies with: {self.VOICE_BASE_INSTALL_HINT}. "
+                "Ensure the model download/cache path is writable."
+            )
+            raise RuntimeError(f"{hint} Runtime error: {exc}") from exc
         self.on_command = on_command_callback
         self._on_status = on_status_callback
         self._wake_threshold = self.WAKE_THRESHOLD if wake_threshold is None else wake_threshold
@@ -142,7 +179,7 @@ class VocoVoice:
 
     def _wake_word_loop(self) -> None:
         self._emit_status(
-            f"Wake listener active ({self.vad_mode} + faster-whisper).",
+            f"Wake listener active ({self.vad_mode} + faster-whisper:{self._whisper_model_size}).",
             "ready" if self.vad_mode == "webrtcvad" else "degraded",
         )
         try:
@@ -219,7 +256,13 @@ class VocoVoice:
         try:
             segments, _ = self.whisper.transcribe(audio, language="en", beam_size=1, vad_filter=False)
         except Exception as exc:  # pragma: no cover - runtime/model specific
-            self._emit_status(f"Transcription failed: {exc}", "error")
+            self._emit_status(
+                (
+                    f"Transcription failed ({self._whisper_model_size}): {exc}. "
+                    f"Check faster-whisper setup: {self.VOICE_BASE_INSTALL_HINT}"
+                ),
+                "error",
+            )
             return ""
         return " ".join(segment.text.strip() for segment in segments if segment.text.strip())
 

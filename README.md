@@ -258,6 +258,14 @@ Optional (preferred) VAD backend:
 pip install webrtcvad
 ```
 
+Voice runtime probe:
+
+```powershell
+python -c "from voice.wake_voice import VocoVoice; print(VocoVoice.startup_status())"
+```
+
+If startup reports missing dependencies or model init errors, follow the `install_hint` in the probe output.
+
 ## 4) Run benchmarks and regression gate
 
 List available benchmark scenarios:
