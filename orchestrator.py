@@ -6,6 +6,7 @@ Flow: task -> prompt -> LLM plan -> parse -> dispatch tools -> summarize.
 from __future__ import annotations
 
 import datetime
+import importlib.util
 import json
 import os
 import re
@@ -28,9 +29,194 @@ from llm import (
     get_last_num_ctx_used,
 )
 from memory import SecureMemoryError, append_context_entry, append_event, append_memory
-from router import predict_route, should_split_task, split_task_into_steps
+from router import predict_route
 from tools import TOOL_REGISTRY, dispatch_tool, tool_requires_approval
 from _prompt import build_correction_prompt, build_system_prompt, parse_response
+
+
+_MINIMAL_CONTEXT_MAX_CHARS = 2200
+_DEFAULT_TOOL_RESULT_SUMMARY_TOKENS = 120
+
+_DECOMPOSER_MODULE_PATH = Path(__file__).with_name("tools").joinpath("decomposer.py")
+_decomposer_spec = importlib.util.spec_from_file_location("task_decomposer", _DECOMPOSER_MODULE_PATH)
+if _decomposer_spec is None or _decomposer_spec.loader is None:
+    raise ImportError(f"Unable to load decomposer module from '{_DECOMPOSER_MODULE_PATH}'.")
+_task_decomposer = importlib.util.module_from_spec(_decomposer_spec)
+_decomposer_spec.loader.exec_module(_task_decomposer)
+needs_decomposition = _task_decomposer.needs_decomposition
+decompose_task = _task_decomposer.decompose_task
+
+_USER_PROFILE_MODULE_PATH = Path(__file__).with_name("memory").joinpath("user_profile.py")
+_FS_WATCHER_MODULE_PATH = Path(__file__).with_name("memory").joinpath("fs_watcher.py")
+_user_profile_class: type | None = None
+_user_profile_class_attempted = False
+_user_profile_store: object | None = None
+_user_profile_store_attempted = False
+_fs_watcher_module: object | None = None
+_fs_watcher_module_attempted = False
+_fs_watcher_observer: object | None = None
+
+
+def _coerce_positive_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 8:
+        return text[:max_chars]
+    suffix = f"...(+{len(text) - max_chars})"
+    if len(suffix) >= max_chars:
+        return text[: max_chars - 3] + "..."
+    cutoff = max_chars - len(suffix)
+    overflow = len(text) - cutoff
+    suffix = f"...(+{overflow})"
+    if len(suffix) >= max_chars:
+        return text[: max_chars - 3] + "..."
+    return text[: max_chars - len(suffix)] + suffix
+
+
+def _safe_json_dumps(value: object) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _estimate_text_size(value: object) -> int:
+    if isinstance(value, str):
+        return len(value)
+    return len(_safe_json_dumps(value))
+
+
+def _compact_value(value: object, char_budget: int, depth: int = 0) -> object:
+    budget = max(16, char_budget)
+
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, str):
+        return _truncate_text(_normalize_whitespace(value), budget)
+    if depth >= 2:
+        return _truncate_text(_normalize_whitespace(_safe_json_dumps(value)), budget)
+
+    if isinstance(value, dict):
+        max_items = 6 if depth == 0 else 4
+        per_item_budget = max(36, budget // max(1, max_items))
+        compacted: dict[str, object] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= max_items:
+                break
+            compacted[str(key)] = _compact_value(item, per_item_budget, depth + 1)
+        omitted = max(0, len(value) - len(compacted))
+        if omitted:
+            compacted["_omitted_keys"] = omitted
+        return compacted
+
+    if isinstance(value, (list, tuple)):
+        max_items = 4 if depth == 0 else 3
+        per_item_budget = max(28, budget // max(1, max_items))
+        compacted_list = [_compact_value(item, per_item_budget, depth + 1) for item in value[:max_items]]
+        omitted = max(0, len(value) - len(compacted_list))
+        if omitted:
+            compacted_list.append(f"... {omitted} more item(s)")
+        return compacted_list
+
+    return _truncate_text(_normalize_whitespace(str(value)), budget)
+
+
+def summarize_tool_result(result: object, max_tokens: int = _DEFAULT_TOOL_RESULT_SUMMARY_TOKENS) -> dict:
+    token_budget = _coerce_positive_int(max_tokens, _DEFAULT_TOOL_RESULT_SUMMARY_TOKENS)
+    char_budget = min(8000, max(200, token_budget * 4))
+
+    if not isinstance(result, dict):
+        payload_summary = _compact_value(result, max(80, char_budget - 48))
+        return {
+            "status": "unknown",
+            "message": "Tool returned non-dict payload.",
+            "result": payload_summary,
+            "debug": {
+                "raw_type": type(result).__name__,
+                "approx_chars": _estimate_text_size(result),
+                "summary_chars": _estimate_text_size(payload_summary),
+                "truncated": True,
+            },
+        }
+
+    status = _normalize_whitespace(str(result.get("status", ""))).lower() or "unknown"
+    message_budget = max(80, min(260, char_budget // 3))
+    message = _truncate_text(_normalize_whitespace(str(result.get("message", ""))), message_budget)
+    raw_payload = result.get("result")
+    payload_budget = max(90, char_budget - len(message) - 32)
+    payload_summary = _compact_value(raw_payload, payload_budget)
+    raw_chars = _estimate_text_size(raw_payload)
+    summary_chars = _estimate_text_size(payload_summary)
+
+    return {
+        "status": status,
+        "message": message,
+        "result": payload_summary,
+        "debug": {
+            "raw_type": type(raw_payload).__name__,
+            "approx_chars": raw_chars,
+            "summary_chars": summary_chars,
+            "truncated": summary_chars < raw_chars,
+        },
+    }
+
+
+def _build_memory_summary(context: AgentContext, max_tokens: int = 80) -> str:
+    token_budget = _coerce_positive_int(max_tokens, 80)
+    char_budget = min(2400, max(180, token_budget * 4))
+    segments: list[str] = []
+
+    if isinstance(context.memory, dict) and context.memory:
+        memory_snapshot = _compact_value(context.memory, char_budget // 2)
+        segments.append(f"memory={_safe_json_dumps(memory_snapshot)}")
+
+    if isinstance(context.history, list) and context.history:
+        history_snapshot = _compact_value(context.history[-3:], char_budget // 2)
+        segments.append(f"history={_safe_json_dumps(history_snapshot)}")
+
+    if isinstance(context.tool_results, list) and context.tool_results:
+        last_item = context.tool_results[-1]
+        if isinstance(last_item, dict):
+            last_payload = last_item.get("result")
+            if last_payload is not None:
+                last_summary = summarize_tool_result(last_payload, max_tokens=40)
+                segments.append(f"last_tool={_safe_json_dumps(last_summary)}")
+
+    if not segments:
+        return "none"
+    return _truncate_text(_normalize_whitespace(" | ".join(segments)), char_budget)
+
+
+def build_minimal_context(task: str, step: str | None, last_result: object, memory_summary: str) -> str:
+    task_text = _truncate_text(_normalize_whitespace(task), 700)
+    step_text = _truncate_text(_normalize_whitespace(step or ""), 340)
+    memory_text = _truncate_text(_normalize_whitespace(memory_summary), 540)
+
+    parts = [f"TASK: {task_text}"]
+    if step_text:
+        parts.append(f"CURRENT_STEP: {step_text}")
+        parts.append("FOCUS: Resolve CURRENT_STEP while staying consistent with TASK.")
+    if last_result is not None:
+        last_summary = summarize_tool_result(last_result, max_tokens=80)
+        parts.append(f"LAST_RESULT: {_truncate_text(_safe_json_dumps(last_summary), 900)}")
+    if memory_text and memory_text != "none":
+        parts.append(f"MEMORY: {memory_text}")
+    parts.append("OUTPUT: Return only a JSON array of tool steps.")
+    return _truncate_text("\n".join(parts), _MINIMAL_CONTEXT_MAX_CHARS)
 
 
 def run(task: str, context: AgentContext, ui_callback=None) -> str:
@@ -55,6 +241,8 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
     self_heal_retries = 0
     self_heal_outcomes: list[dict] = []
     raw_response = ""
+    _ensure_fs_watcher_started()
+    _record_user_profile_task(task=task)
 
     tool_first_bundle = _build_tool_first_hybrid_plan(task=task, context=context, emit=emit)
     local_plan = _build_local_fastpath_plan(task) if tool_first_bundle is None else None
@@ -232,9 +420,16 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
 
         emit("[VOCO] Building context...", "info")
         system_prompt = build_system_prompt(context)
+        memory_summary = _build_memory_summary(context=context, max_tokens=90)
+        planning_context = build_minimal_context(
+            task=task,
+            step="Generate a deterministic execution plan for the full task.",
+            last_result=context.tool_results[-1].get("result") if context.tool_results else None,
+            memory_summary=memory_summary,
+        )
 
         emit("[VOCO] Generating action plan...", "info")
-        raw_response = generate(system_prompt=system_prompt, user_message=task)
+        raw_response = generate(system_prompt=system_prompt, user_message=planning_context)
         model_used = get_last_model_used()
         emit(f"[VOCO] Model selected: {model_used} (num_ctx={get_last_num_ctx_used()})", "info")
         status, plan = parse_response(raw_response)
@@ -242,9 +437,20 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
         if status == "format_failure":
             format_failures += 1
             emit("[VOCO] Format issue detected. Requesting correction...", "info")
+            correction_signal = {
+                "status": "format_failure",
+                "message": "Planner output was not valid JSON.",
+                "result": raw_response,
+            }
+            correction_context = build_minimal_context(
+                task=task,
+                step="Correct the planner output into one valid JSON array.",
+                last_result=correction_signal,
+                memory_summary=memory_summary,
+            )
             correction_messages = [
-                {"role": "user", "content": task},
-                {"role": "assistant", "content": raw_response},
+                {"role": "user", "content": correction_context},
+                {"role": "assistant", "content": _safe_json_dumps(summarize_tool_result(correction_signal, 90))},
                 {"role": "user", "content": build_correction_prompt()},
             ]
             corrected_response = generate_with_history(system_prompt, correction_messages)
@@ -362,6 +568,7 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
         last_failure_class = ""
         last_known_fix = ""
         last_error_message = ""
+        last_correction_context: dict[str, object] = {}
 
         for attempt_number in range(1, max_step_retries + 2):
             if attempt_number > 1:
@@ -370,13 +577,25 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
             classification = _classify_tool_failure(tool_name=tool_name, result=result)
             status = str(result.get("status", "")).strip().lower()
             message = str(result.get("message", "")).strip()
+            correction_context: dict[str, object] = {}
+            known_fix_hint = str(classification["known_fix"])
             if status != "success":
+                correction_context = _build_retry_correction_context(
+                    tool_name=tool_name,
+                    failure_class=str(classification["class"]),
+                    known_fix=str(classification["known_fix"]),
+                    error_message=message,
+                )
+                selected_hint = _normalize_whitespace(str(correction_context.get("selected_hint", "")))
+                if selected_hint:
+                    known_fix_hint = selected_hint
                 if not trigger_failure_class:
                     trigger_failure_class = str(classification["class"])
-                    trigger_known_fix = str(classification["known_fix"])
+                    trigger_known_fix = known_fix_hint
                 last_failure_class = str(classification["class"])
-                last_known_fix = str(classification["known_fix"])
+                last_known_fix = known_fix_hint
                 last_error_message = message[:300]
+                last_correction_context = correction_context
 
             remaining_retry_budget = max_step_retries - (attempt_number - 1)
             should_retry = status != "success" and bool(classification["recoverable"]) and remaining_retry_budget > 0
@@ -388,7 +607,9 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                     "message": message[:300],
                     "classification": str(classification["class"]),
                     "recoverable": bool(classification["recoverable"]),
-                    "known_fix": str(classification["known_fix"]),
+                    "known_fix": known_fix_hint,
+                    "hint_source": str(correction_context.get("selected_hint_source", "builtin")).strip() or "builtin",
+                    "profile_hint_count": max(0, _safe_int(correction_context.get("profile_match_count"), 0)),
                     "will_retry": should_retry,
                 }
             )
@@ -399,7 +620,7 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 emit(
                     (
                         f"  RETRY {retry_count}/{max_step_retries} due to "
-                        f"{classification['class']}: {classification['known_fix']}"
+                        f"{classification['class']}: {known_fix_hint}"
                     ),
                     "info",
                 )
@@ -416,6 +637,8 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
             "known_fix": trigger_known_fix or last_known_fix,
             "attempts": retry_attempts,
         }
+        if last_correction_context:
+            retry_metadata["correction_context"] = last_correction_context
 
         if retries_exhausted:
             failure_class = last_failure_class or trigger_failure_class or "unknown"
@@ -424,10 +647,19 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 f"failure_class={failure_class}; retries={retry_count}/{max_step_retries}. "
                 f"Last error: {last_error_message}"
             )
+            learn_teach_affordance = _build_learn_teach_affordance(
+                tool_name=tool_name,
+                failure_class=failure_class,
+                retry_count=retry_count,
+                max_retries=max_step_retries,
+                correction_context=last_correction_context,
+            )
+            retry_metadata["learn_teach_affordance"] = learn_teach_affordance
             result = {
                 "status": "failure",
                 "result": result.get("result") if isinstance(result, dict) else None,
                 "message": exhausted_message,
+                "learn_teach_affordance": learn_teach_affordance,
             }
             retry_metadata["exhausted_message"] = exhausted_message
 
@@ -459,6 +691,10 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 "retry": retry_metadata,
             }
         )
+        summarized_result = summarize_tool_result(
+            result=result,
+            max_tokens=_DEFAULT_TOOL_RESULT_SUMMARY_TOKENS,
+        )
         context.tool_results.append(
             {
                 "step": index,
@@ -466,9 +702,16 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 "args": safe_tool_args,
                 "access_level": policy_metadata["access_level"],
                 "policy": policy_metadata,
-                "result": result,
+                "result": summarized_result,
                 "retry": retry_metadata,
             }
+        )
+        _record_user_profile_step(
+            tool_name=tool_name,
+            raw_args=tool_args,
+            safe_args=safe_tool_args,
+            result=result,
+            retry_metadata=retry_metadata,
         )
 
         if result["status"] == "success":
@@ -496,6 +739,7 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
         _write_incomplete_state(task=task, plan=plan, tool_results=context.tool_results)
 
     _persist_self_heal_outcomes(task=task, context=context, outcomes=self_heal_outcomes)
+    _record_user_profile_self_heal(task=task, outcomes=self_heal_outcomes)
 
     success = steps_completed > 0 and not execution_failed
     elapsed = round(time.time() - start_time, 1)
@@ -572,6 +816,10 @@ _ACCESS_LEVEL_BY_TOOL: dict[str, str] = {
     "read_file": "L2",
     "write_file": "L2",
     "list_files": "L2",
+    "get_system_health_snapshot": "L2",
+    "list_running_processes": "L2",
+    "get_network_status": "L2",
+    "list_usb_devices": "L2",
     "save_text_to_desktop_file": "L2",
     "index_files": "L2",
     "index_apps": "L2",
@@ -579,6 +827,8 @@ _ACCESS_LEVEL_BY_TOOL: dict[str, str] = {
     "youtube_comment_pipeline": "L2",
     # L3: privileged/sensitive system controls
     "run_command": "L3",
+    "run_powershell_command": "L3",
+    "kill_process": "L3",
     "disable_usb_device": "L3",
     "add_firewall_rule": "L3",
     "read_registry": "L3",
@@ -648,7 +898,19 @@ def _annotate_step_reason(step_text: str, route_path: str, base_reason: str, too
 def _plan_single_step_with_llm(step_task: str, context: AgentContext) -> dict:
     """Use Gemma as per-step fallback planner for unresolved atomic steps."""
     system_prompt = build_system_prompt(context)
-    raw_response = generate(system_prompt=system_prompt, user_message=step_task)
+    memory_summary = _build_memory_summary(context=context, max_tokens=80)
+    last_result = None
+    if context.tool_results:
+        last_tool_entry = context.tool_results[-1]
+        if isinstance(last_tool_entry, dict):
+            last_result = last_tool_entry.get("result")
+    step_context = build_minimal_context(
+        task=context.task or step_task,
+        step=step_task,
+        last_result=last_result,
+        memory_summary=memory_summary,
+    )
+    raw_response = generate(system_prompt=system_prompt, user_message=step_context)
     model_used = get_last_model_used()
     status, plan = parse_response(raw_response)
     format_failures = 0
@@ -656,9 +918,20 @@ def _plan_single_step_with_llm(step_task: str, context: AgentContext) -> dict:
 
     if status == "format_failure":
         format_failures += 1
+        correction_signal = {
+            "status": "format_failure",
+            "message": "Step planner output was not valid JSON.",
+            "result": raw_response,
+        }
+        correction_context = build_minimal_context(
+            task=context.task or step_task,
+            step=f"Correct planner output for step: {step_task}",
+            last_result=correction_signal,
+            memory_summary=memory_summary,
+        )
         correction_messages = [
-            {"role": "user", "content": step_task},
-            {"role": "assistant", "content": raw_response},
+            {"role": "user", "content": correction_context},
+            {"role": "assistant", "content": _safe_json_dumps(summarize_tool_result(correction_signal, 80))},
             {"role": "user", "content": build_correction_prompt()},
         ]
         corrected_response = generate_with_history(system_prompt, correction_messages)
@@ -688,7 +961,7 @@ def _plan_single_step_with_llm(step_task: str, context: AgentContext) -> dict:
     return {
         "ok": True,
         "error": "",
-        "raw_response": raw_response,
+        "raw_response": _truncate_text(raw_response, 500),
         "model_used": model_used,
         "format_failures": format_failures,
         "retries": retries,
@@ -828,6 +1101,24 @@ def _cleanup_decomposed_plan_steps(plan: list[dict], step_sources: list[str]) ->
     return cleaned_plan, suppressed_steps
 
 
+def _llm_decompose_steps(task_text: str, max_steps: int) -> str:
+    if not check_ollama_running():
+        return ""
+    prompt = (
+        "Break the request into atomic executable steps.\n"
+        f"Return ONLY a numbered list with no more than {max_steps} steps.\n"
+        "Rules:\n"
+        "1) Keep each step as one direct action.\n"
+        "2) Preserve critical details (profile names, file names, destinations).\n"
+        "3) Do not add commentary, markdown, or JSON.\n\n"
+        f"Request: {task_text}"
+    )
+    ok, response = generate_conversation(user_message=prompt, temperature=0.0)
+    if not ok:
+        return ""
+    return str(response).strip()
+
+
 def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dict | None:
     """
     Build a tool-first plan:
@@ -839,10 +1130,15 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
     """
     if _is_conversational_prompt(task):
         return None
-    if not should_split_task(task):
+    if not needs_decomposition(task):
         return None
 
-    split_steps = split_task_into_steps(task)
+    split_steps = decompose_task(
+        task,
+        max_steps=MAX_STEPS,
+        llm_decomposer=_llm_decompose_steps,
+        allow_llm_fallback=True,
+    )
     if len(split_steps) <= 1:
         return None
 
@@ -1104,6 +1400,604 @@ def _safe_int(value: object, default: int = 0) -> int:
         return default
 
 
+_PROFILE_FILE_ACTIVITY_TOOLS = {
+    "read_file",
+    "write_file",
+    "list_files",
+    "open_existing_document",
+    "open_file_with_default_app",
+    "search_file",
+    "search_local_paths",
+    "save_text_to_desktop_file",
+    "index_files",
+}
+_PROFILE_FILE_ACTIVITY_ARG_KEYS = (
+    "path",
+    "file_path",
+    "source_path",
+    "destination_path",
+    "directory",
+    "output_path",
+    "target_path",
+    "filename",
+)
+
+
+def _load_user_profile_class() -> type | None:
+    global _user_profile_class_attempted, _user_profile_class
+    if _user_profile_class is not None:
+        return _user_profile_class
+    if _user_profile_class_attempted:
+        return None
+
+    _user_profile_class_attempted = True
+    if not _USER_PROFILE_MODULE_PATH.exists():
+        return None
+
+    try:
+        spec = importlib.util.spec_from_file_location("voco_user_profile", _USER_PROFILE_MODULE_PATH)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        candidate = getattr(module, "UserProfile", None)
+        if isinstance(candidate, type):
+            _user_profile_class = candidate
+    except Exception:
+        _user_profile_class = None
+    return _user_profile_class
+
+
+def _get_user_profile_store() -> object | None:
+    global _user_profile_store_attempted, _user_profile_store
+    if _user_profile_store is not None:
+        return _user_profile_store
+    if _user_profile_store_attempted:
+        return None
+
+    _user_profile_store_attempted = True
+    profile_class = _load_user_profile_class()
+    if profile_class is None:
+        return None
+    try:
+        _user_profile_store = profile_class()
+    except Exception:
+        _user_profile_store = None
+    return _user_profile_store
+
+
+def _load_fs_watcher_module() -> object | None:
+    global _fs_watcher_module_attempted, _fs_watcher_module
+    if _fs_watcher_module is not None:
+        return _fs_watcher_module
+    if _fs_watcher_module_attempted:
+        return None
+
+    _fs_watcher_module_attempted = True
+    if not _FS_WATCHER_MODULE_PATH.exists():
+        return None
+
+    try:
+        spec = importlib.util.spec_from_file_location("voco_fs_watcher", _FS_WATCHER_MODULE_PATH)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _fs_watcher_module = module
+    except Exception:
+        _fs_watcher_module = None
+    return _fs_watcher_module
+
+
+def _observer_is_alive(observer: object | None) -> bool:
+    if observer is None:
+        return False
+    is_alive = getattr(observer, "is_alive", None)
+    if callable(is_alive):
+        try:
+            return bool(is_alive())
+        except Exception:
+            return False
+    return True
+
+
+def _ensure_fs_watcher_started() -> object | None:
+    global _fs_watcher_observer
+    if _observer_is_alive(_fs_watcher_observer):
+        return _fs_watcher_observer
+
+    module = _load_fs_watcher_module()
+    if module is None:
+        return None
+
+    starter = getattr(module, "start_filesystem_watcher", None)
+    if not callable(starter):
+        return None
+    try:
+        observer = starter()
+    except Exception:
+        return None
+
+    if _observer_is_alive(observer):
+        _fs_watcher_observer = observer
+        return observer
+    return None
+
+
+def start_fs_watcher() -> object | None:
+    return _ensure_fs_watcher_started()
+
+
+def stop_fs_watcher(observer: object | None = None) -> None:
+    global _fs_watcher_observer
+    module = _load_fs_watcher_module()
+    target = observer if observer is not None else _fs_watcher_observer
+    if target is None:
+        return
+
+    if module is not None:
+        stopper = getattr(module, "stop_filesystem_watcher", None)
+        if callable(stopper):
+            try:
+                stopper(target)
+            except Exception:
+                pass
+    elif _observer_is_alive(target):
+        stop_method = getattr(target, "stop", None)
+        if callable(stop_method):
+            try:
+                stop_method()
+            except Exception:
+                pass
+        join_method = getattr(target, "join", None)
+        if callable(join_method):
+            try:
+                join_method(timeout=3)
+            except Exception:
+                pass
+
+    if target is _fs_watcher_observer or observer is None:
+        _fs_watcher_observer = None
+
+
+_TEACH_MODE_ENDPOINT = "teach_mode_store_correction"
+
+
+def _try_user_profile_method(profile: object, method_name: str, **kwargs) -> tuple[bool, object | None]:
+    method = getattr(profile, method_name, None)
+    if not callable(method):
+        return False, None
+    try:
+        return True, method(**kwargs)
+    except Exception:
+        return False, None
+
+
+def _call_user_profile_method(profile: object, method_name: str, **kwargs) -> None:
+    _try_user_profile_method(profile, method_name, **kwargs)
+
+
+def _build_retry_recipe_key(failure_class: str, tool_name: str) -> str:
+    normalized_failure = _normalize_whitespace(str(failure_class or "")).lower() or "unknown"
+    normalized_tool = _normalize_whitespace(str(tool_name or "")).lower() or "unknown"
+    return _truncate_text(f"{normalized_failure}|{normalized_tool}", 280)
+
+
+def _collect_profile_retry_hints(
+    profile: object,
+    *,
+    failure_class: str,
+    tool_name: str,
+    limit: int = 3,
+) -> list[dict[str, str]]:
+    normalized_failure = _normalize_whitespace(failure_class).lower()
+    normalized_tool = _normalize_whitespace(tool_name).lower()
+    max_hints = max(1, limit)
+    hints: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _add_hint(text: object, source: str) -> None:
+        hint = _truncate_text(_normalize_whitespace(str(text or "")), 260)
+        if not hint:
+            return
+        signature = hint.lower()
+        if signature in seen:
+            return
+        seen.add(signature)
+        hints.append({"hint": hint, "source": source})
+
+    profile_queries: list[dict[str, object]] = []
+    if normalized_failure and normalized_tool:
+        profile_queries.append({"failure_class": normalized_failure, "tool_name": normalized_tool})
+    if normalized_failure:
+        profile_queries.append({"failure_class": normalized_failure})
+    if normalized_tool:
+        profile_queries.append({"tool_name": normalized_tool})
+
+    for query in profile_queries:
+        ok, rows = _try_user_profile_method(profile, "get_failure_memory", limit=8, **query)
+        if not ok or not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            _add_hint(row.get("known_fix"), "failure_memory")
+            if len(hints) >= max_hints:
+                return hints[:max_hints]
+
+    ok, recipes = _try_user_profile_method(profile, "get_learned_recipes", limit=30)
+    if not ok or not isinstance(recipes, list):
+        return hints[:max_hints]
+
+    recipe_key = _build_retry_recipe_key(normalized_failure, normalized_tool)
+    for recipe in recipes:
+        if not isinstance(recipe, dict):
+            continue
+        key = _normalize_whitespace(str(recipe.get("recipe_key", ""))).lower()
+        if key != recipe_key:
+            continue
+        _add_hint(recipe.get("recipe_text"), "learned_recipe")
+        if len(hints) >= max_hints:
+            return hints[:max_hints]
+
+    if hints:
+        return hints[:max_hints]
+
+    for recipe in recipes:
+        if not isinstance(recipe, dict):
+            continue
+        key = _normalize_whitespace(str(recipe.get("recipe_key", ""))).lower()
+        if not key:
+            continue
+        matches_failure = bool(normalized_failure and key.startswith(f"{normalized_failure}|"))
+        matches_tool = bool(normalized_tool and key.endswith(f"|{normalized_tool}"))
+        if not (matches_failure or matches_tool):
+            continue
+        _add_hint(recipe.get("recipe_text"), "learned_recipe")
+        if len(hints) >= max_hints:
+            return hints[:max_hints]
+
+    return hints[:max_hints]
+
+
+def _build_retry_correction_context(
+    *,
+    tool_name: str,
+    failure_class: str,
+    known_fix: str,
+    error_message: str,
+) -> dict[str, object]:
+    normalized_tool = _normalize_whitespace(str(tool_name or "")).lower() or "unknown"
+    normalized_failure = _normalize_whitespace(str(failure_class or "")).lower() or "unknown"
+    fallback_fix = _truncate_text(_normalize_whitespace(str(known_fix or "")), 260)
+    context: dict[str, object] = {
+        "failure_class": normalized_failure,
+        "tool_name": normalized_tool,
+        "base_known_fix": fallback_fix,
+        "selected_hint": fallback_fix,
+        "selected_hint_source": "builtin" if fallback_fix else "none",
+        "profile_hints": [],
+        "profile_match_count": 0,
+        "error_excerpt": _truncate_text(_normalize_whitespace(str(error_message or "")), 220),
+    }
+
+    profile = _get_user_profile_store()
+    if profile is None:
+        return context
+
+    profile_hints = _collect_profile_retry_hints(
+        profile,
+        failure_class=normalized_failure,
+        tool_name=normalized_tool,
+        limit=3,
+    )
+    hint_values = [str(item.get("hint", "")).strip() for item in profile_hints if isinstance(item, dict)]
+    hint_values = [hint for hint in hint_values if hint]
+    context["profile_hints"] = hint_values
+    context["profile_match_count"] = len(hint_values)
+
+    if hint_values:
+        context["selected_hint"] = hint_values[0]
+        context["selected_hint_source"] = str(profile_hints[0].get("source", "profile")).strip() or "profile"
+
+    return context
+
+
+def _build_learn_teach_affordance(
+    *,
+    tool_name: str,
+    failure_class: str,
+    retry_count: int,
+    max_retries: int,
+    correction_context: dict[str, object] | None = None,
+) -> dict[str, object]:
+    context = correction_context if isinstance(correction_context, dict) else {}
+    normalized_tool = _normalize_whitespace(str(tool_name or "")).lower() or "unknown"
+    normalized_failure = _normalize_whitespace(str(failure_class or "")).lower() or "unknown"
+    suggested_hint = _truncate_text(_normalize_whitespace(str(context.get("selected_hint", ""))), 260)
+    hint_source = _normalize_whitespace(str(context.get("selected_hint_source", ""))) or "builtin"
+    return {
+        "available": True,
+        "mode": "teach_mode",
+        "endpoint": _TEACH_MODE_ENDPOINT,
+        "recipe_key": _build_retry_recipe_key(normalized_failure, normalized_tool),
+        "failure_class": normalized_failure,
+        "tool_name": normalized_tool,
+        "suggested_correction": suggested_hint,
+        "hint_source": hint_source,
+        "retry_count": max(0, _safe_int(retry_count, 0)),
+        "max_retries": max(0, _safe_int(max_retries, 0)),
+    }
+
+
+def teach_mode_store_correction(
+    failure_class: str,
+    tool_name: str,
+    correction_text: str,
+    *,
+    success: bool | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    profile = _get_user_profile_store()
+    if profile is None:
+        return {
+            "status": "error",
+            "result": None,
+            "message": "Teach-mode storage unavailable: UserProfile store not initialized.",
+        }
+
+    normalized_failure = _normalize_whitespace(str(failure_class or "")).lower() or "unknown"
+    normalized_tool = _normalize_whitespace(str(tool_name or "")).lower() or "unknown"
+    normalized_correction = _truncate_text(_normalize_whitespace(str(correction_text or "")), 4000)
+    if not normalized_correction:
+        return {
+            "status": "error",
+            "result": None,
+            "message": "Teach-mode storage requires a non-empty correction_text.",
+        }
+
+    payload_metadata = {
+        "source": "teach_mode_scaffold",
+        "failure_class": normalized_failure,
+        "tool_name": normalized_tool,
+    }
+    if isinstance(metadata, dict):
+        payload_metadata.update(metadata)
+
+    call_succeeded = False
+    stored_payload: object | None = None
+    if hasattr(profile, "store_teach_mode_entry"):
+        call_succeeded, stored_payload = _try_user_profile_method(
+            profile,
+            "store_teach_mode_entry",
+            failure_class=normalized_failure,
+            tool_name=normalized_tool,
+            correction_text=normalized_correction,
+            success=success,
+            metadata=payload_metadata,
+            record_failure_event=False,
+        )
+
+    recipe_key = _build_retry_recipe_key(normalized_failure, normalized_tool)
+    if not call_succeeded:
+        call_succeeded, _ = _try_user_profile_method(
+            profile,
+            "record_learned_recipe",
+            recipe_key=recipe_key,
+            recipe_text=normalized_correction,
+            success=success,
+            metadata=payload_metadata,
+        )
+
+    if not call_succeeded:
+        return {
+            "status": "error",
+            "result": None,
+            "message": "Teach-mode storage failed while writing correction entry to UserProfile.",
+        }
+
+    result_payload: dict[str, object] = {
+        "recipe_key": recipe_key,
+        "failure_class": normalized_failure,
+        "tool_name": normalized_tool,
+        "stored_correction": normalized_correction,
+        "source": "teach_mode_scaffold",
+    }
+    if isinstance(stored_payload, dict):
+        for key in ("updated_at", "last_outcome", "record_failure_event"):
+            value = stored_payload.get(key)
+            if value is not None:
+                result_payload[key] = value
+
+    return {
+        "status": "success",
+        "result": result_payload,
+        "message": "Teach-mode correction stored in UserProfile.",
+    }
+
+
+def _extract_profile_file_paths(tool_name: str, args: dict) -> list[str]:
+    normalized_tool = str(tool_name or "").strip().lower()
+    if normalized_tool not in _PROFILE_FILE_ACTIVITY_TOOLS:
+        return []
+
+    paths: list[str] = []
+    for key in _PROFILE_FILE_ACTIVITY_ARG_KEYS:
+        value = args.get(key)
+        candidates: list[str] = []
+        if isinstance(value, str):
+            candidates = [value]
+        elif isinstance(value, (list, tuple)):
+            candidates = [item for item in value if isinstance(item, str)]
+        for candidate in candidates:
+            normalized_path = _truncate_text(str(candidate).strip(), 1200)
+            if normalized_path and normalized_path not in paths:
+                paths.append(normalized_path)
+    return paths[:5]
+
+
+def _extract_profile_app_event(tool_name: str, args: dict) -> tuple[str, str] | None:
+    normalized_tool = str(tool_name or "").strip().lower()
+    if normalized_tool == "open_app":
+        app_name = _normalize_whitespace(str(args.get("app_name") or args.get("name") or ""))
+        if app_name:
+            return app_name, "open"
+        return None
+
+    if normalized_tool.startswith("browser_"):
+        browser = _normalize_whitespace(str(args.get("browser") or "browser"))
+        action = normalized_tool.removeprefix("browser_") or normalized_tool
+        return browser, action
+
+    if normalized_tool in {"focus_window", "get_window_state", "click_in_window", "type_text"}:
+        window_name = _normalize_whitespace(str(args.get("window_title") or args.get("title") or ""))
+        if window_name:
+            return window_name, normalized_tool
+    return None
+
+
+def _record_user_profile_task(task: str) -> None:
+    profile = _get_user_profile_store()
+    if profile is None:
+        return
+
+    normalized_task = _truncate_text(_normalize_whitespace(task), 1200)
+    if not normalized_task:
+        return
+    _call_user_profile_method(
+        profile,
+        "record_command",
+        command=normalized_task,
+        status="task_received",
+        tool_name="orchestrator.run",
+        metadata={"source": "run"},
+    )
+
+
+def _record_user_profile_step(
+    tool_name: str,
+    raw_args: dict,
+    safe_args: dict,
+    result: dict,
+    retry_metadata: dict,
+) -> None:
+    profile = _get_user_profile_store()
+    if profile is None:
+        return
+
+    normalized_tool = str(tool_name or "").strip()
+    if not normalized_tool:
+        return
+    normalized_status = _normalize_whitespace(str(result.get("status", ""))).lower() or "unknown"
+    normalized_message = _truncate_text(_normalize_whitespace(str(result.get("message", ""))), 320)
+    safe_args_payload = safe_args if isinstance(safe_args, dict) else {}
+    safe_args_preview = _truncate_text(_safe_json_dumps(safe_args_payload), 900)
+    command_text = normalized_tool
+    if safe_args_preview and safe_args_preview != "{}":
+        command_text = f"{normalized_tool} {safe_args_preview}"
+
+    retry_payload = retry_metadata if isinstance(retry_metadata, dict) else {}
+    _call_user_profile_method(
+        profile,
+        "record_command",
+        command=command_text,
+        status=normalized_status,
+        tool_name=normalized_tool,
+        metadata={
+            "message": normalized_message,
+            "retry_count": max(0, _safe_int(retry_payload.get("retry_count"), 0)),
+            "retries_exhausted": bool(retry_payload.get("retries_exhausted")),
+        },
+    )
+
+    args_payload = raw_args if isinstance(raw_args, dict) else {}
+    for candidate_path in _extract_profile_file_paths(normalized_tool, args_payload):
+        _call_user_profile_method(
+            profile,
+            "record_file_activity",
+            path=candidate_path,
+            action=normalized_tool,
+            tool_name=normalized_tool,
+            status=normalized_status,
+            metadata={"message": normalized_message},
+        )
+
+    app_event = _extract_profile_app_event(normalized_tool, args_payload)
+    if app_event is not None:
+        app_name, app_action = app_event
+        _call_user_profile_method(
+            profile,
+            "record_app_usage",
+            app_name=app_name,
+            action=app_action,
+            tool_name=normalized_tool,
+            status=normalized_status,
+            metadata={"message": normalized_message},
+        )
+
+    if normalized_tool.lower() == "update_user_profile" and normalized_status == "success":
+        pref_key = _normalize_whitespace(str(args_payload.get("key") or ""))
+        if pref_key:
+            raw_pref_value = args_payload.get("value")
+            if _is_sensitive_arg_key(pref_key):
+                pref_value = _REDACTED_ARG_VALUE
+            else:
+                pref_value = _truncate_text(_normalize_whitespace(str(raw_pref_value or "")), 400)
+            _call_user_profile_method(
+                profile,
+                "set_preference",
+                key=pref_key,
+                value=pref_value,
+                metadata={"source": "update_user_profile"},
+            )
+
+    if normalized_status in {"error", "failure"}:
+        failure_class = _normalize_whitespace(str(retry_payload.get("trigger_failure_class", "")))
+        known_fix = _normalize_whitespace(str(retry_payload.get("known_fix", "")))
+        _call_user_profile_method(
+            profile,
+            "record_failure",
+            failure_class=failure_class or normalized_status,
+            message=normalized_message or "tool execution failed",
+            tool_name=normalized_tool,
+            known_fix=known_fix,
+            metadata={"args": safe_args_payload},
+        )
+
+
+def _record_user_profile_self_heal(task: str, outcomes: list[dict]) -> None:
+    if not outcomes:
+        return
+
+    profile = _get_user_profile_store()
+    if profile is None:
+        return
+
+    normalized_task = _truncate_text(_normalize_whitespace(task), 240)
+    for outcome in outcomes:
+        if not isinstance(outcome, dict):
+            continue
+        known_fix = _normalize_whitespace(str(outcome.get("known_fix", "")))
+        if not known_fix:
+            continue
+        failure_class = _normalize_whitespace(str(outcome.get("trigger_failure_class", ""))) or "unknown"
+        tool_name = _normalize_whitespace(str(outcome.get("tool", ""))) or "unknown"
+        recipe_key = _truncate_text(f"{failure_class}|{tool_name}", 280)
+        _call_user_profile_method(
+            profile,
+            "record_learned_recipe",
+            recipe_key=recipe_key,
+            recipe_text=known_fix,
+            success=bool(outcome.get("resolved")),
+            metadata={
+                "task": normalized_task,
+                "step": _safe_int(outcome.get("step"), 0),
+                "retry_count": max(0, _safe_int(outcome.get("retry_count"), 0)),
+                "retries_exhausted": bool(outcome.get("retries_exhausted")),
+            },
+        )
+
+
 def _classify_tool_failure(tool_name: str, result: dict) -> dict[str, object]:
     status = str(result.get("status", "")).strip().lower()
     if status == "success":
@@ -1199,6 +2093,8 @@ def _sanitize_retry_metadata(raw_retry: dict | None) -> dict:
                     "classification": str(item.get("classification", "")).strip() or "unknown",
                     "recoverable": bool(item.get("recoverable")),
                     "known_fix": str(item.get("known_fix", "")).strip(),
+                    "hint_source": str(item.get("hint_source", "")).strip(),
+                    "profile_hint_count": max(0, _safe_int(item.get("profile_hint_count"), 0)),
                     "will_retry": bool(item.get("will_retry")),
                 }
             )
@@ -1214,6 +2110,53 @@ def _sanitize_retry_metadata(raw_retry: dict | None) -> dict:
     exhausted_message = str(raw_retry.get("exhausted_message", "")).strip()
     if exhausted_message:
         normalized["exhausted_message"] = exhausted_message[:300]
+
+    correction_context = raw_retry.get("correction_context")
+    if isinstance(correction_context, dict):
+        profile_hints = correction_context.get("profile_hints")
+        normalized_hints: list[str] = []
+        if isinstance(profile_hints, list):
+            for hint in profile_hints[:3]:
+                normalized_hint = _truncate_text(_normalize_whitespace(str(hint or "")), 260)
+                if normalized_hint:
+                    normalized_hints.append(normalized_hint)
+        normalized["correction_context"] = {
+            "failure_class": str(correction_context.get("failure_class", "")).strip(),
+            "tool_name": str(correction_context.get("tool_name", "")).strip(),
+            "base_known_fix": _truncate_text(
+                _normalize_whitespace(str(correction_context.get("base_known_fix", ""))),
+                260,
+            ),
+            "selected_hint": _truncate_text(
+                _normalize_whitespace(str(correction_context.get("selected_hint", ""))),
+                260,
+            ),
+            "selected_hint_source": str(correction_context.get("selected_hint_source", "")).strip(),
+            "profile_hints": normalized_hints,
+            "profile_match_count": max(0, _safe_int(correction_context.get("profile_match_count"), 0)),
+            "error_excerpt": _truncate_text(
+                _normalize_whitespace(str(correction_context.get("error_excerpt", ""))),
+                220,
+            ),
+        }
+
+    learn_teach = raw_retry.get("learn_teach_affordance")
+    if isinstance(learn_teach, dict):
+        normalized["learn_teach_affordance"] = {
+            "available": bool(learn_teach.get("available")),
+            "mode": str(learn_teach.get("mode", "")).strip(),
+            "endpoint": str(learn_teach.get("endpoint", "")).strip(),
+            "recipe_key": str(learn_teach.get("recipe_key", "")).strip(),
+            "failure_class": str(learn_teach.get("failure_class", "")).strip(),
+            "tool_name": str(learn_teach.get("tool_name", "")).strip(),
+            "suggested_correction": _truncate_text(
+                _normalize_whitespace(str(learn_teach.get("suggested_correction", ""))),
+                260,
+            ),
+            "hint_source": str(learn_teach.get("hint_source", "")).strip(),
+            "retry_count": max(0, _safe_int(learn_teach.get("retry_count"), 0)),
+            "max_retries": max(0, _safe_int(learn_teach.get("max_retries"), 0)),
+        }
     return normalized
 
 
@@ -1246,9 +2189,25 @@ def _build_tool_results_log(tool_results: list[dict] | None) -> list[dict]:
         payload = item.get("result", {})
         status = "unknown"
         message = ""
+        result_preview = ""
+        result_debug: dict[str, object] = {}
         if isinstance(payload, dict):
             status = str(payload.get("status", "")).strip().lower() or "unknown"
             message = str(payload.get("message", "")).strip()
+            payload_result = payload.get("result")
+            if payload_result is not None:
+                result_preview = _truncate_text(
+                    _normalize_whitespace(_safe_json_dumps(payload_result)),
+                    240,
+                )
+            debug_payload = payload.get("debug")
+            if isinstance(debug_payload, dict):
+                result_debug = {
+                    "raw_type": str(debug_payload.get("raw_type", "")).strip(),
+                    "approx_chars": max(0, _safe_int(debug_payload.get("approx_chars"), 0)),
+                    "summary_chars": max(0, _safe_int(debug_payload.get("summary_chars"), 0)),
+                    "truncated": bool(debug_payload.get("truncated")),
+                }
         policy = _sanitize_policy_metadata(item.get("policy"))
         records.append(
             {
@@ -1256,6 +2215,8 @@ def _build_tool_results_log(tool_results: list[dict] | None) -> list[dict]:
                 "tool": str(item.get("tool", "")).strip(),
                 "status": status,
                 "message": message[:300],
+                "result_preview": result_preview,
+                "result_debug": result_debug,
                 "access_level": policy["access_level"],
                 "policy": policy,
                 "retry": _sanitize_retry_metadata(item.get("retry")),
@@ -1361,14 +2322,32 @@ def _build_action_trace(steps: list[dict] | None, tool_results: list[dict] | Non
         payload = item.get("result", {})
         status = "unknown"
         message = ""
+        result_preview = ""
+        result_debug: dict[str, object] = {}
         if isinstance(payload, dict):
             raw_status = str(payload.get("status", "")).strip().lower()
             if raw_status:
                 status = raw_status
             message = str(payload.get("message", "")).strip()
+            payload_result = payload.get("result")
+            if payload_result is not None:
+                result_preview = _truncate_text(
+                    _normalize_whitespace(_safe_json_dumps(payload_result)),
+                    240,
+                )
+            debug_payload = payload.get("debug")
+            if isinstance(debug_payload, dict):
+                result_debug = {
+                    "raw_type": str(debug_payload.get("raw_type", "")).strip(),
+                    "approx_chars": max(0, _safe_int(debug_payload.get("approx_chars"), 0)),
+                    "summary_chars": max(0, _safe_int(debug_payload.get("summary_chars"), 0)),
+                    "truncated": bool(debug_payload.get("truncated")),
+                }
         result_by_step[step_index] = {
             "status": status,
             "message": message[:300],
+            "result_preview": result_preview,
+            "result_debug": result_debug,
             "policy": _sanitize_policy_metadata(item.get("policy")),
             "retry": _sanitize_retry_metadata(item.get("retry")),
         }
@@ -1394,7 +2373,14 @@ def _build_action_trace(steps: list[dict] | None, tool_results: list[dict] | Non
         step_retry = _sanitize_retry_metadata(step.get("retry"))
         result_info = result_by_step.get(
             step_index,
-            {"status": "unknown", "message": "", "policy": step_policy, "retry": step_retry},
+            {
+                "status": "unknown",
+                "message": "",
+                "result_preview": "",
+                "result_debug": {},
+                "policy": step_policy,
+                "retry": step_retry,
+            },
         )
         policy_info = _sanitize_policy_metadata(result_info.get("policy"))
         retry_info = result_info.get("retry")
@@ -1409,6 +2395,8 @@ def _build_action_trace(steps: list[dict] | None, tool_results: list[dict] | Non
                 "reason": reason,
                 "status": result_info["status"],
                 "message": result_info["message"],
+                "result_preview": str(result_info.get("result_preview", "")),
+                "result_debug": result_info.get("result_debug", {}),
                 "requires_approval": requires_approval,
                 "human_approved": human_approved,
                 "access_level": policy_info["access_level"],
@@ -1419,6 +2407,8 @@ def _build_action_trace(steps: list[dict] | None, tool_results: list[dict] | Non
                 "failure_class": str(retry_info.get("trigger_failure_class", "")).strip(),
                 "known_fix": str(retry_info.get("known_fix", "")).strip(),
                 "retry_attempts": retry_info.get("attempts", []),
+                "correction_context": retry_info.get("correction_context", {}),
+                "learn_teach_affordance": retry_info.get("learn_teach_affordance", {}),
             }
         )
 

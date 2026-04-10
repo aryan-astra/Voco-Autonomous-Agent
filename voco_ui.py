@@ -1,7 +1,6 @@
 """VOCO TUI frontend prototype using Textual (no backend logic)."""
 
 import asyncio
-import os
 import queue
 import threading
 from rich.markup import escape
@@ -13,7 +12,7 @@ from textual.widgets import Footer, Input, Label, RichLog, Rule, Static
 
 from constants import OLLAMA_MODEL
 from context import AgentContext
-from orchestrator import run as orchestrator_run
+from orchestrator import run as orchestrator_run, start_fs_watcher, stop_fs_watcher
 
 
 _agent_context = AgentContext()
@@ -109,6 +108,12 @@ class VocoApp(App):
 
     #left-column .meta {
         color: #7E7E81;
+    }
+
+    #voice-status {
+        color: #7E7E81;
+        margin-top: 1;
+        text-style: bold;
     }
 
     #right-column {
@@ -219,6 +224,8 @@ class VocoApp(App):
         self._worker_thread = threading.Thread(target=self._task_worker_loop, daemon=True)
         self._voice_agent = None
         self._voice_enabled = False
+        self._voice_degraded = False
+        self._fs_watcher_observer = None
 
     def compose(self) -> ComposeResult:
         # The UI is split into three vertical bands:
@@ -236,6 +243,7 @@ class VocoApp(App):
                             yield Static(self.MASCOT_FRAMES[0], id="mascot")
                             yield Label(_MODEL_META_LABEL, classes="meta")
                             yield Label("/workspace/voco/apps", classes="meta")
+                            yield Label("Voice: OFF", id="voice-status")
 
                         # Right activity/information column.
                         with Vertical(id="right-column"):
@@ -267,12 +275,19 @@ class VocoApp(App):
         self.query_one("#dashboard", Container).border_title = " VOCO v1.0.0 "
         self.query_one("#command-input", Input).focus()
         self.set_interval(1.2, self._animate_mascot)
+        self._fs_watcher_observer = start_fs_watcher()
         if not self._worker_thread.is_alive():
             self._worker_thread.start()
+        self._probe_voice_runtime()
 
     def on_unmount(self) -> None:
         self._worker_stop.set()
         self._task_queue.put_nowait(None)
+        try:
+            stop_fs_watcher(self._fs_watcher_observer)
+        except Exception:
+            pass
+        self._fs_watcher_observer = None
         if self._voice_agent is not None:
             try:
                 self._voice_agent.stop()
@@ -280,6 +295,7 @@ class VocoApp(App):
                 pass
             self._voice_agent = None
             self._voice_enabled = False
+        self._set_voice_status_indicator("OFF")
 
     def _animate_mascot(self) -> None:
         """Animate mascot while dashboard is visible for subtle liveliness."""
@@ -303,7 +319,7 @@ class VocoApp(App):
         chat_log.write(Text("  /resume           Continue last workflow", style="#D4D4D4"))
         chat_log.write(Text("  /index            Build full file index", style="#D4D4D4"))
         chat_log.write(Text("  /index-app        Build installed app index", style="#D4D4D4"))
-        chat_log.write(Text("  Ctrl+V            Mock voice input", style="#D4D4D4"))
+        chat_log.write(Text("  Ctrl+G            Toggle wake-word voice", style="#D4D4D4"))
 
     async def _handle_slash_command(self, command: str, chat_log: RichLog) -> bool:
         """Handle slash commands and return True when a command was consumed."""
@@ -380,6 +396,97 @@ class VocoApp(App):
         chat_log = self._activate_conversation()
         chat_log.write(Text(message, style=style))
 
+    def _set_voice_status_indicator(
+        self,
+        status: str,
+        detail: str = "",
+        color: str = "#7E7E81",
+    ) -> None:
+        suffix = f" ({detail})" if detail else ""
+        indicator = self.query_one("#voice-status", Label)
+        indicator.update(f"Voice: {status}{suffix}")
+        indicator.styles.color = color
+
+    def _probe_voice_runtime(self) -> None:
+        try:
+            from voice.wake_voice import VocoVoice
+
+            dep_status = VocoVoice.startup_status()
+        except Exception as exc:
+            self._voice_degraded = True
+            self._set_voice_status_indicator("DEGRADED", "voice unavailable", "red")
+            self._update_output(f"[VOCO VOICE] Voice init probe failed: {exc}", "red")
+            return
+
+        if not dep_status["available"]:
+            missing = ", ".join(str(name) for name in dep_status["missing"])
+            self._voice_degraded = True
+            self._set_voice_status_indicator("DEGRADED", "missing deps", "yellow")
+            self._update_output(f"[VOCO VOICE] Voice unavailable (missing: {missing}).", "yellow")
+            return
+
+        if not dep_status["runtime_ready"]:
+            self._voice_degraded = True
+            self._set_voice_status_indicator("DEGRADED", "wake model unavailable", "red")
+            self._update_output(
+                f"[VOCO VOICE] Wake model unavailable: {dep_status['error']}",
+                "red",
+            )
+            return
+
+        if dep_status["vad_mode"] == "webrtcvad":
+            self._voice_degraded = False
+            self._set_voice_status_indicator("READY", "WebRTC VAD")
+            return
+
+        self._voice_degraded = True
+        self._set_voice_status_indicator("DEGRADED", "silence VAD fallback", "yellow")
+        self._update_output(
+            "[VOCO VOICE] webrtcvad missing. Using silence-heuristic VAD fallback.",
+            "yellow",
+        )
+
+    def _handle_voice_status_event(self, message: str, level: str = "info") -> None:
+        color_map = {
+            "info": "white",
+            "step": "cyan",
+            "ready": "green",
+            "degraded": "yellow",
+            "error": "red",
+        }
+        self._update_output(f"[VOCO VOICE] {message}", color_map.get(level, "white"))
+
+        if level == "ready":
+            if self._voice_agent is not None and getattr(self._voice_agent, "vad_mode", "") == "webrtcvad":
+                self._voice_degraded = False
+                self._set_voice_status_indicator("ON", "WebRTC VAD", "green")
+                return
+            self._voice_degraded = True
+            self._set_voice_status_indicator("DEGRADED", "silence VAD fallback", "yellow")
+            return
+
+        if level == "degraded":
+            self._voice_degraded = True
+            self._set_voice_status_indicator("DEGRADED", "silence VAD fallback", "yellow")
+            return
+
+        if level == "error":
+            self._voice_enabled = False
+            self._voice_agent = None
+            self._voice_degraded = True
+            self._set_voice_status_indicator("DEGRADED", "voice runtime error", "red")
+
+    def _queue_voice_command(self, spoken: str) -> None:
+        command = spoken.strip()
+        if not command:
+            return
+
+        app_thread_id = getattr(self, "_thread_id", None)
+        if app_thread_id is not None and app_thread_id == threading.get_ident():
+            self._handle_user_input(command)
+            return
+        self.call_from_thread(self._handle_user_input, command)
+
     def _emit_to_ui(self, message: str, level: str = "info") -> None:
         """
         Thread-safe callback used by orchestrator.run to stream progress.
@@ -438,29 +545,40 @@ class VocoApp(App):
                 return
             self._voice_enabled = False
             self._voice_agent = None
+            self._voice_degraded = False
+            self._set_voice_status_indicator("OFF")
             chat_log.write(Text("[VOCO VOICE] Stopped.", style="#C96B45"))
             return
 
-        access_key = os.environ.get("PORCUPINE_ACCESS_KEY", "").strip()
-        if not access_key:
-            chat_log.write(
-                Text("[VOCO VOICE] PORCUPINE_ACCESS_KEY is missing. Voice not started.", style="red")
-            )
-            return
+        self._set_voice_status_indicator("STARTING")
+        chat_log.write(Text("[VOCO VOICE] Initializing openwakeword listener...", style="#C96B45"))
 
         try:
             from voice.wake_voice import VocoVoice
 
             self._voice_agent = VocoVoice(
-                on_command_callback=lambda spoken: self.call_from_thread(self._handle_user_input, spoken),
-                porcupine_access_key=access_key,
+                on_command_callback=self._queue_voice_command,
+                on_status_callback=lambda msg, lvl: self.call_from_thread(self._handle_voice_status_event, msg, lvl),
             )
             self._voice_agent.start()
             self._voice_enabled = True
-            chat_log.write(Text("[VOCO VOICE] Wake word listener started.", style="#C96B45"))
+            self._voice_degraded = getattr(self._voice_agent, "vad_mode", "") != "webrtcvad"
+            if self._voice_degraded:
+                self._set_voice_status_indicator("DEGRADED", "silence VAD fallback", "yellow")
+                chat_log.write(
+                    Text(
+                        "[VOCO VOICE] Started in degraded mode (silence VAD fallback).",
+                        style="yellow",
+                    )
+                )
+                return
+            self._set_voice_status_indicator("ON", "WebRTC VAD", "green")
+            chat_log.write(Text("[VOCO VOICE] Wake-word listener started.", style="#C96B45"))
         except Exception as exc:
             self._voice_agent = None
             self._voice_enabled = False
+            self._voice_degraded = True
+            self._set_voice_status_indicator("DEGRADED", "voice unavailable", "red")
             chat_log.write(Text(f"[VOCO VOICE] Failed to start: {exc}", style="red"))
 
 

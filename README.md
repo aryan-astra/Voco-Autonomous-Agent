@@ -47,7 +47,7 @@ We implemented the full Phase-1 build and major fixes:
 - Better UI logging (fixed garbled `[voco]` style output)
 - Better LLM error messages for HTTP 500 / timeout
 - **Local fast-path** for basic commands (`mute`, `un-mute`, screenshot, running apps)
-- **Single-model pinning** to `gemma4:e2b` with adaptive context fallback
+- **Single-model pinning** to `voco-agent` with adaptive context fallback
 - **Closed-loop browser tools** (`browser_navigate`, `browser_get_state`, `browser_type`, `browser_click`, `browser_press_key`)
 - **Stress browser suite** (`browser_stress_50_sites`) with deterministic per-site retries/timeouts + telemetry (opens each site in a separate tab by default)
 - **YouTube comment export pipeline** (`youtube_comment_pipeline`) with play/pause/comment extraction + Desktop `.txt` save
@@ -139,8 +139,8 @@ VOCO supports explicit profile modes: **default**, **snapshot**, and **automatio
 - Firefox always runs in automation mode even if default/snapshot is requested.
 - Responses include: `browser`, `profile_mode` (requested), `effective_profile_mode` (actual), and `launch_mode`.
 
-### 9) Gemma 4 E2B capabilities in this setup
-From `ollama show gemma4:e2b`, the local model exposes:
+### 9) voco-agent capabilities in this setup
+From `ollama show voco-agent`, the local model exposes:
 
 - completion
 - tools
@@ -198,10 +198,11 @@ python -m playwright install chromium
 ollama serve
 ```
 
-Pull the exact model used by current VOCO config:
+Provision the base model and create the exact model used by current VOCO config:
 
 ```powershell
-ollama pull gemma4:e2b
+ollama pull qwen3:4b
+ollama create voco-agent -f models\voco_model.Modelfile
 ```
 
 ## 3) Run VOCO UI
@@ -216,11 +217,45 @@ Or run with admin elevation helper:
 run_voco_admin.bat
 ```
 
+### Runtime storage policy (O: drive)
+
+`run_voco_admin.bat` now enforces O-drive runtime paths for mutable caches/artifacts when available:
+
+- `OLLAMA_MODELS=O:\voco-runtime\ollama\models`
+- `TEMP=O:\voco-runtime\temp`
+- `TMP=O:\voco-runtime\temp`
+- `PIP_CACHE_DIR=O:\voco-runtime\pip\cache`
+
+Startup auto-creates missing folders and prints active values under:
+
+- `[VOCO] Runtime storage policy active:`
+
+If `O:` is unavailable, the script safely falls back to the script drive and prints a warning.
+
+Quick verification:
+
+```powershell
+run_voco_admin.bat --print-config
+```
+
+Confirm startup output includes O-drive values, then verify folders exist:
+
+```powershell
+Test-Path O:\voco-runtime\ollama\models
+Test-Path O:\voco-runtime\temp
+Test-Path O:\voco-runtime\pip\cache
+```
+
 Optional voice dependencies (for Ctrl+G wake-word mode):
 
 ```powershell
-pip install pvporcupine sounddevice numpy faster-whisper
-set PORCUPINE_ACCESS_KEY=your_key_here
+pip install openwakeword sounddevice numpy faster-whisper
+```
+
+Optional (preferred) VAD backend:
+
+```powershell
+pip install webrtcvad
 ```
 
 ## 4) Run benchmarks and regression gate
@@ -454,5 +489,5 @@ Current limitation:
 ## Final note
 
 VOCO is now much more usable for daily basic commands on this device.  
-For complex tasks, stability still depends on available memory/CPU headroom for `gemma4:e2b`.
+For complex tasks, stability still depends on available memory/CPU headroom for `voco-agent`.
 

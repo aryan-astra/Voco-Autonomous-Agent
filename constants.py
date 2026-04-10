@@ -23,11 +23,15 @@ MAX_RETRIES = 1
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 OLLAMA_URL = "http://localhost:11434"
-OLLAMA_MODEL = "gemma4:e2b"
+OLLAMA_MODEL = "voco-agent"
 OLLAMA_FAST_MODEL_CANDIDATES = [
+    "voco-agent",
+    "qwen3:4b",
     "gemma4:e2b",
 ]
 OLLAMA_HEAVY_MODEL_CANDIDATES = [
+    "voco-agent",
+    "qwen3:4b",
     "gemma4:e2b",
 ]
 OLLAMA_NUM_CTX_SIMPLE = 2048

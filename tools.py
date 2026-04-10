@@ -10,6 +10,7 @@ import json
 import os
 import re
 import hashlib
+import importlib.util
 import inspect
 import sqlite3
 import shutil
@@ -81,6 +82,8 @@ _mute_state: bool | None = None
 _FILE_INDEX_DB = MEMORY_DIR / "file_index.db"
 _APP_INDEX_DB = MEMORY_DIR / "app_index.db"
 _INDEX_LOCK = threading.Lock()
+_system_monitor_module = None
+_system_monitor_module_error = ""
 _COMMON_APP_ALIASES: dict[str, str] = {
     "notepad": "notepad.exe",
     "calculator": "calc.exe",
@@ -183,6 +186,43 @@ def _resolve_workspace_path(path: str, allow_missing_parent: bool = False) -> Pa
     if not allow_missing_parent and not resolved.exists():
         raise FileNotFoundError(f"Path not found: {resolved}")
     return resolved
+
+
+def _load_system_monitor_module():
+    global _system_monitor_module, _system_monitor_module_error
+    if _system_monitor_module is not None:
+        return _system_monitor_module
+    if _system_monitor_module_error:
+        return None
+
+    module_path = Path(__file__).with_name("tools").joinpath("system_monitor.py")
+    if not module_path.exists():
+        _system_monitor_module_error = f"Module file missing: {module_path}"
+        return None
+
+    try:
+        spec = importlib.util.spec_from_file_location("voco_system_monitor", module_path)
+        if spec is None or spec.loader is None:
+            _system_monitor_module_error = f"Failed to create module spec: {module_path}"
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _system_monitor_module = module
+        return module
+    except Exception as exc:
+        _system_monitor_module_error = str(exc)
+        return None
+
+
+def _call_system_monitor(method_name: str, **kwargs):
+    module = _load_system_monitor_module()
+    if module is None:
+        raise RuntimeError(f"System monitor unavailable: {_system_monitor_module_error or 'load failure'}")
+
+    method = getattr(module, method_name, None)
+    if not callable(method):
+        raise RuntimeError(f"System monitor method not found: {method_name}")
+    return method(**kwargs)
 
 
 def _normalize_browser_target(browser: str | None) -> str:
@@ -4342,23 +4382,72 @@ def run_shell_command(command: str, shell: str = "powershell") -> dict:
         return _err(f"Shell execution failed: {exc}")
 
 
-def get_usb_devices() -> dict:
-    if not WMI_AVAILABLE:
-        return _err("wmi package is not installed.")
+def get_system_health_snapshot() -> dict:
     try:
-        client = wmi.WMI()
-        devices = []
-        for device in client.Win32_USBHub():
-            devices.append(
-                {
-                    "name": str(getattr(device, "Name", "") or ""),
-                    "device_id": str(getattr(device, "DeviceID", "") or ""),
-                    "status": str(getattr(device, "Status", "") or ""),
-                }
-            )
+        snapshot = _call_system_monitor("get_health_snapshot")
+        return _ok(snapshot, "Captured system health snapshot.")
+    except Exception as exc:
+        return _err(f"Health snapshot failed: {exc}")
+
+
+def list_running_processes(limit: int = 100) -> dict:
+    try:
+        processes = _call_system_monitor("list_running_processes", limit=limit)
+        return _ok(processes, f"Found {len(processes)} running processes.")
+    except Exception as exc:
+        return _err(f"Process listing failed: {exc}")
+
+
+def get_network_status() -> dict:
+    try:
+        status = _call_system_monitor("get_network_status")
+        adapter_count = len(status.get("adapters", [])) if isinstance(status, dict) else 0
+        return _ok(status, f"Captured network status ({adapter_count} adapters).")
+    except Exception as exc:
+        return _err(f"Network status failed: {exc}")
+
+
+def list_usb_devices() -> dict:
+    try:
+        devices = _call_system_monitor("list_usb_devices")
         return _ok(devices, f"Found {len(devices)} USB devices.")
     except Exception as exc:
-        return _err(f"Failed to list USB devices: {exc}")
+        return _err(f"USB listing failed: {exc}")
+
+
+def run_powershell_command(command: str, timeout_seconds: int = 20, human_approval: bool = False) -> dict:
+    _ = human_approval
+    try:
+        result = _call_system_monitor(
+            "execute_powershell",
+            command=command,
+            timeout_seconds=timeout_seconds,
+        )
+        return _ok(result, "PowerShell command executed successfully.")
+    except Exception as exc:
+        return _err(f"PowerShell execution failed: {exc}")
+
+
+def kill_process(
+    pid: int | None = None,
+    process_name: str | None = None,
+    force: bool = True,
+    human_approval: bool = False,
+) -> dict:
+    _ = human_approval
+    try:
+        result = _call_system_monitor("kill_process", pid=pid, process_name=process_name, force=force)
+        if result.get("pid") is not None:
+            target = f"PID {result['pid']}"
+        else:
+            target = str(result.get("process_name") or "unknown process")
+        return _ok(result, f"Killed process target: {target}.")
+    except Exception as exc:
+        return _err(f"Process kill failed: {exc}")
+
+
+def get_usb_devices() -> dict:
+    return list_usb_devices()
 
 
 def disable_usb_device(device_id: str, human_approval: bool = False) -> dict:
@@ -4480,8 +4569,7 @@ def read_registry(hive: str, path: str, key: str) -> dict:
 
 
 def run_command(command: str, human_approval: bool = False) -> dict:
-    _ = human_approval
-    return run_shell_command(command=command, shell="powershell")
+    return run_powershell_command(command=command, timeout_seconds=20, human_approval=human_approval)
 
 
 def mute_audio(mute: bool = True) -> dict:
@@ -4894,10 +4982,40 @@ TOOL_REGISTRY = {
         "description": "Capture a screenshot into the workspace.",
         "args": {"filename": "string (optional)"},
     },
+    "get_system_health_snapshot": {
+        "fn": get_system_health_snapshot,
+        "description": "Capture a system health snapshot (CPU/memory/disk/uptime/process count).",
+        "args": {},
+    },
+    "list_running_processes": {
+        "fn": list_running_processes,
+        "description": "List currently running OS processes with PID and memory usage.",
+        "args": {"limit": "integer (optional, default 100)"},
+    },
+    "get_network_status": {
+        "fn": get_network_status,
+        "description": "Read current network adapter, IP, and profile status.",
+        "args": {},
+    },
+    "list_usb_devices": {
+        "fn": list_usb_devices,
+        "description": "List currently connected USB devices.",
+        "args": {},
+    },
     "run_shell_command": {
         "fn": run_shell_command,
         "description": "Run a shell command and return output.",
         "args": {"command": "string", "shell": "string (optional: powershell/cmd)"},
+    },
+    "run_powershell_command": {
+        "fn": run_powershell_command,
+        "description": "Run a PowerShell command with explicit human approval.",
+        "args": {
+            "command": "string",
+            "timeout_seconds": "integer (optional, default 20)",
+            "human_approval": "boolean (required true)",
+        },
+        "requires_approval": True,
     },
     "run_command": {
         "fn": run_command,
@@ -4914,6 +5032,17 @@ TOOL_REGISTRY = {
         "fn": disable_usb_device,
         "description": "Disable a USB device by ID (approval required).",
         "args": {"device_id": "string", "human_approval": "boolean (required true)"},
+        "requires_approval": True,
+    },
+    "kill_process": {
+        "fn": kill_process,
+        "description": "Kill a running process by PID or process name (approval required).",
+        "args": {
+            "pid": "integer (optional)",
+            "process_name": "string (optional)",
+            "force": "boolean (optional, default true)",
+            "human_approval": "boolean (required true)",
+        },
         "requires_approval": True,
     },
     "get_firewall_rules": {
