@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from collections import deque
 from typing import Callable
@@ -48,6 +49,12 @@ class VocoVoice:
     DEFAULT_WHISPER_MODEL = "base.en"
     VOICE_BASE_INSTALL_HINT = "pip install openwakeword sounddevice numpy faster-whisper"
     VOICE_VAD_INSTALL_HINT = "pip install webrtcvad"
+    WAKE_ONNX_RUNTIME_HINT = (
+        "Wake model ONNX init failed. Install ONNX runtime with: pip install onnxruntime. "
+        "Ensure openwakeword ONNX models are available."
+    )
+    WAKE_TFLITE_FALLBACK_ENV = "VOCO_WAKE_ALLOW_TFLITE_FALLBACK"
+    WAKE_TFLITE_INSTALL_HINT = "pip install tflite-runtime"
     _DEPENDENCY_PACKAGE_MAP = {
         "openwakeword": "openwakeword",
         "sounddevice": "sounddevice",
@@ -62,6 +69,10 @@ class VocoVoice:
         if not unique_packages:
             return cls.VOICE_BASE_INSTALL_HINT
         return f"pip install {' '.join(unique_packages)}"
+
+    @classmethod
+    def _allow_tflite_fallback(cls) -> bool:
+        return str(os.getenv(cls.WAKE_TFLITE_FALLBACK_ENV, "")).strip() == "1"
 
     @classmethod
     def dependency_status(cls) -> dict[str, object]:
@@ -90,26 +101,43 @@ class VocoVoice:
         status["runtime_ready"] = False
         status["error"] = ""
         status["runtime_hint"] = ""
+        status["fallback_attempted"] = False
+        status["fallback_error"] = ""
+        status["fallback_note"] = ""
         status["whisper_model_default"] = cls.DEFAULT_WHISPER_MODEL
         if not status["available"]:
             status["runtime_hint"] = str(status.get("install_hint", cls.VOICE_BASE_INSTALL_HINT))
             return status
 
-        errors = []
-        for kwargs in ({"inference_framework": "onnx"}, {}):
-            try:
-                OpenWakeWordModel(**kwargs)
-                status["runtime_ready"] = True
-                return status
-            except Exception as exc:  # pragma: no cover - runtime/env specific
-                errors.append(exc)
+        try:
+            OpenWakeWordModel(inference_framework="onnx")
+            status["runtime_ready"] = True
+            return status
+        except Exception as exc:  # pragma: no cover - runtime/env specific
+            status["error"] = str(exc)
+            status["runtime_hint"] = cls.WAKE_ONNX_RUNTIME_HINT
 
-        status["error"] = str(errors[-1])
-        status["runtime_hint"] = (
-            "Ensure openwakeword ONNX models are available "
-            "(or install tflite-runtime for tflite models)."
-        )
-        return status
+        if not cls._allow_tflite_fallback():
+            status["runtime_hint"] = (
+                f"{status['runtime_hint']} "
+                f"Set {cls.WAKE_TFLITE_FALLBACK_ENV}=1 to try default framework fallback."
+            )
+            return status
+
+        status["fallback_attempted"] = True
+        try:
+            OpenWakeWordModel()
+            status["runtime_ready"] = True
+            status["error"] = ""
+            status["runtime_hint"] = ""
+            return status
+        except Exception as exc:  # pragma: no cover - runtime/env specific
+            status["fallback_error"] = str(exc)
+            status["fallback_note"] = (
+                f"Default-framework fallback was attempted ({cls.WAKE_TFLITE_FALLBACK_ENV}=1) and failed. "
+                f"If you rely on this fallback, install with: {cls.WAKE_TFLITE_INSTALL_HINT}"
+            )
+            return status
 
     def __init__(
         self,
@@ -144,17 +172,28 @@ class VocoVoice:
         self._thread: threading.Thread | None = None
 
     def _create_wake_model(self):
-        errors = []
-        for kwargs in ({"inference_framework": "onnx"}, {}):
-            try:
-                return OpenWakeWordModel(**kwargs)
-            except Exception as exc:  # pragma: no cover - runtime/env specific
-                errors.append(exc)
-        hint = (
-            "Ensure openwakeword ONNX models are available "
-            "(or install tflite-runtime for tflite models)."
-        )
-        raise RuntimeError(f"Failed to initialize openwakeword model. {hint}") from errors[-1]
+        try:
+            return OpenWakeWordModel(inference_framework="onnx")
+        except Exception as exc:  # pragma: no cover - runtime/env specific
+            onnx_error = exc
+
+        onnx_hint = self.WAKE_ONNX_RUNTIME_HINT
+        if not self._allow_tflite_fallback():
+            raise RuntimeError(
+                "Failed to initialize openwakeword model. "
+                f"{onnx_hint} Set {self.WAKE_TFLITE_FALLBACK_ENV}=1 to try default framework fallback."
+            ) from onnx_error
+
+        try:
+            return OpenWakeWordModel()
+        except Exception as fallback_error:  # pragma: no cover - runtime/env specific
+            fallback_note = (
+                f"Default-framework fallback failed ({self.WAKE_TFLITE_FALLBACK_ENV}=1). "
+                f"If you rely on this fallback, install with: {self.WAKE_TFLITE_INSTALL_HINT}"
+            )
+            raise RuntimeError(
+                f"Failed to initialize openwakeword model. {onnx_hint} {fallback_note}"
+            ) from fallback_error
 
     def _emit_status(self, message: str, level: str = "info") -> None:
         if self._on_status is None:

@@ -431,12 +431,17 @@ class VocoApp(App):
 
         if not dep_status["runtime_ready"]:
             runtime_hint = str(dep_status.get("runtime_hint", "")).strip()
+            fallback_note = str(dep_status.get("fallback_note", "")).strip()
             self._voice_degraded = True
             self._set_voice_status_indicator("DEGRADED", "wake model unavailable", "red")
             runtime_error = str(dep_status.get("error", "")).strip()
-            message = f"[VOCO VOICE] Wake model unavailable: {runtime_error or 'unknown runtime error'}"
+            message = "[VOCO VOICE] Wake model unavailable."
             if runtime_hint:
-                message = f"{message}. {runtime_hint}"
+                message = f"{message} {runtime_hint}"
+            elif runtime_error:
+                message = f"{message} Error: {runtime_error}"
+            if fallback_note:
+                message = f"{message} {fallback_note}"
             self._update_output(message, "red")
             return
 
