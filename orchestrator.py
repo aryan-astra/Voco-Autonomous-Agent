@@ -785,6 +785,7 @@ _ROUTER_LOW_CONF_DIRECT_TOOLS = {
     "browser_type",
     "browser_click",
     "browser_press_key",
+    "browser_get_state",
     "write_in_notepad",
     "save_text_to_desktop_file",
     "search_local_paths",
@@ -1129,6 +1130,10 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
     5) fallback unresolved steps to Gemma planner
     """
     if _is_conversational_prompt(task):
+        return None
+    task_text = task.lower()
+    # Keep known deterministic YouTube comment workflows on their dedicated fast-path.
+    if _build_youtube_comment_fastpath_plan(task=task, text=task_text) is not None:
         return None
     if not needs_decomposition(task):
         return None
@@ -3201,6 +3206,7 @@ def _extract_txt_filename(task: str) -> str | None:
 
 def _extract_youtube_pipeline_query(task: str, text: str) -> str | None:
     patterns = [
+        r"\byoutube\b.*?\bsearch(?:\s+for)?\s+(.+?)(?=\s+(?:and|then)\s+(?:open|play|pause|go|copy|paste|save|export)\b|[,.]|$)",
         r"\bsearch(?:\s+for)?\s+(.+?)\s+on\s+youtube\b",
         r"\bon\s+youtube\b.*\bsearch(?:\s+for)?\s+(.+?)(?:\s+and|\s*$)",
         r"\byoutube(?:\s+comment(?:s)?(?:\s+pipeline)?)?\s+(?:for|about)\s+(.+?)(?:\s+and|\s*$)",

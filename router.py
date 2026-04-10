@@ -188,6 +188,26 @@ _BROWSER_STATE_VERB_REGEX = re.compile(r"\b(?:copy|read|extract|get)\b", flags=r
 _BROWSER_STATE_TARGET_REGEX = re.compile(r"\b(?:content|comments?|description)\b", flags=re.IGNORECASE)
 _NOTEPAD_PASTE_REGEX = re.compile(r"\bpaste\b", flags=re.IGNORECASE)
 _DESKTOP_SAVE_REFERENCE_REGEX = re.compile(r"\bsave\s+(?:it|this|that)\b", flags=re.IGNORECASE)
+_DESKTOP_SAVE_FILE_REGEX = re.compile(
+    r"\bsave(?:\s+(?:the|a|an|this|that|it))?\s+file\b",
+    flags=re.IGNORECASE,
+)
+_NOTEPAD_CLIPBOARD_REFERENCES = {
+    "it",
+    "this",
+    "that",
+    "them",
+    "those",
+    "these",
+    "content",
+    "the content",
+    "description",
+    "the description",
+    "comment",
+    "comments",
+    "the comment",
+    "the comments",
+}
 _BROWSER_STATE_QUANTITY_REGEX = re.compile(
     r"\b(?:top|first|last|latest)?\s*(\d{1,3})\s+(?:comments?|results?|items?|elements?|entries?|lines?)\b",
     flags=re.IGNORECASE,
@@ -648,9 +668,14 @@ def extract_args(intent: str, text: str) -> dict[str, object]:
 
     if intent == "write_in_notepad":
         content = _extract_notepad_text(task)
+        paste_request = bool(_NOTEPAD_PASTE_REGEX.search(task) and "notepad" in lower)
         if content and content.lower() not in {"in a notepad file", "in notepad", "into notepad"}:
-            args["text"] = content
-        if _NOTEPAD_PASTE_REGEX.search(task) and "notepad" in lower and "text" not in args:
+            normalized_content = content.lower()
+            if paste_request and normalized_content in _NOTEPAD_CLIPBOARD_REFERENCES:
+                args["paste_clipboard"] = True
+            else:
+                args["text"] = content
+        if paste_request and "text" not in args:
             args["paste_clipboard"] = True
         return args
 
@@ -658,7 +683,13 @@ def extract_args(intent: str, text: str) -> dict[str, object]:
         quoted = _extract_quoted_values(task)
         if quoted:
             args["content"] = quoted[0]
-        if _DESKTOP_SAVE_REFERENCE_REGEX.search(lower) and "desktop" in lower:
+        has_explicit_content = bool(str(args.get("content", "")).strip())
+        desktop_save_reference = bool(
+            _DESKTOP_SAVE_REFERENCE_REGEX.search(lower)
+            or _DESKTOP_SAVE_FILE_REGEX.search(lower)
+            or re.search(r"\bsave\b.*\bdesktop\b", lower)
+        )
+        if "desktop" in lower and desktop_save_reference and not has_explicit_content:
             args["from_clipboard"] = True
         file_name = _extract_filename(task, "txt")
         if file_name:
