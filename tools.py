@@ -9,13 +9,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 import inspect
 import sqlite3
 import shutil
 import subprocess
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
@@ -1192,7 +1193,39 @@ def browser_navigate(url: str, browser: str | None = None) -> dict:
         return _err(f"Browser navigation failed: {exc}")
 
 
-def browser_type(text: str, element_name: str | None = None, clear: bool = True) -> dict:
+def _normalize_newline_mode(newline_mode: str | None, multiline: bool | None, typed: str) -> str:
+    normalized_mode = str(newline_mode or "").strip().lower().replace("-", "_").replace("+", "_")
+    if normalized_mode in {"shift_enter", "shiftenter", "safe", "multiline"}:
+        return "shift_enter"
+    if normalized_mode in {"enter", "submit"}:
+        return "enter"
+    if bool(multiline) or "\n" in typed:
+        return "shift_enter"
+    return "literal"
+
+
+def _type_text_with_newline_policy(page, text: str, newline_mode: str) -> None:
+    lines = str(text).split("\n")
+    mode = _normalize_newline_mode(newline_mode=newline_mode, multiline=True, typed=str(text))
+    for index, line in enumerate(lines):
+        if line:
+            page.keyboard.type(line)
+        if index >= len(lines) - 1:
+            continue
+        if mode == "shift_enter":
+            page.keyboard.press("Shift+Enter")
+        else:
+            page.keyboard.press("Enter")
+
+
+def browser_type(
+    text: str,
+    element_name: str | None = None,
+    clear: bool = True,
+    multiline: bool | None = None,
+    newline_mode: str | None = None,
+    submit: bool = False,
+) -> dict:
     typed = str(text)
     if not typed:
         return _err("No text provided for browser typing.")
@@ -1223,19 +1256,38 @@ def browser_type(text: str, element_name: str | None = None, clear: bool = True)
 
         if target is not None:
             target.click(timeout=5000)
-            if clear:
-                target.fill(typed, timeout=5000)
-            else:
-                target.type(typed, timeout=5000)
         else:
             if not _focus_best_text_input(page):
                 return _err("No editable browser field found to type into.")
-            if clear:
-                page.keyboard.press("Control+A")
+
+        if clear:
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+
+        normalized_multiline = bool(multiline) or ("\n" in typed)
+        resolved_newline_mode = _normalize_newline_mode(
+            newline_mode=newline_mode,
+            multiline=multiline,
+            typed=typed,
+        )
+        if normalized_multiline:
+            _type_text_with_newline_policy(page, typed, resolved_newline_mode)
+        else:
             page.keyboard.type(typed)
+
+        if bool(submit):
+            page.keyboard.press("Enter")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=4000)
+            except Exception:
+                pass
 
         state = _snapshot_browser_state(page)
         destination = f" into '{target_name}'" if target_name else ""
+        if normalized_multiline and not bool(submit):
+            return _ok(state, f"Typed multiline text{destination} in browser using {resolved_newline_mode}.")
+        if bool(submit):
+            return _ok(state, f"Typed '{typed}'{destination} and submitted in browser.")
         return _ok(state, f"Typed '{typed}'{destination} in browser.")
     except PlaywrightTimeoutError:
         return _err("Timed out while typing in browser.")
@@ -2068,16 +2120,57 @@ def web_codegen_autofix(
     }
 
 
-def type_in_browser(text: str, selector: str | None = None) -> dict:
+def type_in_browser(
+    text: str,
+    selector: str | None = None,
+    multiline: bool | None = None,
+    submit: bool = False,
+    newline_mode: str | None = None,
+) -> dict:
+    typed = str(text)
+    if not typed:
+        return _err("No text provided for browser typing.")
     try:
         page = _get_browser_page()
         page.bring_to_front()
         if selector:
             target = page.wait_for_selector(selector, timeout=5000)
-            target.fill(text)
+            target.click()
+            normalized_multiline = bool(multiline) or ("\n" in typed)
+            resolved_newline_mode = _normalize_newline_mode(
+                newline_mode=newline_mode,
+                multiline=multiline,
+                typed=typed,
+            )
+            if normalized_multiline:
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                _type_text_with_newline_policy(page, typed, resolved_newline_mode)
+            else:
+                target.fill(typed)
+            if bool(submit):
+                page.keyboard.press("Enter")
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=4000)
+                except Exception:
+                    pass
             state = _snapshot_browser_state(page)
+            if normalized_multiline and not bool(submit):
+                return _ok(
+                    state,
+                    f"Typed multiline text in browser selector '{selector}' using {resolved_newline_mode}.",
+                )
+            if bool(submit):
+                return _ok(state, f"Typed text in browser selector '{selector}' and submitted.")
             return _ok(state, f"Typed text in browser selector '{selector}'.")
-        return browser_type(text=text, element_name=None, clear=True)
+        return browser_type(
+            text=typed,
+            element_name=None,
+            clear=True,
+            multiline=multiline,
+            submit=submit,
+            newline_mode=newline_mode,
+        )
     except PlaywrightTimeoutError:
         return _err(f"Browser selector not found: {selector}")
     except Exception as exc:
@@ -2343,6 +2436,300 @@ def _get_drive_roots() -> list[Path]:
     return roots
 
 
+_TEXT_CONTEXT_MAX_BYTES = 12 * 1024
+_TEXT_CONTEXT_MAX_CHARS = 1200
+_TEXT_CONTEXT_SNIPPET_CHARS = 300
+_TEXT_CONTEXT_SUMMARY_CHARS = 240
+_TEXT_CONTEXT_MAX_KEYWORDS = 12
+_TEXT_CONTEXT_EXTENSIONS = frozenset(
+    {
+        ".txt",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".log",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".jsonl",
+        ".xml",
+        ".csv",
+        ".tsv",
+        ".html",
+        ".htm",
+        ".css",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".py",
+        ".java",
+        ".kt",
+        ".c",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".cs",
+        ".go",
+        ".rs",
+        ".rb",
+        ".php",
+        ".swift",
+        ".sql",
+        ".sh",
+        ".ps1",
+        ".bat",
+        ".cmd",
+    }
+)
+_TEXT_CONTEXT_FILENAMES = frozenset(
+    {
+        "dockerfile",
+        "makefile",
+        "cmakelists.txt",
+        ".gitignore",
+        ".gitattributes",
+        ".editorconfig",
+        ".env",
+        "requirements.txt",
+        "package.json",
+        "package-lock.json",
+        "pyproject.toml",
+    }
+)
+_TEXT_CONTEXT_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "has",
+        "have",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "this",
+        "to",
+        "was",
+        "were",
+        "will",
+        "with",
+        "you",
+        "your",
+        "not",
+        "can",
+        "all",
+        "any",
+        "but",
+        "into",
+        "out",
+        "our",
+        "their",
+        "they",
+        "them",
+        "if",
+        "else",
+        "true",
+        "false",
+        "null",
+        "none",
+        "def",
+        "class",
+        "return",
+        "import",
+        "const",
+        "let",
+        "var",
+        "function",
+    }
+)
+
+
+def _supports_context_extraction(path: Path) -> bool:
+    suffix = path.suffix.lower()
+    name = path.name.lower()
+    if suffix in _TEXT_CONTEXT_EXTENSIONS:
+        return True
+    if name in _TEXT_CONTEXT_FILENAMES:
+        return True
+    if name.startswith(".env"):
+        return True
+    if suffix == "" and name.startswith("readme"):
+        return True
+    return False
+
+
+def _read_bounded_file_chunk(path: Path, max_bytes: int = _TEXT_CONTEXT_MAX_BYTES) -> bytes | None:
+    try:
+        with path.open("rb") as file_obj:
+            return file_obj.read(max(512, int(max_bytes)))
+    except (PermissionError, OSError):
+        return None
+
+
+def _is_probably_binary_chunk(data: bytes) -> bool:
+    if not data:
+        return False
+    if b"\x00" in data:
+        return True
+    control_count = sum(1 for byte in data if byte < 32 and byte not in (9, 10, 13))
+    return (control_count / len(data)) > 0.15
+
+
+def _decode_text_chunk(data: bytes) -> str:
+    if not data:
+        return ""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    if data.startswith(b"\xef\xbb\xbf"):
+        try:
+            return data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            pass
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="replace")
+
+
+def _normalize_context_text(text: str, limit: int = _TEXT_CONTEXT_MAX_CHARS) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) > limit:
+        compact = compact[:limit].rstrip()
+    return compact
+
+
+def _derive_context_keywords(text: str, limit: int = _TEXT_CONTEXT_MAX_KEYWORDS) -> list[str]:
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", text.lower())
+    if not tokens:
+        return []
+
+    counts: Counter[str] = Counter()
+    first_seen: dict[str, int] = {}
+    for idx, token in enumerate(tokens):
+        if token in _TEXT_CONTEXT_STOPWORDS or token.isnumeric():
+            continue
+        counts[token] += 1
+        if token not in first_seen:
+            first_seen[token] = idx
+
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], first_seen[item[0]], item[0]))
+    return [token for token, _ in ranked[: max(1, int(limit))]]
+
+
+def _derive_context_summary(text: str, keywords: list[str]) -> str | None:
+    if not text:
+        return None
+
+    sentences = [segment.strip() for segment in re.split(r"(?<=[.!?])\s+", text) if segment.strip()]
+    summary = sentences[0] if sentences else text
+    if len(summary) < 72 and len(sentences) > 1:
+        for sentence in sentences[1:]:
+            summary = f"{summary} {sentence}".strip()
+            if len(summary) >= 72:
+                break
+
+    summary = summary[:_TEXT_CONTEXT_SUMMARY_CHARS].rstrip(" ,;:-")
+    if not summary:
+        return None
+    if not keywords:
+        return summary
+
+    topics = ", ".join(keywords[:4])
+    suffix = f" | topics: {topics}"
+    max_summary_chars = _TEXT_CONTEXT_SUMMARY_CHARS - len(suffix)
+    if max_summary_chars > 24 and len(summary) > max_summary_chars:
+        summary = summary[:max_summary_chars].rstrip(" ,;:-")
+    if len(summary) + len(suffix) <= _TEXT_CONTEXT_SUMMARY_CHARS:
+        summary = f"{summary}{suffix}"
+    return summary
+
+
+def _compute_context_hash(data: bytes, size_bytes: int) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(size_bytes).encode("utf-8"))
+    digest.update(b":")
+    digest.update(data)
+    return digest.hexdigest()
+
+
+def _extract_file_context(path: Path, size_bytes: int) -> tuple[str | None, str | None, str | None, str | None]:
+    if not _supports_context_extraction(path):
+        return (None, None, None, None)
+
+    chunk = _read_bounded_file_chunk(path)
+    if not chunk or _is_probably_binary_chunk(chunk):
+        return (None, None, None, None)
+
+    text = _decode_text_chunk(chunk)
+    normalized = _normalize_context_text(text)
+    if not normalized:
+        return (None, None, None, None)
+
+    snippet = normalized[:_TEXT_CONTEXT_SNIPPET_CHARS].rstrip(" ,;:-")
+    keywords = _derive_context_keywords(normalized)
+    summary = _derive_context_summary(normalized, keywords)
+    content_hash = _compute_context_hash(chunk, size_bytes)
+    keywords_text = ", ".join(keywords) if keywords else None
+    return (snippet or None, keywords_text, summary, content_hash)
+
+
+def _ensure_files_index_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            extension TEXT,
+            size_bytes INTEGER,
+            modified_ts REAL,
+            content_snippet TEXT,
+            content_keywords TEXT,
+            content_summary TEXT,
+            content_hash TEXT
+        )
+        """
+    )
+
+    context_columns = (
+        "content_snippet",
+        "content_keywords",
+        "content_summary",
+        "content_hash",
+    )
+    existing_columns = {
+        str(row[1]).strip().lower() for row in conn.execute("PRAGMA table_info(files)").fetchall()
+    }
+    for column in context_columns:
+        if column in existing_columns:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE files ADD COLUMN {column} TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+
+
 def index_files(scope: str = "quick", max_files: int = 200000) -> dict:
     _ensure_index_parent()
     scope_normalized = str(scope).strip().lower()
@@ -2370,20 +2757,21 @@ def index_files(scope: str = "quick", max_files: int = 200000) -> dict:
     with _INDEX_LOCK:
         conn = sqlite3.connect(_FILE_INDEX_DB)
         try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS files (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    path TEXT NOT NULL,
-                    filename TEXT NOT NULL,
-                    extension TEXT,
-                    size_bytes INTEGER,
-                    modified_ts REAL
-                )
-                """
-            )
+            _ensure_files_index_schema(conn)
             conn.execute("DELETE FROM files")
-            batch: list[tuple[str, str, str, int, float]] = []
+            batch: list[
+                tuple[
+                    str,
+                    str,
+                    str,
+                    int,
+                    float,
+                    str | None,
+                    str | None,
+                    str | None,
+                    str | None,
+                ]
+            ] = []
             for root in roots:
                 for current, dirs, files in os.walk(root):
                     dirs[:] = [d for d in dirs if d not in skip_dirs]
@@ -2393,6 +2781,10 @@ def index_files(scope: str = "quick", max_files: int = 200000) -> dict:
                             stat = full_path.stat()
                         except (PermissionError, OSError):
                             continue
+                        content_snippet, content_keywords, content_summary, content_hash = _extract_file_context(
+                            full_path,
+                            int(stat.st_size),
+                        )
                         batch.append(
                             (
                                 str(full_path),
@@ -2400,12 +2792,28 @@ def index_files(scope: str = "quick", max_files: int = 200000) -> dict:
                                 full_path.suffix.lower(),
                                 int(stat.st_size),
                                 float(stat.st_mtime),
+                                content_snippet,
+                                content_keywords,
+                                content_summary,
+                                content_hash,
                             )
                         )
                         indexed += 1
                         if len(batch) >= 1000:
                             conn.executemany(
-                                "INSERT INTO files (path, filename, extension, size_bytes, modified_ts) VALUES (?,?,?,?,?)",
+                                """
+                                INSERT INTO files (
+                                    path,
+                                    filename,
+                                    extension,
+                                    size_bytes,
+                                    modified_ts,
+                                    content_snippet,
+                                    content_keywords,
+                                    content_summary,
+                                    content_hash
+                                ) VALUES (?,?,?,?,?,?,?,?,?)
+                                """,
                                 batch,
                             )
                             conn.commit()
@@ -2418,12 +2826,27 @@ def index_files(scope: str = "quick", max_files: int = 200000) -> dict:
                     break
             if batch:
                 conn.executemany(
-                    "INSERT INTO files (path, filename, extension, size_bytes, modified_ts) VALUES (?,?,?,?,?)",
+                    """
+                    INSERT INTO files (
+                        path,
+                        filename,
+                        extension,
+                        size_bytes,
+                        modified_ts,
+                        content_snippet,
+                        content_keywords,
+                        content_summary,
+                        content_hash
+                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                    """,
                     batch,
                 )
                 conn.commit()
             conn.execute("CREATE INDEX IF NOT EXISTS idx_files_filename_lower ON files(lower(filename))")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_files_path_lower ON files(lower(path))")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_extension_modified_ts ON files(extension, modified_ts)"
+            )
             conn.commit()
         finally:
             conn.close()
@@ -2558,7 +2981,121 @@ def check_app_availability(app_name: str) -> dict:
     return _ok(payload, f"'{requested}' is not launchable on this PC. {hint}")
 
 
-def open_app(app_name: str) -> dict:
+def _normalize_window_search_term(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return ""
+    if normalized.endswith(".exe"):
+        normalized = normalized[:-4]
+    normalized = normalized.replace("ms-settings:", "settings")
+    normalized = normalized.replace("msedge", "edge")
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return " ".join(normalized.split())
+
+
+def _collect_app_window_terms(
+    requested: str, matched_name: str, executable: str, launch_target: str
+) -> list[str]:
+    alias_terms: dict[str, tuple[str, ...]] = {
+        "notepad": ("notepad",),
+        "calc": ("calculator",),
+        "calculator": ("calculator",),
+        "mspaint": ("paint",),
+        "paint": ("paint",),
+        "explorer": ("file explorer", "explorer"),
+        "taskmgr": ("task manager",),
+        "task manager": ("task manager",),
+        "powerpnt": ("powerpoint",),
+        "ppt": ("powerpoint",),
+        "pptx": ("powerpoint",),
+        "ms settings": ("settings",),
+        "settings": ("settings",),
+        "edge": ("edge", "microsoft edge"),
+        "chrome": ("chrome", "google chrome"),
+        "firefox": ("firefox",),
+        "spotify": ("spotify",),
+        "powershell": ("powershell",),
+        "cmd": ("command prompt", "cmd"),
+    }
+    ignored_terms = {"app", "application", "program", "launcher", "windows", "microsoft"}
+    seen_terms: set[str] = set()
+    terms: list[str] = []
+
+    def add_term(term: str) -> None:
+        normalized = _normalize_window_search_term(term)
+        if not normalized or normalized in ignored_terms or normalized in seen_terms:
+            return
+        if len(normalized) < 3:
+            return
+        seen_terms.add(normalized)
+        terms.append(normalized)
+
+    raw_candidates = [requested, matched_name, executable, launch_target]
+    for candidate in raw_candidates:
+        add_term(candidate)
+        candidate_str = str(candidate or "").strip()
+        if candidate_str:
+            add_term(Path(candidate_str).stem)
+        normalized_candidate = _normalize_window_search_term(candidate)
+        for token in normalized_candidate.split():
+            if len(token) >= 4:
+                add_term(token)
+        for key in (normalized_candidate, *normalized_candidate.split()):
+            for alias in alias_terms.get(key, ()):
+                add_term(alias)
+
+    return terms
+
+
+def _find_matching_window(search_terms: list[str]):
+    if not PYGETWINDOW_AVAILABLE or not search_terms:
+        return None
+    try:
+        windows = gw.getAllWindows()
+    except Exception:
+        return None
+    for window in windows:
+        title = str(getattr(window, "title", "") or "").strip()
+        if not title:
+            continue
+        lowered_title = title.lower()
+        if any(term in lowered_title for term in search_terms):
+            return window
+    return None
+
+
+def _focus_window_handle(window) -> tuple[bool, str]:
+    if window is None:
+        return False, "No matching window handle was found."
+    try:
+        if getattr(window, "isMinimized", False):
+            window.restore()
+        window.activate()
+        time.sleep(0.2)
+        return True, str(getattr(window, "title", ""))
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _wait_and_focus_window(search_terms: list[str], timeout_seconds: float = 6.0) -> tuple[object | None, str]:
+    if not PYGETWINDOW_AVAILABLE:
+        return None, "pygetwindow is not installed."
+    deadline = time.time() + max(0.5, float(timeout_seconds))
+    last_error = ""
+    while time.time() < deadline:
+        window = _find_matching_window(search_terms)
+        if window is not None:
+            focused, note = _focus_window_handle(window)
+            if focused:
+                return window, note
+            last_error = note
+        time.sleep(0.2)
+    if last_error:
+        return None, last_error
+    return None, "Matching window did not appear in time."
+
+
+def open_app(app_name: str, force_new: bool = False) -> dict:
     requested = str(app_name).strip()
     if not requested:
         return _err("Application name cannot be empty.")
@@ -2577,6 +3114,25 @@ def open_app(app_name: str) -> dict:
         fallback = str(payload.get("fallback") or _app_unavailable_hint(requested))
         return _err(f"Application '{requested}' is not launchable on this PC. {fallback}")
 
+    search_terms = _collect_app_window_terms(requested, matched_name, executable, launch_target)
+    if not bool(force_new) and search_terms:
+        existing_window = _find_matching_window(search_terms)
+        if existing_window is not None:
+            focused, focused_title = _focus_window_handle(existing_window)
+            if focused:
+                return _ok(
+                    {
+                        "app": matched_name,
+                        "executable": executable,
+                        "launch_target": launch_target,
+                        "source": payload.get("source"),
+                        "window": focused_title or matched_name,
+                        "action": "focused_existing_window",
+                        "force_new": False,
+                    },
+                    f"Focused existing application: {matched_name}",
+                )
+
     try:
         if launch_target.lower().startswith("ms-"):
             subprocess.Popen(["cmd", "/c", "start", "", launch_target], shell=False)
@@ -2592,6 +3148,8 @@ def open_app(app_name: str) -> dict:
             "executable": executable,
             "launch_target": launch_target,
             "source": payload.get("source"),
+            "action": "launched_new_instance",
+            "force_new": bool(force_new),
         },
         f"Opened application: {matched_name}",
     )
@@ -3107,6 +3665,122 @@ def _default_search_roots() -> list[Path]:
     return deduped
 
 
+def _tokenize_search_query(query: str) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for raw_token in re.findall(r"[a-z0-9][a-z0-9._-]{1,}", str(query).lower()):
+        token = raw_token.strip("._-")
+        if not token:
+            continue
+        if token in _TEXT_CONTEXT_STOPWORDS and token not in {"ppt", "pdf", "csv", "sql"}:
+            continue
+        if len(token) < 3 and token not in {"py", "js", "ts", "md", "go", "rs", "c", "h"}:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens
+
+
+def _infer_extension_hints(tokens: list[str]) -> set[str]:
+    hints: set[str] = set()
+    for token in tokens:
+        if token in {"ppt", "pptx", "slides", "slide", "presentation", "deck"}:
+            hints.update({".ppt", ".pptx"})
+        elif token in {"pdf", "report", "paper"}:
+            hints.add(".pdf")
+        elif token in {"notes", "note", "text", "txt", "readme"}:
+            hints.update({".txt", ".md", ".markdown"})
+        elif token in {"python", "py", "script"}:
+            hints.add(".py")
+        elif token in {"excel", "sheet", "spreadsheet", "xlsx", "csv"}:
+            hints.update({".xlsx", ".xls", ".csv"})
+        elif token in {"word", "doc", "docx", "document"}:
+            hints.update({".doc", ".docx", ".txt", ".md"})
+    return hints
+
+
+def _score_indexed_file_candidate(
+    term: str,
+    tokens: list[str],
+    extension_hints: set[str],
+    filename: str,
+    path: str,
+    extension: str | None,
+    snippet: str | None,
+    keywords: str | None,
+    summary: str | None,
+    modified_ts: float | None,
+) -> float:
+    filename_lower = filename.lower()
+    path_lower = path.lower()
+    snippet_lower = str(snippet or "").lower()
+    summary_lower = str(summary or "").lower()
+    keyword_tokens = {
+        part.strip().lower()
+        for part in str(keywords or "").split(",")
+        if part and part.strip()
+    }
+
+    score = 0.0
+    if term and term in filename_lower:
+        score += 120.0
+    if term and term in path_lower:
+        score += 90.0
+    if term and term in summary_lower:
+        score += 55.0
+    if term and term in snippet_lower:
+        score += 45.0
+    if term and term in str(keywords or "").lower():
+        score += 60.0
+
+    token_hits = 0
+    for token in tokens:
+        hit = False
+        if token in filename_lower:
+            score += 26.0
+            hit = True
+        if token in path_lower:
+            score += 12.0
+            hit = True
+        if token in keyword_tokens:
+            score += 22.0
+            hit = True
+        elif token in str(keywords or "").lower():
+            score += 12.0
+            hit = True
+        if token in summary_lower:
+            score += 12.0
+            hit = True
+        if token in snippet_lower:
+            score += 8.0
+            hit = True
+        if hit:
+            token_hits += 1
+
+    if tokens:
+        score += min(30.0, (token_hits / len(tokens)) * 30.0)
+        if filename_lower.startswith(tokens[0]):
+            score += 10.0
+
+    ext = str(extension or "").lower()
+    if extension_hints:
+        if ext in extension_hints:
+            score += 18.0
+        elif ext:
+            score -= 2.0
+
+    if modified_ts:
+        age_days = max(0.0, (time.time() - float(modified_ts)) / 86400.0)
+        if age_days <= 7:
+            score += 6.0
+        elif age_days <= 30:
+            score += 3.0
+
+    return score
+
+
 def _search_indexed_files(query: str, kind: str = "all", limit: int = 20) -> list[dict]:
     if not _FILE_INDEX_DB.exists():
         return []
@@ -3116,49 +3790,134 @@ def _search_indexed_files(query: str, kind: str = "all", limit: int = 20) -> lis
     kinds = {"all", "file", "folder"}
     if kind not in kinds:
         kind = "all"
+    if kind == "folder":
+        return []
     cap = max(1, int(limit))
+    tokens = _tokenize_search_query(term)
+    extension_hints = _infer_extension_hints(tokens)
 
     conn = sqlite3.connect(_FILE_INDEX_DB)
     try:
-        cursor = conn.execute(
-            """
-            SELECT path, filename
-            FROM files
-            WHERE lower(filename) LIKE ? OR lower(path) LIKE ?
-            ORDER BY length(filename) ASC
-            LIMIT ?
-            """,
-            (f"%{term}%", f"%{term}%", cap * 3),
-        )
+        search_terms: list[str] = [term]
+        for token in tokens:
+            if token != term:
+                search_terms.append(token)
+            if len(search_terms) >= 6:
+                break
+
+        where_parts: list[str] = []
+        params: list[object] = []
+        for search_term in search_terms:
+            pattern = f"%{search_term}%"
+            where_parts.extend(
+                [
+                    "lower(filename) LIKE ?",
+                    "lower(path) LIKE ?",
+                    "lower(COALESCE(content_snippet, '')) LIKE ?",
+                    "lower(COALESCE(content_keywords, '')) LIKE ?",
+                    "lower(COALESCE(content_summary, '')) LIKE ?",
+                ]
+            )
+            params.extend([pattern, pattern, pattern, pattern, pattern])
+
+        where_clause = " OR ".join(where_parts) if where_parts else "1=0"
+        candidate_cap = max(cap * 40, 120)
+        try:
+            cursor = conn.execute(
+                f"""
+                SELECT
+                    path,
+                    filename,
+                    extension,
+                    modified_ts,
+                    content_snippet,
+                    content_keywords,
+                    content_summary
+                FROM files
+                WHERE {where_clause}
+                ORDER BY modified_ts DESC
+                LIMIT ?
+                """,
+                (*params, candidate_cap),
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such column" not in str(exc).lower():
+                raise
+            where_parts = []
+            params = []
+            for search_term in search_terms:
+                pattern = f"%{search_term}%"
+                where_parts.extend(["lower(filename) LIKE ?", "lower(path) LIKE ?"])
+                params.extend([pattern, pattern])
+            where_clause = " OR ".join(where_parts) if where_parts else "1=0"
+            cursor = conn.execute(
+                f"""
+                SELECT path, filename, extension, modified_ts, NULL, NULL, NULL
+                FROM files
+                WHERE {where_clause}
+                ORDER BY modified_ts DESC
+                LIMIT ?
+                """,
+                (*params, candidate_cap),
+            )
         rows = cursor.fetchall()
     finally:
         conn.close()
 
-    matches: list[dict] = []
-    for path_str, _filename in rows:
-        path_obj = Path(path_str)
-        is_dir = path_obj.is_dir()
-        if kind == "file" and is_dir:
+    scored_matches: list[tuple[float, dict]] = []
+    seen_paths: set[str] = set()
+    for row in rows:
+        path_str, filename, extension, modified_ts, snippet, keywords, summary = row
+        path_key = str(path_str).lower()
+        if path_key in seen_paths:
             continue
-        if kind == "folder" and not is_dir:
+        seen_paths.add(path_key)
+
+        score = _score_indexed_file_candidate(
+            term=term,
+            tokens=tokens,
+            extension_hints=extension_hints,
+            filename=str(filename or ""),
+            path=str(path_str),
+            extension=str(extension or ""),
+            snippet=str(snippet or ""),
+            keywords=str(keywords or ""),
+            summary=str(summary or ""),
+            modified_ts=float(modified_ts) if modified_ts else None,
+        )
+        if score <= 0:
             continue
-        matches.append({"type": "folder" if is_dir else "file", "path": str(path_obj)})
-        if len(matches) >= cap:
-            break
-    return matches
+
+        candidate = {
+            "type": "file",
+            "path": str(path_str),
+            "score": round(score, 2),
+        }
+        if summary:
+            candidate["summary"] = str(summary)[:220]
+        if keywords:
+            keyword_list = [part.strip() for part in str(keywords).split(",") if part.strip()]
+            if keyword_list:
+                candidate["keywords"] = keyword_list[:6]
+        scored_matches.append((score, candidate))
+
+    scored_matches.sort(key=lambda item: (-item[0], len(item[1]["path"])))
+    return [candidate for _, candidate in scored_matches[:cap]]
 
 
 def search_file(query: str, limit: int = 10, open_first: bool = False, kind: str = "all") -> dict:
     term = str(query).strip()
     if not term:
         return _err("Search query cannot be empty.")
+    kind_normalized = str(kind).strip().lower()
+    if kind_normalized not in {"all", "file", "folder"}:
+        kind_normalized = "all"
 
-    matches = _search_indexed_files(term, kind=str(kind).strip().lower(), limit=limit)
+    matches = _search_indexed_files(term, kind=kind_normalized, limit=limit)
     if not matches:
-        fallback_kind = kind if str(kind).strip().lower() in {"all", "file", "folder"} else "all"
         return search_local_paths(
             query=term,
-            kind=fallback_kind,
+            kind=kind_normalized,
             open_first=open_first,
             max_results=max(1, int(limit)),
             max_seconds=8,
@@ -3176,8 +3935,8 @@ def search_file(query: str, limit: int = 10, open_first: bool = False, kind: str
             return _err(f"Found indexed matches but failed opening first result: {exc}")
 
     return _ok(
-        {"query": term, "kind": kind, "matches": matches, "source": "index"},
-        f"Found {len(matches)} indexed matches for '{term}'.",
+        {"query": term, "kind": kind_normalized, "matches": matches, "source": "index_hybrid"},
+        f"Found {len(matches)} indexed matches for '{term}' using hybrid name+context ranking.",
     )
 
 
@@ -3300,7 +4059,7 @@ def search_in_explorer(query: str, folders_only: bool = True) -> dict:
         return _err(f"Explorer search failed: {exc}")
 
 
-def write_in_notepad(text: str) -> dict:
+def write_in_notepad(text: str, force_new: bool = False) -> dict:
     if not PYAUTOGUI_AVAILABLE:
         return _err("pyautogui is not installed.")
     if not PYGETWINDOW_AVAILABLE:
@@ -3310,37 +4069,34 @@ def write_in_notepad(text: str) -> dict:
     if not content:
         return _err("No text provided for Notepad writing.")
 
-    try:
-        subprocess.Popen("notepad.exe", shell=True)
-    except FileNotFoundError:
-        return _err("Notepad executable not found.")
-    except Exception as exc:
-        return _err(f"Failed to open Notepad: {exc}")
+    open_result = open_app("notepad", force_new=bool(force_new))
+    if open_result["status"] != "success":
+        return open_result
 
-    window = None
-    deadline = time.time() + 6.0
-    while time.time() < deadline:
-        try:
-            matches = gw.getWindowsWithTitle("Notepad")
-            if matches:
-                window = matches[0]
-                if getattr(window, "isMinimized", False):
-                    window.restore()
-                window.activate()
-                break
-        except Exception:
-            pass
-        time.sleep(0.2)
+    open_payload = open_result.get("result", {})
+    used_existing_window = isinstance(open_payload, dict) and open_payload.get("action") == "focused_existing_window"
 
+    window, focus_note = _wait_and_focus_window(["notepad"], timeout_seconds=6.0)
     if window is None:
-        return _err("Could not focus Notepad window.")
+        return _err(f"Could not focus Notepad window. {focus_note}")
 
     try:
         time.sleep(0.15)
         pyautogui.write(content, interval=0.01)
+        action = "focused_existing_window" if used_existing_window else "launched_new_instance"
+        message = (
+            "Focused existing Notepad and typed requested text."
+            if used_existing_window
+            else "Opened Notepad and typed requested text."
+        )
         return _ok(
-            {"typed": content, "window": getattr(window, "title", "Notepad")},
-            "Opened Notepad and typed requested text.",
+            {
+                "typed": content,
+                "window": getattr(window, "title", "Notepad"),
+                "action": action,
+                "force_new": bool(force_new),
+            },
+            message,
         )
     except Exception as exc:
         return _err(f"Typing in Notepad failed: {exc}")
@@ -3760,7 +4516,14 @@ TOOL_REGISTRY = {
     "browser_type": {
         "fn": browser_type,
         "description": "Type text into browser input by accessible element name or active field.",
-        "args": {"text": "string", "element_name": "string (optional)", "clear": "boolean (optional)"},
+        "args": {
+            "text": "string",
+            "element_name": "string (optional)",
+            "clear": "boolean (optional)",
+            "multiline": "boolean (optional)",
+            "newline_mode": "string (optional: shift_enter/enter/literal)",
+            "submit": "boolean (optional)",
+        },
     },
     "browser_press_key": {
         "fn": browser_press_key,
@@ -3838,7 +4601,13 @@ TOOL_REGISTRY = {
     "type_in_browser": {
         "fn": type_in_browser,
         "description": "Backward-compatible browser typing (selector or active input).",
-        "args": {"text": "string", "selector": "string (optional)"},
+        "args": {
+            "text": "string",
+            "selector": "string (optional)",
+            "multiline": "boolean (optional)",
+            "newline_mode": "string (optional: shift_enter/enter/literal)",
+            "submit": "boolean (optional)",
+        },
     },
     "press_key_in_browser": {
         "fn": press_key_in_browser,
@@ -3862,8 +4631,8 @@ TOOL_REGISTRY = {
     },
     "open_app": {
         "fn": open_app,
-        "description": "Open a Windows app by name/executable, using app index when available.",
-        "args": {"app_name": "string"},
+        "description": "Open/focus a Windows app by name/executable, reusing an existing window by default.",
+        "args": {"app_name": "string", "force_new": "boolean (optional, default false)"},
     },
     "check_file_handler": {
         "fn": check_file_handler,
@@ -3936,7 +4705,7 @@ TOOL_REGISTRY = {
     "write_in_notepad": {
         "fn": write_in_notepad,
         "description": "Open/focus Notepad and type text into it.",
-        "args": {"text": "string"},
+        "args": {"text": "string", "force_new": "boolean (optional, default false)"},
     },
     "get_running_apps": {
         "fn": get_running_apps,

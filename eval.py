@@ -93,6 +93,11 @@ class BenchmarkScenario:
     description: str
     steps: tuple[BenchmarkStep, ...]
     required_tools: tuple[str, ...] = ()
+    completion_indicators: tuple[str, ...] = ()
+    completion_output_markers: tuple[str, ...] = ()
+    completion_artifact_paths: tuple[str, ...] = ()
+    enforce_no_duplicate_open_app: bool = False
+    allow_duplicate_open_app_targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -121,14 +126,14 @@ BENCHMARK_SCENARIOS: tuple[BenchmarkScenario, ...] = (
         category="browser",
         description="Navigate to DuckDuckGo and submit a search query.",
         steps=(task_step("open browser and go to duckduckgo.com and search for github copilot"),),
-        required_tools=("browser_navigate", "browser_type", "browser_press_key"),
+        required_tools=("browser_navigate", "browser_type"),
     ),
     BenchmarkScenario(
         scenario_id="browser-youtube-play-first",
         category="browser",
         description="Search YouTube and click the first video result.",
         steps=(task_step("open youtube and search mkbhd and play the 1st video"),),
-        required_tools=("browser_navigate", "browser_type", "browser_press_key", "browser_click"),
+        required_tools=("browser_navigate", "browser_type", "browser_click"),
     ),
     BenchmarkScenario(
         scenario_id="tool-first-decompose-browser-notepad",
@@ -142,7 +147,7 @@ BENCHMARK_SCENARIOS: tuple[BenchmarkScenario, ...] = (
                 'open chrome and go to youtube and search for mkbhd and then open notepad and write "routing test done" in notepad'
             ),
         ),
-        required_tools=("browser_navigate", "browser_type", "browser_press_key", "write_in_notepad"),
+        required_tools=("browser_navigate", "browser_type", "write_in_notepad"),
     ),
     BenchmarkScenario(
         scenario_id="desktop-notepad-write",
@@ -167,6 +172,8 @@ BENCHMARK_SCENARIOS: tuple[BenchmarkScenario, ...] = (
             tool_step("search_file", {"query": "Windows", "limit": 5, "open_first": False, "kind": "all"}),
         ),
         required_tools=("index_files", "search_file"),
+        completion_output_markers=("indexed", "matches for"),
+        completion_artifact_paths=("memory\\file_index.db",),
     ),
     BenchmarkScenario(
         scenario_id="local-app-index-open",
@@ -174,6 +181,54 @@ BENCHMARK_SCENARIOS: tuple[BenchmarkScenario, ...] = (
         description="Build app index then open Notepad using indexed app resolution.",
         steps=(tool_step("index_apps"), task_step("open notepad")),
         required_tools=("index_apps", "open_app"),
+    ),
+    BenchmarkScenario(
+        scenario_id="complex-browser-search-click-extract",
+        category="complex",
+        description=(
+            "Execute a decomposed browser workflow: navigate, search, click the first result, "
+            "then capture browser state for extraction-style verification."
+        ),
+        steps=(
+            tool_step("browser_navigate", {"url": "https://duckduckgo.com"}),
+            tool_step("browser_type", {"text": "github copilot cli documentation"}),
+            tool_step("browser_press_key", {"key": "Enter"}),
+            tool_step("browser_click", {"element_name": "result", "occurrence": 1}),
+            tool_step("browser_get_state", {"max_elements": 40}),
+        ),
+        required_tools=("browser_navigate", "browser_type", "browser_press_key", "browser_click", "browser_get_state"),
+        completion_indicators=("browser_click", "browser_get_state"),
+    ),
+    BenchmarkScenario(
+        scenario_id="complex-desktop-browser-handoff",
+        category="complex",
+        description="Mix desktop and browser actions: open Notepad, write text, then run browser search and capture state.",
+        steps=(
+            tool_step("open_app", {"app_name": "notepad"}),
+            tool_step("write_in_notepad", {"text": "VOCO complex desktop-browser checkpoint"}),
+            tool_step("browser_navigate", {"url": "https://duckduckgo.com"}),
+            tool_step("browser_type", {"text": "windows notepad shortcuts"}),
+            tool_step("browser_press_key", {"key": "Enter"}),
+            tool_step("browser_get_state", {"max_elements": 35}),
+        ),
+        required_tools=("open_app", "write_in_notepad", "browser_navigate", "browser_type", "browser_press_key", "browser_get_state"),
+        completion_indicators=("write_in_notepad", "browser_get_state"),
+        enforce_no_duplicate_open_app=True,
+    ),
+    BenchmarkScenario(
+        scenario_id="complex-index-assisted-retrieval",
+        category="complex",
+        description="Build file/app indexes, retrieve indexed file metadata, and open a desktop app via indexed resolution.",
+        steps=(
+            tool_step("index_files", {"scope": "quick", "max_files": 12000}),
+            tool_step("search_file", {"query": "eval.py", "limit": 5, "open_first": False, "kind": "all"}),
+            tool_step("index_apps"),
+            tool_step("open_app", {"app_name": "notepad"}),
+        ),
+        required_tools=("index_files", "search_file", "index_apps", "open_app"),
+        completion_indicators=("search_file", "open_app"),
+        completion_artifact_paths=("memory\\file_index.db", "memory\\app_index.db"),
+        enforce_no_duplicate_open_app=True,
     ),
     BenchmarkScenario(
         scenario_id="stress-browser-50-sites",
@@ -745,6 +800,7 @@ def _run_task_step(step: BenchmarkStep) -> tuple[dict, list[str]]:
                 "latency_seconds": elapsed,
                 "final_output": f"EXCEPTION: {exc}",
                 "executed_tools": [],
+                "executed_tool_events": [],
                 "tool_statuses": [],
                 "message_counts": {},
                 "message": f"Task execution exception: {exc}",
@@ -754,16 +810,28 @@ def _run_task_step(step: BenchmarkStep) -> tuple[dict, list[str]]:
 
     elapsed = round(time.perf_counter() - start, 3)
     executed_tools: list[str] = []
+    executed_tool_events: list[dict[str, Any]] = []
     tool_statuses: list[str] = []
     for tool_result in context.tool_results:
         tool_name = str(tool_result.get("tool", "")).strip()
         if tool_name:
             executed_tools.append(tool_name)
+        tool_args = tool_result.get("args", {})
+        safe_args = dict(tool_args) if isinstance(tool_args, dict) else {}
         payload = tool_result.get("result", {})
+        status = ""
         if isinstance(payload, dict):
-            status = str(payload.get("status", "")).strip()
-            if status:
-                tool_statuses.append(status)
+            status = str(payload.get("status", "")).strip().lower()
+        if status:
+            tool_statuses.append(status)
+        if tool_name:
+            executed_tool_events.append(
+                {
+                    "tool": tool_name,
+                    "status": status or "unknown",
+                    "args": safe_args,
+                }
+            )
 
     all_tools_success = bool(tool_statuses) and all(status == "success" for status in tool_statuses)
     success = final_output.startswith("[VOCO] OK") and all_tools_success
@@ -781,6 +849,7 @@ def _run_task_step(step: BenchmarkStep) -> tuple[dict, list[str]]:
             "latency_seconds": elapsed,
             "final_output": final_output[:300],
             "executed_tools": executed_tools,
+            "executed_tool_events": executed_tool_events,
             "tool_statuses": tool_statuses,
             "message_counts": message_counts,
             "message": final_output[:300],
@@ -806,10 +875,52 @@ def _run_tool_step(step: BenchmarkStep) -> tuple[dict, list[str]]:
             "success": success,
             "latency_seconds": elapsed,
             "result_status": result_status,
+            "executed_tool_events": (
+                [{"tool": tool_name, "status": result_status.lower(), "args": dict(args)}] if tool_name else []
+            ),
             "message": message[:300],
         },
         [tool_name] if tool_name else [],
     )
+
+
+def _normalize_open_app_target(raw_args: dict[str, Any]) -> str:
+    for key in ("app_name", "app", "name", "window_title"):
+        value = raw_args.get(key)
+        normalized = str(value or "").strip().lower()
+        if normalized:
+            return normalized
+    return ""
+
+
+def _find_duplicate_open_app_targets(
+    tool_events: list[dict[str, Any]],
+    *,
+    allowed_targets: set[str],
+) -> list[str]:
+    seen_targets: set[str] = set()
+    duplicate_targets: set[str] = set()
+
+    for event in tool_events:
+        tool_name = str(event.get("tool", "")).strip().lower()
+        if tool_name != "open_app":
+            continue
+        status = str(event.get("status", "")).strip().lower()
+        if status and status != "success":
+            continue
+        raw_args = event.get("args", {})
+        args = dict(raw_args) if isinstance(raw_args, dict) else {}
+        if bool(args.get("force_new")):
+            continue
+        target = _normalize_open_app_target(args)
+        if not target or target in allowed_targets:
+            continue
+        if target in seen_targets:
+            duplicate_targets.add(target)
+        else:
+            seen_targets.add(target)
+
+    return sorted(duplicate_targets)
 
 
 def _run_benchmark_scenario(scenario: BenchmarkScenario) -> dict:
@@ -819,7 +930,8 @@ def _run_benchmark_scenario(scenario: BenchmarkScenario) -> dict:
     start = time.perf_counter()
     step_results: list[dict] = []
     executed_tools: list[str] = []
-    failure_reason: str | None = None
+    executed_tool_events: list[dict[str, Any]] = []
+    step_failure_reason: str | None = None
 
     for idx, step in enumerate(scenario.steps, start=1):
         if step.kind == "task":
@@ -840,24 +952,157 @@ def _run_benchmark_scenario(scenario: BenchmarkScenario) -> dict:
 
         step_results.append(step_result)
         executed_tools.extend(step_tools)
+        raw_step_events = step_result.get("executed_tool_events", [])
+        if isinstance(raw_step_events, list):
+            for raw_event in raw_step_events:
+                if isinstance(raw_event, dict):
+                    executed_tool_events.append(raw_event)
         step_status = "OK" if step_result["success"] else "FAIL"
         print(f"  - [{idx}/{len(scenario.steps)}] {step_status} {label} ({step_result['latency_seconds']}s)")
 
         if not step_result["success"]:
-            failure_reason = str(step_result.get("message", "Benchmark step failed."))
+            step_failure_reason = str(step_result.get("message", "Benchmark step failed."))
             break
 
-    unique_tools = sorted(set(executed_tools))
+    planned_steps = len(scenario.steps)
+    completed_steps = len(step_results)
+    all_steps_completed = completed_steps == planned_steps
+    all_step_results_successful = all(bool(step_result.get("success")) for step_result in step_results) and all_steps_completed
+    step_completion_percent = 100.0 if planned_steps == 0 else round((completed_steps / planned_steps) * 100, 2)
+
+    tool_sequence = [str(event.get("tool", "")).strip() for event in executed_tool_events]
+    tool_sequence = [tool_name for tool_name in tool_sequence if tool_name]
+    if not tool_sequence and executed_tools:
+        tool_sequence = [tool_name for tool_name in executed_tools if tool_name]
+    unique_tools = sorted(set(tool_sequence))
     missing_required_tools = sorted(tool for tool in scenario.required_tools if tool not in unique_tools)
-    if failure_reason is None and missing_required_tools:
+    required_tool_coverage = (
+        1.0
+        if not scenario.required_tools
+        else (len(scenario.required_tools) - len(missing_required_tools)) / len(scenario.required_tools)
+    )
+    tool_coverage_passed = len(missing_required_tools) == 0
+
+    completion_indicators = scenario.completion_indicators or scenario.required_tools
+    successful_tools = {
+        str(event.get("tool", "")).strip()
+        for event in executed_tool_events
+        if str(event.get("status", "")).strip().lower() == "success"
+    }
+    missing_completion_indicators = sorted(
+        indicator for indicator in completion_indicators if indicator not in successful_tools
+    )
+    completion_indicator_coverage = (
+        1.0
+        if not completion_indicators
+        else (len(completion_indicators) - len(missing_completion_indicators)) / len(completion_indicators)
+    )
+
+    completion_output_markers = tuple(
+        marker.strip()
+        for marker in scenario.completion_output_markers
+        if str(marker).strip()
+    )
+    output_haystack = " ".join(
+        (
+            f"{str(step_result.get('final_output', '')).strip()} "
+            f"{str(step_result.get('message', '')).strip()}"
+        ).strip()
+        for step_result in step_results
+    ).lower()
+    missing_completion_output_markers = sorted(
+        marker for marker in completion_output_markers if marker.lower() not in output_haystack
+    )
+    completion_output_marker_coverage = (
+        1.0
+        if not completion_output_markers
+        else (len(completion_output_markers) - len(missing_completion_output_markers))
+        / len(completion_output_markers)
+    )
+
+    completion_artifact_paths = tuple(
+        str(path).strip()
+        for path in scenario.completion_artifact_paths
+        if str(path).strip()
+    )
+    missing_completion_artifact_paths = sorted(
+        path for path in completion_artifact_paths if not Path(path).exists()
+    )
+    completion_artifact_coverage = (
+        1.0
+        if not completion_artifact_paths
+        else (len(completion_artifact_paths) - len(missing_completion_artifact_paths))
+        / len(completion_artifact_paths)
+    )
+
+    allowed_duplicate_targets = {
+        str(target).strip().lower() for target in scenario.allow_duplicate_open_app_targets if str(target).strip()
+    }
+    duplicate_open_app_targets = _find_duplicate_open_app_targets(
+        executed_tool_events,
+        allowed_targets=allowed_duplicate_targets,
+    )
+    duplicate_open_app_check_passed = not scenario.enforce_no_duplicate_open_app or not duplicate_open_app_targets
+    completion_state_checks = {
+        "all_steps_completed": all_steps_completed,
+        "all_step_results_successful": all_step_results_successful,
+        "no_duplicate_open_app": duplicate_open_app_check_passed,
+    }
+
+    completion_oracle_failures: list[str] = []
+    if not all_steps_completed:
+        completion_oracle_failures.append(
+            f"Only completed {completed_steps}/{planned_steps} planned steps."
+        )
+    if not all_step_results_successful:
+        completion_oracle_failures.append("One or more executed steps failed.")
+    if missing_completion_indicators:
+        completion_oracle_failures.append(
+            "Missing completion indicators: " + ", ".join(missing_completion_indicators)
+        )
+    if missing_completion_output_markers:
+        completion_oracle_failures.append(
+            "Missing completion output markers: " + ", ".join(missing_completion_output_markers)
+        )
+    if missing_completion_artifact_paths:
+        completion_oracle_failures.append(
+            "Missing completion artifacts: " + ", ".join(missing_completion_artifact_paths)
+        )
+    if scenario.enforce_no_duplicate_open_app and not duplicate_open_app_check_passed:
+        completion_oracle_failures.append(
+            "Duplicate open_app target(s) detected: " + ", ".join(duplicate_open_app_targets)
+        )
+    completion_oracle_passed = len(completion_oracle_failures) == 0
+
+    failure_type: str | None = None
+    failure_reason: str | None = None
+    if step_failure_reason is not None:
+        failure_type = "step_execution"
+        failure_reason = step_failure_reason
+    elif not tool_coverage_passed:
+        failure_type = "tool_coverage"
         failure_reason = "Missing expected tool coverage: " + ", ".join(missing_required_tools)
+    elif not completion_oracle_passed:
+        failure_type = "completion_oracle"
+        failure_reason = "Completion oracle failed: " + "; ".join(completion_oracle_failures)
 
     latency = round(time.perf_counter() - start, 3)
-    success = failure_reason is None and len(step_results) == len(scenario.steps)
+    success = failure_type is None
     if success:
         print(f"  -> OK in {latency}s")
     else:
         print(f"  -> FAIL in {latency}s | {failure_reason}")
+
+    assertions = {
+        "required_tool_coverage": tool_coverage_passed,
+        "completion_indicators": len(missing_completion_indicators) == 0,
+        "completion_output_markers": len(missing_completion_output_markers) == 0,
+        "completion_artifact_paths": len(missing_completion_artifact_paths) == 0,
+        "no_duplicate_open_app": duplicate_open_app_check_passed,
+        "all_steps_completed": all_steps_completed,
+        "all_step_results_successful": all_step_results_successful,
+        "completion_oracle_passed": completion_oracle_passed,
+    }
 
     return {
         "id": scenario.scenario_id,
@@ -866,8 +1111,46 @@ def _run_benchmark_scenario(scenario: BenchmarkScenario) -> dict:
         "success": success,
         "latency_seconds": latency,
         "required_tools": list(scenario.required_tools),
+        "completion_indicators": list(completion_indicators),
+        "completion_output_markers": list(completion_output_markers),
+        "completion_artifact_paths": list(completion_artifact_paths),
         "executed_tools": unique_tools,
+        "tool_sequence": tool_sequence,
         "missing_required_tools": missing_required_tools,
+        "missing_completion_indicators": missing_completion_indicators,
+        "missing_completion_output_markers": missing_completion_output_markers,
+        "missing_completion_artifact_paths": missing_completion_artifact_paths,
+        "duplicate_open_app_targets": duplicate_open_app_targets,
+        "tool_coverage_passed": tool_coverage_passed,
+        "completion_oracle_passed": completion_oracle_passed,
+        "completion_oracle": {
+            "passed": completion_oracle_passed,
+            "failures": completion_oracle_failures,
+            "state_checks": completion_state_checks,
+            "expected": {
+                "indicators": list(completion_indicators),
+                "output_markers": list(completion_output_markers),
+                "artifact_paths": list(completion_artifact_paths),
+            },
+            "missing": {
+                "indicators": missing_completion_indicators,
+                "output_markers": missing_completion_output_markers,
+                "artifact_paths": missing_completion_artifact_paths,
+            },
+        },
+        "assertions": assertions,
+        "metrics": {
+            "tool_event_count": len(tool_sequence),
+            "required_tool_coverage_percent": round(required_tool_coverage * 100, 2),
+            "completion_indicator_coverage_percent": round(completion_indicator_coverage * 100, 2),
+            "completion_output_marker_coverage_percent": round(completion_output_marker_coverage * 100, 2),
+            "completion_artifact_coverage_percent": round(completion_artifact_coverage * 100, 2),
+            "planned_steps": planned_steps,
+            "completed_steps": completed_steps,
+            "step_completion_percent": step_completion_percent,
+            "completion_oracle_failure_count": len(completion_oracle_failures),
+        },
+        "failure_type": failure_type,
         "failure_reason": failure_reason,
         "steps": step_results,
     }
@@ -973,6 +1256,22 @@ def run_benchmark(
             "p95_latency_seconds": round(_percentile(category_latencies, 0.95), 3),
         }
 
+    tool_coverage_failure_ids = sorted(
+        result["id"] for result in scenario_results if not bool(result.get("tool_coverage_passed", True))
+    )
+    completion_oracle_failure_ids = sorted(
+        result["id"] for result in scenario_results if not bool(result.get("completion_oracle_passed", True))
+    )
+    failure_type_counts: dict[str, int] = {}
+    for result in scenario_results:
+        raw_failure_type = result.get("failure_type")
+        if raw_failure_type is None:
+            continue
+        failure_type = str(raw_failure_type).strip()
+        if not failure_type:
+            continue
+        failure_type_counts[failure_type] = failure_type_counts.get(failure_type, 0) + 1
+
     gate_failures: list[str] = []
     if min_success_ratio is not None and success_rate_ratio < min_success_ratio:
         gate_failures.append(
@@ -1003,6 +1302,17 @@ def run_benchmark(
             "min_seconds": round(min_latency, 3),
             "max_seconds": round(max_latency, 3),
         },
+        "failure_breakdown": {
+            "tool_coverage_failures": {
+                "count": len(tool_coverage_failure_ids),
+                "scenario_ids": tool_coverage_failure_ids,
+            },
+            "completion_oracle_failures": {
+                "count": len(completion_oracle_failure_ids),
+                "scenario_ids": completion_oracle_failure_ids,
+            },
+            "by_failure_type": failure_type_counts,
+        },
         "by_category": by_category,
         "gate": {
             "enforced": enforce_gate,
@@ -1030,6 +1340,14 @@ def run_benchmark(
     print(
         "Latency (s): "
         f"avg={avg_latency:.3f}, median={median_latency:.3f}, p95={p95_latency:.3f}, max={max_latency:.3f}"
+    )
+    print(
+        f"Tool coverage failures: {len(tool_coverage_failure_ids)}"
+        + (f" [{', '.join(tool_coverage_failure_ids)}]" if tool_coverage_failure_ids else "")
+    )
+    print(
+        f"Completion oracle failures: {len(completion_oracle_failure_ids)}"
+        + (f" [{', '.join(completion_oracle_failure_ids)}]" if completion_oracle_failure_ids else "")
     )
     if gate_failures:
         print("Gate checks:")

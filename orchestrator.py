@@ -292,9 +292,19 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
     for index, step in enumerate(plan[:MAX_STEPS], start=1):
         requires_approval = False
         human_approved = False
+        privileged_action = False
+        approval_error_code = ""
         tool_name = "unknown"
         tool_args: dict = {}
         reason = ""
+        step_reason = ""
+        policy_metadata = _build_policy_metadata(
+            tool_name=tool_name,
+            requires_approval=requires_approval,
+            human_approved=human_approved,
+            policy_scope=context.access_level_policy,
+            approval_error_code=approval_error_code,
+        )
         if not isinstance(step, dict):
             result = {"status": "error", "result": None, "message": "Invalid step payload (expected object)."}
             reason = "invalid-step"
@@ -304,27 +314,43 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
             reason = str(step.get("reason", "")).strip()
             if tool_name in TOOL_REGISTRY and isinstance(tool_args, dict):
                 requires_approval = tool_requires_approval(tool_name)
-                if requires_approval:
+                privileged_action = _is_privileged_tool_action(
+                    tool_name=tool_name,
+                    requires_approval=requires_approval,
+                )
+                if privileged_action:
                     human_approved = _has_human_approval(task=task, args=tool_args)
 
             if not isinstance(tool_args, dict):
                 result = {"status": "error", "result": None, "message": "Step args must be an object."}
             elif tool_name not in TOOL_REGISTRY:
                 result = {"status": "error", "result": None, "message": f"Unknown tool: '{tool_name}'"}
-            elif requires_approval and not human_approved:
-                result = {
-                    "status": "error",
-                    "result": None,
-                    "message": (
-                        f"Tool '{tool_name}' requires human approval. "
-                        "Re-run with explicit approval in the task or args.human_approval=true."
-                    ),
-                }
+            elif privileged_action and not human_approved:
+                approval_error_code = _POLICY_APPROVAL_ERROR_CODE
+                policy_metadata = _build_policy_metadata(
+                    tool_name=tool_name,
+                    requires_approval=requires_approval,
+                    human_approved=human_approved,
+                    policy_scope=context.access_level_policy,
+                    approval_error_code=approval_error_code,
+                )
+                result = _build_approval_required_result(tool_name=tool_name, policy_metadata=policy_metadata)
             else:
                 result = dispatch_tool(tool_name, tool_args)
 
+        policy_metadata = _build_policy_metadata(
+            tool_name=tool_name,
+            requires_approval=requires_approval,
+            human_approved=human_approved,
+            policy_scope=context.access_level_policy,
+            approval_error_code=approval_error_code,
+        )
+        step_reason = _format_step_reason_with_policy(reason=reason, policy_metadata=policy_metadata)
         emit(
-            f"[VOCO] Step {index}/{max_steps_to_run}: {tool_name}({_format_args_preview(tool_name, tool_args)}) - {reason}",
+            (
+                f"[VOCO] Step {index}/{max_steps_to_run}: "
+                f"{tool_name}({_format_args_preview(tool_name, tool_args)}) - {step_reason}"
+            ),
             "step",
         )
 
@@ -425,9 +451,11 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 "step": index,
                 "tool": tool_name,
                 "args": safe_tool_args,
-                "reason": reason,
+                "reason": step_reason,
                 "requires_approval": requires_approval,
                 "human_approved": human_approved,
+                "access_level": policy_metadata["access_level"],
+                "policy": policy_metadata,
                 "retry": retry_metadata,
             }
         )
@@ -436,6 +464,8 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 "step": index,
                 "tool": tool_name,
                 "args": safe_tool_args,
+                "access_level": policy_metadata["access_level"],
+                "policy": policy_metadata,
                 "result": result,
                 "retry": retry_metadata,
             }
@@ -559,6 +589,56 @@ def _get_tool_access_level(tool_name: str) -> str:
     return _ACCESS_LEVEL_BY_TOOL.get(str(tool_name).strip(), "L2")
 
 
+_POLICY_APPROVAL_ERROR_CODE = "POLICY_APPROVAL_REQUIRED"
+
+
+def _is_privileged_tool_action(tool_name: str, requires_approval: bool = False) -> bool:
+    access_level = _get_tool_access_level(tool_name)
+    return access_level == "L3" or bool(requires_approval)
+
+
+def _build_policy_metadata(
+    tool_name: str,
+    requires_approval: bool,
+    human_approved: bool,
+    policy_scope: str,
+    approval_error_code: str = "",
+) -> dict:
+    access_level = _get_tool_access_level(tool_name)
+    return {
+        "policy_scope": str(policy_scope).strip() or "L1-L3",
+        "access_level": access_level,
+        "privileged_action": _is_privileged_tool_action(tool_name, requires_approval=requires_approval),
+        "requires_approval": bool(requires_approval),
+        "human_approved": bool(human_approved),
+        "approval_error_code": str(approval_error_code).strip(),
+    }
+
+
+def _format_policy_metadata(policy_metadata: dict) -> str:
+    return (
+        f"policy_scope={policy_metadata['policy_scope']}; "
+        f"access_level={policy_metadata['access_level']}; "
+        f"privileged_action={str(bool(policy_metadata['privileged_action'])).lower()}; "
+        f"requires_approval={str(bool(policy_metadata['requires_approval'])).lower()}; "
+        f"human_approved={str(bool(policy_metadata['human_approved'])).lower()}"
+    )
+
+
+def _format_step_reason_with_policy(reason: str, policy_metadata: dict) -> str:
+    detail = reason.strip() or "Tool-first execution step."
+    return f"{detail} [{_format_policy_metadata(policy_metadata)}]"
+
+
+def _build_approval_required_result(tool_name: str, policy_metadata: dict) -> dict:
+    message = (
+        f"{_POLICY_APPROVAL_ERROR_CODE}: Tool '{tool_name}' requires human approval. "
+        "Re-run with explicit approval in the task or args.human_approval=true. "
+        f"{_format_policy_metadata(policy_metadata)}"
+    )
+    return {"status": "error", "result": None, "message": message}
+
+
 def _annotate_step_reason(step_text: str, route_path: str, base_reason: str, tool_name: str) -> str:
     access_level = _get_tool_access_level(tool_name)
     detail = base_reason.strip() or "Tool-first execution step."
@@ -616,6 +696,138 @@ def _plan_single_step_with_llm(step_task: str, context: AgentContext) -> dict:
     }
 
 
+_EXPLICIT_REPEAT_STEP_REGEX = re.compile(
+    r"\b(?:again|once more|one more time|repeat|re-open|reopen|refocus|re-focus|retry|twice|thrice|"
+    r"second time|third time|\d+\s+times?|two\s+times?|three\s+times?)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_explicit_repeat_step(step_text: str) -> bool:
+    return _EXPLICIT_REPEAT_STEP_REGEX.search(str(step_text or "")) is not None
+
+
+def _normalize_open_focus_action_key(tool_name: str, args: dict[str, object]) -> tuple[str, str] | None:
+    normalized_tool = str(tool_name or "").strip().lower()
+    if not normalized_tool:
+        return None
+
+    def _normalize_token(value: object) -> str:
+        token = str(value or "").strip().strip("\"'").lower()
+        return re.sub(r"\s+", " ", token)
+
+    if normalized_tool == "open_app":
+        app_name = _normalize_token(args.get("app_name"))
+        if app_name:
+            return ("open", f"app:{app_name}")
+        return None
+
+    if normalized_tool == "focus_window":
+        window_title = _normalize_token(args.get("window_title"))
+        if window_title:
+            return ("focus", f"window:{window_title}")
+        return None
+
+    if normalized_tool == "browser_navigate":
+        url = _normalize_token(args.get("url"))
+        if not url:
+            return None
+        browser = _normalize_token(args.get("browser")) or "default"
+        normalized_url = re.sub(r"^https?://", "", url).rstrip("/")
+        return ("open", f"browser:{browser}:{normalized_url}")
+
+    if normalized_tool == "browser_switch_profile":
+        profile_mode = _normalize_token(args.get("profile_mode"))
+        if not profile_mode:
+            return None
+        browser = _normalize_token(args.get("browser")) or "default"
+        return ("open", f"profile:{browser}:{profile_mode}")
+
+    if normalized_tool == "open_existing_document":
+        path = _normalize_token(args.get("path"))
+        if path:
+            return ("open", f"document:{path}")
+        extension = _normalize_token(args.get("extension"))
+        query = _normalize_token(args.get("query"))
+        if extension or query:
+            return ("open", f"document:{extension}:{query}")
+        return None
+
+    return None
+
+
+_BROWSER_OPEN_APP_ALIASES = frozenset(
+    {
+        "browser",
+        "chrome",
+        "google chrome",
+        "msedge",
+        "edge",
+        "microsoft edge",
+        "firefox",
+        "chromium",
+    }
+)
+
+
+def _is_browser_open_app_step(tool_name: str, args: dict[str, object]) -> bool:
+    if str(tool_name or "").strip().lower() != "open_app":
+        return False
+    app_name = str(args.get("app_name", "")).strip().strip("\"'").lower()
+    app_name = re.sub(r"\s+", " ", app_name)
+    return app_name in _BROWSER_OPEN_APP_ALIASES
+
+
+def _has_future_browser_navigation_step(plan: list[dict], start_index: int) -> bool:
+    for candidate in plan[start_index + 1 :]:
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("tool", "")).strip().lower() == "browser_navigate":
+            return True
+    return False
+
+
+def _cleanup_decomposed_plan_steps(plan: list[dict], step_sources: list[str]) -> tuple[list[dict], int]:
+    cleaned_plan: list[dict] = []
+    suppressed_steps = 0
+    previous_open_focus_key: tuple[str, str] | None = None
+
+    for index, raw_step in enumerate(plan):
+        if not isinstance(raw_step, dict):
+            cleaned_plan.append(raw_step)
+            previous_open_focus_key = None
+            continue
+
+        tool_name = str(raw_step.get("tool", "")).strip()
+        raw_args = raw_step.get("args", {})
+        args = raw_args if isinstance(raw_args, dict) else {}
+        step = raw_step if isinstance(raw_args, dict) else {**raw_step, "args": args}
+        source_step = step_sources[index] if index < len(step_sources) else ""
+
+        if (
+            _is_browser_open_app_step(tool_name=tool_name, args=args)
+            and _has_future_browser_navigation_step(plan=plan, start_index=index)
+            and not _is_explicit_repeat_step(source_step)
+        ):
+            suppressed_steps += 1
+            continue
+
+        action_key = _normalize_open_focus_action_key(tool_name=tool_name, args=args)
+        if action_key is None:
+            cleaned_plan.append(step)
+            previous_open_focus_key = None
+            continue
+
+        if previous_open_focus_key == action_key and not _is_explicit_repeat_step(source_step):
+            suppressed_steps += 1
+            continue
+
+        cleaned_plan.append(step)
+        previous_open_focus_key = action_key
+
+    return cleaned_plan, suppressed_steps
+
+
 def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dict | None:
     """
     Build a tool-first plan:
@@ -636,10 +848,38 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
 
     plan: list[dict] = []
     route_trace: list[dict] = []
+    plan_step_sources: list[str] = []
     unresolved_steps: list[str] = []
     format_failures = 0
     plan_retries = 0
     last_model_used = ""
+
+    def _append_plan_step(step_payload: dict, source_step_text: str) -> None:
+        plan.append(step_payload)
+        plan_step_sources.append(source_step_text)
+
+    def _finalize_bundle(confidence: float, error: str = "") -> dict:
+        cleaned_plan, suppressed_steps = _cleanup_decomposed_plan_steps(
+            plan=plan,
+            step_sources=plan_step_sources,
+        )
+        if suppressed_steps:
+            emit(
+                f"[VOCO] Decomposition cleanup removed {suppressed_steps} redundant open/focus step(s).",
+                "info",
+            )
+        return {
+            "plan": cleaned_plan,
+            "split_steps": split_steps,
+            "route_trace": route_trace,
+            "decomposition_used": True,
+            "confidence": confidence,
+            "model_used": last_model_used,
+            "format_failures": format_failures,
+            "plan_retries": plan_retries,
+            "cleanup_suppressed_steps": suppressed_steps,
+            "error": error,
+        }
 
     for step_index, step_text in enumerate(split_steps, start=1):
         route = predict_route(step_text)
@@ -670,7 +910,20 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
 
         if can_route_direct:
             route_path = "router_direct" if confidence >= _ROUTER_DIRECT_THRESHOLD else "router_direct_low_conf"
-            plan.append(
+            direct_args = dict(args)
+            if tool_name == "browser_type":
+                if _browser_submit_requested(step_text, include_search=True):
+                    direct_args.setdefault("submit", True)
+                text_value = str(direct_args.get("text", ""))
+                if text_value:
+                    normalized_text = _normalize_browser_multiline_text(text_value)
+                    if normalized_text:
+                        direct_args["text"] = normalized_text
+                if _browser_multiline_requested(step_text) or "\n" in str(direct_args.get("text", "")):
+                    direct_args.setdefault("multiline", True)
+                    direct_args.setdefault("newline_mode", "shift_enter")
+            args = direct_args
+            _append_plan_step(
                 {
                     "tool": tool_name,
                     "args": args,
@@ -680,29 +933,9 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                         base_reason=f"intent={intent} confidence={confidence:.2f}",
                         tool_name=tool_name,
                     ),
-                }
+                },
+                source_step_text=step_text,
             )
-            should_submit_search = bool(
-                tool_name == "browser_type"
-                and (
-                    str(args.get("element_name", "")).strip().lower() == "search"
-                    or bool(re.search(r"\bsearch\b", step_text, flags=re.IGNORECASE))
-                )
-                and not bool(re.search(r"\b(?:press|hit)\s+enter\b", step_text, flags=re.IGNORECASE))
-            )
-            if should_submit_search:
-                plan.append(
-                    {
-                        "tool": "browser_press_key",
-                        "args": {"key": "Enter"},
-                        "reason": _annotate_step_reason(
-                            step_text=step_text,
-                            route_path=route_path,
-                            base_reason="Submit browser search after typing query.",
-                            tool_name="browser_press_key",
-                        ),
-                    }
-                )
         else:
             fallback_plan = _build_local_fastpath_plan(step_text)
             if fallback_plan is not None:
@@ -713,7 +946,7 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                     if not isinstance(fallback_args, dict):
                         fallback_args = {}
                     fallback_reason = str(fallback_step.get("reason", "")).strip()
-                    plan.append(
+                    _append_plan_step(
                         {
                             "tool": fallback_tool,
                             "args": fallback_args,
@@ -723,7 +956,8 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                                 base_reason=fallback_reason,
                                 tool_name=fallback_tool,
                             ),
-                        }
+                        },
+                        source_step_text=step_text,
                     )
             elif tool_name and tool_name in TOOL_REGISTRY and missing_args:
                 route_path = "router_missing_args"
@@ -733,7 +967,7 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                     f"Missing required argument(s) for '{tool_name}': {missing_suffix}. "
                     f"Clarify this step: {step_text}"
                 )
-                plan.append(
+                _append_plan_step(
                     {
                         "tool": "report_failure",
                         "args": {"reason": failure_reason},
@@ -743,7 +977,8 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                             base_reason=failure_reason,
                             tool_name="report_failure",
                         ),
-                    }
+                    },
+                    source_step_text=step_text,
                 )
             else:
                 unresolved_steps.append(step_text)
@@ -764,20 +999,13 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
 
     if unresolved_steps:
         if not check_ollama_running():
-            return {
-                "plan": plan,
-                "split_steps": split_steps,
-                "route_trace": route_trace,
-                "decomposition_used": True,
-                "confidence": 0.82,
-                "model_used": last_model_used,
-                "format_failures": format_failures,
-                "plan_retries": plan_retries,
-                "error": (
+            return _finalize_bundle(
+                confidence=0.82,
+                error=(
                     "Tool-first decomposition found unresolved steps but Gemma fallback is unavailable. "
                     f"Run: ollama serve && ollama pull {OLLAMA_MODEL}"
                 ),
-            }
+            )
 
         for unresolved in unresolved_steps:
             emit(f"[VOCO] Router uncertain for step, using Gemma fallback: {unresolved}", "info")
@@ -789,17 +1017,10 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                 last_model_used = model_candidate
 
             if not bool(llm_step.get("ok")):
-                return {
-                    "plan": plan,
-                    "split_steps": split_steps,
-                    "route_trace": route_trace,
-                    "decomposition_used": True,
-                    "confidence": 0.8,
-                    "model_used": last_model_used,
-                    "format_failures": format_failures,
-                    "plan_retries": plan_retries,
-                    "error": str(llm_step.get("error", "Gemma fallback step planning failed.")),
-                }
+                return _finalize_bundle(
+                    confidence=0.8,
+                    error=str(llm_step.get("error", "Gemma fallback step planning failed.")),
+                )
 
             for llm_plan_step in llm_step.get("plan", []):
                 if not isinstance(llm_plan_step, dict):
@@ -809,7 +1030,7 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                 if not isinstance(llm_args, dict):
                     llm_args = {}
                 llm_reason = str(llm_plan_step.get("reason", "")).strip()
-                plan.append(
+                _append_plan_step(
                     {
                         "tool": llm_tool,
                         "args": llm_args,
@@ -819,7 +1040,8 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                             base_reason=llm_reason,
                             tool_name=llm_tool,
                         ),
-                    }
+                    },
+                    source_step_text=unresolved,
                 )
 
     average_confidence = 0.0
@@ -827,17 +1049,7 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
         confidence_values = [float(item.get("confidence", 0.0)) for item in route_trace]
         average_confidence = sum(confidence_values) / max(1, len(confidence_values))
 
-    return {
-        "plan": plan,
-        "split_steps": split_steps,
-        "route_trace": route_trace,
-        "decomposition_used": True,
-        "confidence": max(0.8, min(1.0, average_confidence)),
-        "model_used": last_model_used,
-        "format_failures": format_failures,
-        "plan_retries": plan_retries,
-        "error": "",
-    }
+    return _finalize_bundle(confidence=max(0.8, min(1.0, average_confidence)), error="")
 
 
 _SENSITIVE_ARG_TOKENS = (
@@ -1023,6 +1235,27 @@ def _sanitize_retry_metadata(raw_retry: dict | None) -> dict:
     return normalized
 
 
+def _sanitize_policy_metadata(raw_policy: dict | None) -> dict:
+    if not isinstance(raw_policy, dict):
+        return {
+            "policy_scope": "L1-L3",
+            "access_level": "L2",
+            "privileged_action": False,
+            "requires_approval": False,
+            "human_approved": False,
+            "approval_error_code": "",
+        }
+
+    return {
+        "policy_scope": str(raw_policy.get("policy_scope", "L1-L3")).strip() or "L1-L3",
+        "access_level": str(raw_policy.get("access_level", "L2")).strip() or "L2",
+        "privileged_action": bool(raw_policy.get("privileged_action")),
+        "requires_approval": bool(raw_policy.get("requires_approval")),
+        "human_approved": bool(raw_policy.get("human_approved")),
+        "approval_error_code": str(raw_policy.get("approval_error_code", "")).strip(),
+    }
+
+
 def _build_tool_results_log(tool_results: list[dict] | None) -> list[dict]:
     records: list[dict] = []
     for fallback_index, item in enumerate(tool_results or [], start=1):
@@ -1034,12 +1267,15 @@ def _build_tool_results_log(tool_results: list[dict] | None) -> list[dict]:
         if isinstance(payload, dict):
             status = str(payload.get("status", "")).strip().lower() or "unknown"
             message = str(payload.get("message", "")).strip()
+        policy = _sanitize_policy_metadata(item.get("policy"))
         records.append(
             {
                 "step": _safe_int(item.get("step"), fallback_index),
                 "tool": str(item.get("tool", "")).strip(),
                 "status": status,
                 "message": message[:300],
+                "access_level": policy["access_level"],
+                "policy": policy,
                 "retry": _sanitize_retry_metadata(item.get("retry")),
             }
         )
@@ -1151,6 +1387,7 @@ def _build_action_trace(steps: list[dict] | None, tool_results: list[dict] | Non
         result_by_step[step_index] = {
             "status": status,
             "message": message[:300],
+            "policy": _sanitize_policy_metadata(item.get("policy")),
             "retry": _sanitize_retry_metadata(item.get("retry")),
         }
 
@@ -1171,11 +1408,13 @@ def _build_action_trace(steps: list[dict] | None, tool_results: list[dict] | Non
         reason = str(step.get("reason", "")).strip()
         requires_approval = bool(step.get("requires_approval")) or tool_requires_approval(tool_name)
         human_approved = bool(step.get("human_approved"))
+        step_policy = _sanitize_policy_metadata(step.get("policy"))
         step_retry = _sanitize_retry_metadata(step.get("retry"))
         result_info = result_by_step.get(
             step_index,
-            {"status": "unknown", "message": "", "retry": step_retry},
+            {"status": "unknown", "message": "", "policy": step_policy, "retry": step_retry},
         )
+        policy_info = _sanitize_policy_metadata(result_info.get("policy"))
         retry_info = result_info.get("retry")
         if not isinstance(retry_info, dict):
             retry_info = step_retry
@@ -1190,6 +1429,8 @@ def _build_action_trace(steps: list[dict] | None, tool_results: list[dict] | Non
                 "message": result_info["message"],
                 "requires_approval": requires_approval,
                 "human_approved": human_approved,
+                "access_level": policy_info["access_level"],
+                "policy": policy_info,
                 "retry_count": max(0, _safe_int(retry_info.get("retry_count"), 0)),
                 "max_retries": max(0, _safe_int(retry_info.get("max_retries"), 0)),
                 "retries_exhausted": bool(retry_info.get("retries_exhausted")),
@@ -1686,7 +1927,12 @@ def _build_privileged_command_fastpath_plan(task: str, text: str) -> list[dict] 
         {
             "tool": "run_command",
             "args": args,
-            "reason": "Execute privileged command path with explicit approval checks.",
+            "reason": _annotate_step_reason(
+                step_text=task,
+                route_path="local_privileged_fastpath",
+                base_reason="Execute privileged command path with explicit approval checks.",
+                tool_name="run_command",
+            ),
         }
     ]
 
@@ -2295,6 +2541,11 @@ def _build_browser_fastpath_plan(task: str, text: str) -> list[dict] | None:
             type_args: dict[str, object] = {"text": action["text"]}
             if action.get("element_name"):
                 type_args["element_name"] = action["element_name"]
+            if action.get("multiline"):
+                type_args["multiline"] = True
+                type_args["newline_mode"] = str(action.get("newline_mode", "shift_enter"))
+            if action.get("submit"):
+                type_args["submit"] = True
             plan.append(
                 {
                     "tool": "browser_type",
@@ -2302,14 +2553,6 @@ def _build_browser_fastpath_plan(task: str, text: str) -> list[dict] | None:
                     "reason": "Type requested text into active browser page.",
                 }
             )
-            if action.get("press_enter", False):
-                plan.append(
-                    {
-                        "tool": "browser_press_key",
-                        "args": {"key": "Enter"},
-                        "reason": "Submit typed input in browser.",
-                    }
-                )
             continue
 
         if action["kind"] == "click":
@@ -2462,8 +2705,47 @@ def _extract_preferred_browser(text: str) -> str | None:
     return None
 
 
+_BROWSER_SUBMIT_REGEX = re.compile(
+    r"\b(?:send|submit)\b|\b(?:press|hit)\s+enter\b",
+    flags=re.IGNORECASE,
+)
+_BROWSER_MULTILINE_REGEX = re.compile(
+    r"\b(?:new\s*line|newline|line\s*break|next\s*line|multiline|multi[-\s]?line)\b",
+    flags=re.IGNORECASE,
+)
+_BROWSER_NEWLINE_TOKEN_REGEX = re.compile(
+    r"\b(?:new\s*line|newline|line\s*break|next\s*line)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _browser_submit_requested(text: str, include_search: bool = False) -> bool:
+    source = str(text or "")
+    if _BROWSER_SUBMIT_REGEX.search(source):
+        return True
+    if include_search and re.search(r"\bsearch(?:\s+for)?\b", source, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _browser_multiline_requested(text: str) -> bool:
+    return _BROWSER_MULTILINE_REGEX.search(str(text or "")) is not None
+
+
+def _normalize_browser_multiline_text(value: str) -> str:
+    cleaned = str(value or "").strip().strip("\"'").strip()
+    cleaned = cleaned.rstrip(".,;:!?")
+    if not cleaned:
+        return ""
+    converted = _BROWSER_NEWLINE_TOKEN_REGEX.sub("\n", cleaned)
+    converted = re.sub(r"[ \t]*\n[ \t]*", "\n", converted)
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in converted.splitlines()]
+    return "\n".join(lines).strip()
+
+
 def _extract_browser_actions(task: str, text: str) -> list[dict]:
     actions: list[dict] = []
+    submit_requested = _browser_submit_requested(task)
 
     search_match = re.search(
         r"\bsearch(?:\s+for)?\s+(.+?)(?=\s+(?:and|then)\s+(?:play|click|open|press|type|write)\b|\s*$)",
@@ -2471,27 +2753,38 @@ def _extract_browser_actions(task: str, text: str) -> list[dict]:
         flags=re.IGNORECASE,
     )
     if search_match:
-        query = _clean_browser_action_text(search_match.group(1))
+        query = _normalize_browser_multiline_text(_clean_browser_action_text(search_match.group(1)))
         if query:
+            search_action: dict[str, object] = {
+                "kind": "search",
+                "text": query,
+                "element_name": "search",
+                "submit": _browser_submit_requested(task, include_search=True),
+            }
+            if _browser_multiline_requested(task) or "\n" in query:
+                search_action["multiline"] = True
+                search_action["newline_mode"] = "shift_enter"
             actions.append(
-                {
-                    "kind": "search",
-                    "text": query,
-                    "element_name": "search",
-                    "press_enter": True,
-                }
+                search_action
             )
 
     type_or_write_match = re.search(
-        r"\b(?:type|write)\s+(.+?)(?=\s+(?:and|then)\s+(?:press\s+enter|send|submit|click|play)\b|\s*$)",
+        r"\b(?:type|write|paste)\s+(.+?)(?=\s+(?:and|then)\s+(?:(?:press|hit)\s+enter|send|submit|click|play)\b|\s*$)",
         task,
         flags=re.IGNORECASE,
     )
     if type_or_write_match:
-        typed_text = _clean_browser_action_text(type_or_write_match.group(1))
+        typed_text = _normalize_browser_multiline_text(_clean_browser_action_text(type_or_write_match.group(1)))
         if typed_text:
-            press_enter = re.search(r"\b(?:press\s+enter|send|submit)\b", task, flags=re.IGNORECASE) is not None
-            actions.append({"kind": "type", "text": typed_text, "press_enter": press_enter})
+            type_action: dict[str, object] = {
+                "kind": "type",
+                "text": typed_text,
+                "submit": submit_requested,
+            }
+            if _browser_multiline_requested(task) or "\n" in typed_text:
+                type_action["multiline"] = True
+                type_action["newline_mode"] = "shift_enter"
+            actions.append(type_action)
 
     play_match = re.search(
         r"\bplay\s+(?:the\s+)?(?:(first|second|third|\d+(?:st|nd|rd|th)?)\s+)?(?:video|result|item)\b",

@@ -90,10 +90,36 @@ VOCO now splits non-trivial prompts into atomic steps before execution.
 - fallback order is: direct router tool -> local fast-path rule -> Gemma step planner
 - browser/media terms are blocked from local file-search routing to prevent misclassification
 
-### 3) Complex commands still depend on local model health
+### 3) Duplicate window guard is on by default
+
+VOCO now reuses existing windows for common desktop actions unless you explicitly request a new one.
+
+- `open_app` focuses an existing matching window first (`force_new=false` default)
+- `write_in_notepad` reuses the current Notepad window by default
+- decomposition cleanup suppresses redundant `open browser` steps when a `browser_navigate` step already follows
+
+### 4) Browser typing/newline policy
+
+Browser text actions now support explicit submit/newline controls:
+
+- `browser_type` args: `multiline`, `newline_mode`, `submit`
+- multiline text defaults to safe `Shift+Enter` newline insertion
+- Enter submit is only executed when submit intent is explicit (`submit=true`)
+
+### 5) Hybrid file search uses filename + indexed context
+
+`search_file` now ranks indexed matches using both path/name and extracted content context:
+
+- filename/path relevance
+- content summary/snippet/keywords relevance
+- lightweight extension hints from layman queries (for example: slides, report, python script)
+
+This improves retrieval quality for natural-language file requests beyond strict name matching.
+
+### 6) Complex commands still depend on local model health
 If your machine has low free RAM/VRAM, complex model tasks can still fail or timeout.
 
-### 4) Browser profile behavior for Playwright actions
+### 7) Browser profile behavior for Playwright actions
 VOCO supports explicit profile modes: **default**, **snapshot**, and **automation**.
 
 - Use commands like `switch chrome profile to default`, `switch chrome profile to snapshot`, or
@@ -104,7 +130,7 @@ VOCO supports explicit profile modes: **default**, **snapshot**, and **automatio
 - Firefox always runs in automation mode even if default/snapshot is requested.
 - Responses include: `browser`, `profile_mode` (requested), `effective_profile_mode` (actual), and `launch_mode`.
 
-### 5) Gemma 4 E2B capabilities in this setup
+### 8) Gemma 4 E2B capabilities in this setup
 From `ollama show gemma4:e2b`, the local model exposes:
 
 - completion
@@ -115,7 +141,7 @@ From `ollama show gemma4:e2b`, the local model exposes:
 
 VOCO currently uses text completion + tool planning/runtime paths. Vision/audio capabilities can be added as a future closed-loop extension.
 
-### 6) Secure memory + redaction behavior
+### 9) Secure memory + redaction behavior
 Sensitive vault data is encrypted at rest with Windows DPAPI.
 
 - Encrypted files: `memory/vault/USER.yaml`, `memory/vault/CONTEXT.md`, `memory/project_state.md`.
@@ -125,11 +151,14 @@ Sensitive vault data is encrypted at rest with Windows DPAPI.
   (`password`, `secret`, `token`, `api_key`, `credential`, `auth`, `cookie`, `session`, etc.).
 - `update_user_profile` arguments are logged with `value` redacted; sensitive profile keys are displayed as `[REDACTED]`.
 
-### 7) Access-level policy (tool execution scope)
+### 10) Access-level policy (tool execution scope)
+- **Implemented scope:** **L1-L3 only** (user-space orchestration).
 - **L1 (UI Automation):** window/control interactions.
 - **L2 (Native user/admin APIs):** browser/files/process/app operations.
-- **L3 (Privileged guarded APIs):** approval-gated system operations.
-- **L4 (Kernel/driver):** intentionally excluded in current VOCO scope.
+- **L3 (Privileged system controls):** explicit human approval is required before execution
+  (set `args.human_approval=true` or include an explicit approval phrase in the task).
+  Missing approval is deterministically rejected with `POLICY_APPROVAL_REQUIRED`.
+- **L4 (Kernel/driver):** intentionally excluded from current VOCO scope (not implemented).
 
 ---
 

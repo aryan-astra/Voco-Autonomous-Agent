@@ -178,6 +178,42 @@ _ACTION_VERBS = (
     "run",
     "create",
     "generate",
+    "focus",
+    "press",
+    "hit",
+    "submit",
+)
+_ACTION_VERB_PATTERN = "|".join(re.escape(verb) for verb in _ACTION_VERBS)
+_ACTION_VERB_REGEX = re.compile(rf"\b(?:{_ACTION_VERB_PATTERN})\b", flags=re.IGNORECASE)
+_STEP_BOUNDARY_START_TOKENS = tuple(
+    dict.fromkeys(
+        _ACTION_VERBS
+        + (
+            "again",
+            "reopen",
+            "refocus",
+            "repeat",
+            "retry",
+        )
+    )
+)
+_STEP_BOUNDARY_START_PATTERN = "|".join(re.escape(token) for token in _STEP_BOUNDARY_START_TOKENS)
+_HARD_STEP_SPLIT_REGEX = re.compile(r"\b(?:and then|then|after that|afterwards)\b|;", flags=re.IGNORECASE)
+_SOFT_STEP_SPLIT_REGEX = re.compile(
+    rf"(?:\s+\band\b\s+|\s*,\s*)(?=(?:please\s+)?(?:{_STEP_BOUNDARY_START_PATTERN})\b)",
+    flags=re.IGNORECASE,
+)
+_BROWSER_SUBMIT_REGEX = re.compile(
+    r"\b(?:send|submit)\b|\b(?:press|hit)\s+enter\b",
+    flags=re.IGNORECASE,
+)
+_BROWSER_MULTILINE_REGEX = re.compile(
+    r"\b(?:new\s*line|newline|line\s*break|next\s*line|multiline|multi[-\s]?line)\b",
+    flags=re.IGNORECASE,
+)
+_BROWSER_NEWLINE_TOKEN_REGEX = re.compile(
+    r"\b(?:new\s*line|newline|line\s*break|next\s*line)\b",
+    flags=re.IGNORECASE,
 )
 
 
@@ -265,6 +301,45 @@ def _clean_phrase(raw: str) -> str:
     cleaned = str(raw).strip().strip("\"'").strip()
     cleaned = cleaned.rstrip(".,;:!?")
     return re.sub(r"\s+", " ", cleaned)
+
+
+def _normalize_browser_text(raw: str) -> str:
+    cleaned = str(raw or "").strip().strip("\"'").strip()
+    cleaned = cleaned.rstrip(".,;:!?")
+    if not cleaned:
+        return ""
+    converted = _BROWSER_NEWLINE_TOKEN_REGEX.sub("\n", cleaned)
+    converted = re.sub(r"[ \t]*\n[ \t]*", "\n", converted)
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in converted.splitlines()]
+    return "\n".join(lines).strip()
+
+
+def _browser_submit_requested(text: str, include_search: bool = False) -> bool:
+    source = str(text or "")
+    if _BROWSER_SUBMIT_REGEX.search(source):
+        return True
+    if include_search and re.search(r"\bsearch(?:\s+for)?\b", source, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _browser_multiline_requested(text: str) -> bool:
+    return _BROWSER_MULTILINE_REGEX.search(str(text or "")) is not None
+
+
+def _has_action_verb(text: str) -> bool:
+    return _ACTION_VERB_REGEX.search(str(text or "")) is not None
+
+
+def _split_candidate_clauses(text: str) -> list[str]:
+    clauses: list[str] = []
+    hard_chunks = [chunk for chunk in re.split(_HARD_STEP_SPLIT_REGEX, text) if chunk and chunk.strip()]
+    for chunk in hard_chunks:
+        for candidate in re.split(_SOFT_STEP_SPLIT_REGEX, chunk):
+            cleaned = _clean_phrase(candidate)
+            if cleaned:
+                clauses.append(cleaned)
+    return clauses
 
 
 def _extract_search_query(text: str) -> str | None:
@@ -356,17 +431,33 @@ def extract_args(intent: str, text: str) -> dict[str, object]:
     if intent == "browser_type":
         query = _extract_search_query(task)
         if query:
-            args["text"] = query
-            if "search" in lower:
+            normalized_query = _normalize_browser_text(query)
+            if normalized_query:
+                args["text"] = normalized_query
                 args["element_name"] = "search"
+                args["submit"] = True
             return args
+
+        typed_source: str | None = None
         quoted = _extract_quoted_values(task)
         if quoted:
-            args["text"] = quoted[0]
-            return args
-        fallback = re.search(r"\b(?:type|write)\s+(.+)$", task, flags=re.IGNORECASE)
+            typed_source = quoted[0]
+        fallback = re.search(
+            r"\b(?:type|write|paste)\s+(.+?)(?=\s+(?:and|then)\s+(?:(?:press|hit)\s+enter|send|submit)\b|\s*$)",
+            task,
+            flags=re.IGNORECASE,
+        )
         if fallback:
-            args["text"] = _clean_phrase(fallback.group(1))
+            typed_source = fallback.group(1)
+        if typed_source:
+            typed_text = _normalize_browser_text(typed_source)
+            if typed_text:
+                args["text"] = typed_text
+                if _browser_multiline_requested(task) or "\n" in typed_text:
+                    args["multiline"] = True
+                    args["newline_mode"] = "shift_enter"
+                if _browser_submit_requested(task):
+                    args["submit"] = True
         return args
 
     if intent == "browser_click":
@@ -656,7 +747,7 @@ def should_split_task(text: str) -> bool:
         return False
     token_count = len(re.findall(r"[a-z0-9_.:/\\-]+", content.lower()))
     connectors = re.search(r"\b(?:and then|then|after that|afterwards|and)\b", content, flags=re.IGNORECASE)
-    action_count = len(re.findall(r"\b(?:open|search|find|locate|switch|set|change|go|visit|click|type|write|paste|save|play|pause|extract|copy|run|create|generate)\b", content, flags=re.IGNORECASE))
+    action_count = len(_ACTION_VERB_REGEX.findall(content))
     return token_count >= 9 or bool(connectors) or action_count >= 2
 
 
@@ -669,17 +760,30 @@ def split_task_into_steps(text: str) -> list[str]:
         return [content]
 
     normalized = re.sub(r"\s+", " ", content).strip()
-    raw_steps = re.split(r"\b(?:and then|then|after that|afterwards|and)\b", normalized, flags=re.IGNORECASE)
+    raw_steps = _split_candidate_clauses(normalized)
     steps: list[str] = []
+    pending_prefix = ""
     for item in raw_steps:
         step = _clean_phrase(item)
         if not step:
             continue
-        if len(step.split()) < 2:
+        if _has_action_verb(step):
+            if pending_prefix:
+                step = _clean_phrase(f"{pending_prefix} {step}")
+                pending_prefix = ""
+            steps.append(step)
             continue
-        if not any(re.search(rf"\b{verb}\b", step, flags=re.IGNORECASE) for verb in _ACTION_VERBS):
-            continue
-        steps.append(step)
+        if steps:
+            steps[-1] = _clean_phrase(f"{steps[-1]} {step}")
+        elif pending_prefix:
+            pending_prefix = _clean_phrase(f"{pending_prefix} {step}")
+        else:
+            pending_prefix = step
+
+    if pending_prefix and steps:
+        steps[0] = _clean_phrase(f"{pending_prefix} {steps[0]}")
+
+    steps = [step for step in steps if _has_action_verb(step) and len(step.split()) >= 2]
 
     if not steps:
         return [content]
