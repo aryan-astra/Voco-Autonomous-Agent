@@ -53,6 +53,13 @@ except ImportError:
     WMI_AVAILABLE = False
 
 try:
+    import tkinter as tk
+
+    TKINTER_AVAILABLE = True
+except Exception:
+    TKINTER_AVAILABLE = False
+
+try:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     from playwright.sync_api import sync_playwright
 
@@ -633,6 +640,34 @@ def _coerce_bool(value: object, default: bool = False) -> bool:
     return default
 
 
+def _set_clipboard_text(value: str) -> tuple[bool, str]:
+    if not TKINTER_AVAILABLE:
+        return False, "tkinter is not available for clipboard operations."
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.clipboard_clear()
+        root.clipboard_append(str(value))
+        root.update()
+        root.destroy()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _get_clipboard_text() -> tuple[str | None, str]:
+    if not TKINTER_AVAILABLE:
+        return None, "tkinter is not available for clipboard operations."
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        content = root.clipboard_get()
+        root.destroy()
+        return str(content), ""
+    except Exception as exc:
+        return None, str(exc)
+
+
 def _split_site_candidates(sites: str | None) -> list[str]:
     raw = str(sites or "").strip()
     if not raw:
@@ -1163,10 +1198,82 @@ def browser_switch_profile(
         return _err(f"Profile switch failed: {exc}")
 
 
-def browser_get_state(max_elements: int = 60) -> dict:
+def _extract_browser_text_lines(page, text_query: str | None = None, text_limit: int = 20) -> list[str]:
+    bounded_limit = _coerce_int(text_limit, default=20, minimum=1, maximum=120)
+    query_tokens = [token for token in re.findall(r"[a-z0-9]+", str(text_query or "").lower()) if token]
+
+    raw_text = ""
+    try:
+        raw_text = page.inner_text("body")
+    except Exception:
+        raw_text = ""
+
+    if not raw_text.strip():
+        return []
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for line in raw_text.splitlines():
+        normalized = re.sub(r"\s+", " ", line).strip()
+        if len(normalized) < 6:
+            continue
+        lowered = normalized.lower()
+        if query_tokens and not any(token in lowered for token in query_tokens):
+            continue
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(normalized)
+        if len(deduped) >= bounded_limit:
+            break
+
+    if deduped or not query_tokens:
+        return deduped
+
+    for line in raw_text.splitlines():
+        normalized = re.sub(r"\s+", " ", line).strip()
+        if len(normalized) < 6:
+            continue
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(normalized)
+        if len(deduped) >= bounded_limit:
+            break
+    return deduped
+
+
+def browser_get_state(
+    max_elements: int = 60,
+    text_query: str | None = None,
+    text_limit: int = 20,
+    copy_to_clipboard: bool = False,
+) -> dict:
     try:
         page = _get_browser_page()
         state = _snapshot_browser_state(page, max_elements=max_elements)
+        extracted_lines = _extract_browser_text_lines(page=page, text_query=text_query, text_limit=text_limit)
+        if extracted_lines:
+            state["text_preview"] = extracted_lines[: min(5, len(extracted_lines))]
+            state["text_line_count"] = len(extracted_lines)
+
+        if bool(copy_to_clipboard):
+            if not extracted_lines:
+                return _err("No readable page text available to copy from browser state.")
+            clipboard_text = "\n".join(extracted_lines)
+            copied, error = _set_clipboard_text(clipboard_text)
+            if not copied:
+                return _err(f"Captured browser state but failed copying text to clipboard: {error}")
+            state["clipboard_copied"] = True
+            state["clipboard_characters"] = len(clipboard_text)
+            return _ok(
+                state,
+                (
+                    f"Captured browser state from {state['url']} with {state['element_count']} interactive elements "
+                    f"and copied {len(extracted_lines)} text lines to clipboard."
+                ),
+            )
         return _ok(
             state,
             f"Captured browser state from {state['url']} with {state['element_count']} interactive elements.",
@@ -1659,11 +1766,19 @@ def browser_stress_50_sites(
 
 
 def save_text_to_desktop_file(
-    content: str,
+    content: str | None = None,
     filename: str | None = None,
     open_in_notepad: bool = False,
+    from_clipboard: bool = False,
 ) -> dict:
     text = str(content or "")
+    content_source = "provided_content"
+    if not text.strip() and bool(from_clipboard):
+        clipboard_text, clipboard_error = _get_clipboard_text()
+        if clipboard_text is None:
+            return _err(f"Clipboard read failed for Desktop file save: {clipboard_error}")
+        text = str(clipboard_text)
+        content_source = "clipboard"
     if not text.strip():
         return _err("No text content provided for Desktop file save.")
 
@@ -1680,7 +1795,7 @@ def save_text_to_desktop_file(
     except Exception as exc:
         return _err(f"Failed to save Desktop file '{target}': {exc}")
 
-    payload = {"path": str(target), "bytes": len(text), "opened_in_notepad": False}
+    payload = {"path": str(target), "bytes": len(text), "opened_in_notepad": False, "source": content_source}
     if not open_in_notepad:
         return _ok(payload, f"Saved Desktop text file: {target}")
 
@@ -4059,14 +4174,19 @@ def search_in_explorer(query: str, folders_only: bool = True) -> dict:
         return _err(f"Explorer search failed: {exc}")
 
 
-def write_in_notepad(text: str, force_new: bool = False) -> dict:
+def write_in_notepad(
+    text: str | None = None,
+    force_new: bool = False,
+    paste_clipboard: bool = False,
+) -> dict:
     if not PYAUTOGUI_AVAILABLE:
         return _err("pyautogui is not installed.")
     if not PYGETWINDOW_AVAILABLE:
         return _err("pygetwindow is not installed.")
 
-    content = str(text).strip()
-    if not content:
+    content = str(text or "").strip()
+    use_clipboard_paste = bool(paste_clipboard) and not content
+    if not content and not use_clipboard_paste:
         return _err("No text provided for Notepad writing.")
 
     open_result = open_app("notepad", force_new=bool(force_new))
@@ -4082,12 +4202,24 @@ def write_in_notepad(text: str, force_new: bool = False) -> dict:
 
     try:
         time.sleep(0.15)
-        pyautogui.write(content, interval=0.01)
+        if use_clipboard_paste:
+            pyautogui.hotkey("ctrl", "v")
+        else:
+            pyautogui.write(content, interval=0.01)
         action = "focused_existing_window" if used_existing_window else "launched_new_instance"
+        content_source = "clipboard" if use_clipboard_paste else "text"
         message = (
-            "Focused existing Notepad and typed requested text."
-            if used_existing_window
-            else "Opened Notepad and typed requested text."
+            "Focused existing Notepad and pasted clipboard content."
+            if used_existing_window and use_clipboard_paste
+            else (
+                "Opened Notepad and pasted clipboard content."
+                if use_clipboard_paste
+                else (
+                    "Focused existing Notepad and typed requested text."
+                    if used_existing_window
+                    else "Opened Notepad and typed requested text."
+                )
+            )
         )
         return _ok(
             {
@@ -4095,6 +4227,7 @@ def write_in_notepad(text: str, force_new: bool = False) -> dict:
                 "window": getattr(window, "title", "Notepad"),
                 "action": action,
                 "force_new": bool(force_new),
+                "source": content_source,
             },
             message,
         )
@@ -4499,7 +4632,12 @@ TOOL_REGISTRY = {
     "browser_get_state": {
         "fn": browser_get_state,
         "description": "Read structured browser accessibility state for closed-loop decisions.",
-        "args": {"max_elements": "integer (optional)"},
+        "args": {
+            "max_elements": "integer (optional)",
+            "text_query": "string (optional)",
+            "text_limit": "integer (optional)",
+            "copy_to_clipboard": "boolean (optional)",
+        },
     },
     "browser_switch_profile": {
         "fn": browser_switch_profile,
@@ -4704,8 +4842,12 @@ TOOL_REGISTRY = {
     },
     "write_in_notepad": {
         "fn": write_in_notepad,
-        "description": "Open/focus Notepad and type text into it.",
-        "args": {"text": "string", "force_new": "boolean (optional, default false)"},
+        "description": "Open/focus Notepad and type text or paste clipboard content.",
+        "args": {
+            "text": "string (optional)",
+            "force_new": "boolean (optional, default false)",
+            "paste_clipboard": "boolean (optional, default false)",
+        },
     },
     "get_running_apps": {
         "fn": get_running_apps,
@@ -4815,9 +4957,10 @@ TOOL_REGISTRY = {
         "fn": save_text_to_desktop_file,
         "description": "Write text to a Desktop .txt file and optionally open it in Notepad.",
         "args": {
-            "content": "string",
+            "content": "string (optional)",
             "filename": "string (optional)",
             "open_in_notepad": "boolean (optional, default false)",
+            "from_clipboard": "boolean (optional, default false)",
         },
     },
     "web_codegen_autofix": {

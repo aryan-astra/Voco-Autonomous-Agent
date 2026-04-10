@@ -960,26 +960,8 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                         source_step_text=step_text,
                     )
             elif tool_name and tool_name in TOOL_REGISTRY and missing_args:
-                route_path = "router_missing_args"
-                missing_arg_names = [str(arg).strip() for arg in missing_args if str(arg).strip()]
-                missing_suffix = ", ".join(missing_arg_names) if missing_arg_names else "unspecified"
-                failure_reason = (
-                    f"Missing required argument(s) for '{tool_name}': {missing_suffix}. "
-                    f"Clarify this step: {step_text}"
-                )
-                _append_plan_step(
-                    {
-                        "tool": "report_failure",
-                        "args": {"reason": failure_reason},
-                        "reason": _annotate_step_reason(
-                            step_text=step_text,
-                            route_path=route_path,
-                            base_reason=failure_reason,
-                            tool_name="report_failure",
-                        ),
-                    },
-                    source_step_text=step_text,
-                )
+                route_path = "router_missing_args_fallback"
+                unresolved_steps.append(step_text)
             else:
                 unresolved_steps.append(step_text)
 
@@ -2523,16 +2505,31 @@ def _build_browser_fastpath_plan(task: str, text: str) -> list[dict] | None:
     if not _should_route_browser_fastpath(text=text, url=url, preferred_browser=preferred_browser, actions=actions):
         return None
 
-    if url is None:
-        url = "https://www.google.com"
+    should_preserve_current_page = bool(
+        url is None
+        and actions
+        and "go to" in text
+        and any(token in text for token in ["video", "result", "latest"])
+        and not any(token in text for token in ["open browser", "open chrome", "open edge", "open firefox"])
+    )
 
-    plan: list[dict] = [
-        {
-            "tool": "browser_navigate",
-            "args": {"url": url, "browser": preferred_browser},
-            "reason": "Open website in automation browser for interactive actions.",
-        }
-    ]
+    plan: list[dict] = []
+    if url is not None:
+        plan.append(
+            {
+                "tool": "browser_navigate",
+                "args": {"url": url, "browser": preferred_browser},
+                "reason": "Open website in automation browser for interactive actions.",
+            }
+        )
+    elif not actions or not should_preserve_current_page:
+        plan.append(
+            {
+                "tool": "browser_navigate",
+                "args": {"url": "https://www.google.com", "browser": preferred_browser},
+                "reason": "Open website in automation browser for interactive actions.",
+            }
+        )
     if not actions:
         return plan
 
@@ -2766,6 +2763,18 @@ def _extract_browser_actions(task: str, text: str) -> list[dict]:
                 search_action["newline_mode"] = "shift_enter"
             actions.append(
                 search_action
+            )
+    elif re.search(r"\bgo to\s+.+\b(?:video|result)\b", task, flags=re.IGNORECASE):
+        implicit_query = re.sub(r"^\s*go to\s+", "", task, flags=re.IGNORECASE).strip()
+        implicit_query = _normalize_browser_multiline_text(_clean_browser_action_text(implicit_query))
+        if implicit_query:
+            actions.append(
+                {
+                    "kind": "search",
+                    "text": implicit_query,
+                    "element_name": "search",
+                    "submit": True,
+                }
             )
 
     type_or_write_match = re.search(

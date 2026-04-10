@@ -105,8 +105,17 @@ Browser text actions now support explicit submit/newline controls:
 - `browser_type` args: `multiline`, `newline_mode`, `submit`
 - multiline text defaults to safe `Shift+Enter` newline insertion
 - Enter submit is only executed when submit intent is explicit (`submit=true`)
+- browser state reads can optionally extract/copy visible text for downstream steps (`browser_get_state` with `copy_to_clipboard=true`)
 
-### 5) Hybrid file search uses filename + indexed context
+### 5) Clipboard-aware follow-up actions
+
+VOCO supports generic copy/paste/save chains without task-specific hardcoding:
+
+- `write_in_notepad` can type text or paste clipboard content (`paste_clipboard=true`)
+- `save_text_to_desktop_file` can save explicit text or clipboard content (`from_clipboard=true`)
+- routing includes deterministic handling for prompts like `paste in notepad` and `save it on desktop`
+
+### 6) Hybrid file search uses filename + indexed context
 
 `search_file` now ranks indexed matches using both path/name and extracted content context:
 
@@ -116,10 +125,10 @@ Browser text actions now support explicit submit/newline controls:
 
 This improves retrieval quality for natural-language file requests beyond strict name matching.
 
-### 6) Complex commands still depend on local model health
+### 7) Complex commands still depend on local model health
 If your machine has low free RAM/VRAM, complex model tasks can still fail or timeout.
 
-### 7) Browser profile behavior for Playwright actions
+### 8) Browser profile behavior for Playwright actions
 VOCO supports explicit profile modes: **default**, **snapshot**, and **automation**.
 
 - Use commands like `switch chrome profile to default`, `switch chrome profile to snapshot`, or
@@ -130,7 +139,7 @@ VOCO supports explicit profile modes: **default**, **snapshot**, and **automatio
 - Firefox always runs in automation mode even if default/snapshot is requested.
 - Responses include: `browser`, `profile_mode` (requested), `effective_profile_mode` (actual), and `launch_mode`.
 
-### 8) Gemma 4 E2B capabilities in this setup
+### 9) Gemma 4 E2B capabilities in this setup
 From `ollama show gemma4:e2b`, the local model exposes:
 
 - completion
@@ -141,7 +150,7 @@ From `ollama show gemma4:e2b`, the local model exposes:
 
 VOCO currently uses text completion + tool planning/runtime paths. Vision/audio capabilities can be added as a future closed-loop extension.
 
-### 9) Secure memory + redaction behavior
+### 10) Secure memory + redaction behavior
 Sensitive vault data is encrypted at rest with Windows DPAPI.
 
 - Encrypted files: `memory/vault/USER.yaml`, `memory/vault/CONTEXT.md`, `memory/project_state.md`.
@@ -151,7 +160,7 @@ Sensitive vault data is encrypted at rest with Windows DPAPI.
   (`password`, `secret`, `token`, `api_key`, `credential`, `auth`, `cookie`, `session`, etc.).
 - `update_user_profile` arguments are logged with `value` redacted; sensitive profile keys are displayed as `[REDACTED]`.
 
-### 10) Access-level policy (tool execution scope)
+### 11) Access-level policy (tool execution scope)
 - **Implemented scope:** **L1-L3 only** (user-space orchestration).
 - **L1 (UI Automation):** window/control interactions.
 - **L2 (Native user/admin APIs):** browser/files/process/app operations.

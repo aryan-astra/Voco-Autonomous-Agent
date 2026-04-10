@@ -81,6 +81,16 @@ INTENT_CATALOG: dict[str, dict] = {
             "open latest result",
         ],
     },
+    "browser_get_state": {
+        "tool": "browser_get_state",
+        "required_args": tuple(),
+        "examples": [
+            "copy the first 5 comments from this page",
+            "read the video description",
+            "extract content from the current website",
+            "get comments from this tab",
+        ],
+    },
     "search_local_paths": {
         "tool": "search_local_paths",
         "required_args": ("query",),
@@ -100,7 +110,7 @@ INTENT_CATALOG: dict[str, dict] = {
     },
     "write_in_notepad": {
         "tool": "write_in_notepad",
-        "required_args": ("text",),
+        "required_args": tuple(),
         "examples": [
             "open notepad and write hello",
             "type this in notepad",
@@ -109,7 +119,7 @@ INTENT_CATALOG: dict[str, dict] = {
     },
     "save_text_to_desktop_file": {
         "tool": "save_text_to_desktop_file",
-        "required_args": ("content",),
+        "required_args": tuple(),
         "examples": [
             "save this text to desktop file",
             "save content in notes.txt on desktop",
@@ -156,6 +166,70 @@ _APP_ALIASES = (
     "powerpoint",
 )
 _PROFILE_MODES = ("default", "snapshot", "automation")
+_OPEN_APP_GENERIC_TOKENS = {
+    "app",
+    "application",
+    "program",
+    "tool",
+    "browser",
+    "website",
+    "web",
+    "video",
+    "content",
+    "comment",
+    "comments",
+    "description",
+    "it",
+    "this",
+    "that",
+}
+_OPEN_APP_VERB_REGEX = re.compile(r"\b(?:open|launch|start)\b", flags=re.IGNORECASE)
+_BROWSER_STATE_VERB_REGEX = re.compile(r"\b(?:copy|read|extract|get)\b", flags=re.IGNORECASE)
+_BROWSER_STATE_TARGET_REGEX = re.compile(r"\b(?:content|comments?|description)\b", flags=re.IGNORECASE)
+_NOTEPAD_PASTE_REGEX = re.compile(r"\bpaste\b", flags=re.IGNORECASE)
+_DESKTOP_SAVE_REFERENCE_REGEX = re.compile(r"\bsave\s+(?:it|this|that)\b", flags=re.IGNORECASE)
+_BROWSER_STATE_QUANTITY_REGEX = re.compile(
+    r"\b(?:top|first|last|latest)?\s*(\d{1,3})\s+(?:comments?|results?|items?|elements?|entries?|lines?)\b",
+    flags=re.IGNORECASE,
+)
+_BROWSER_STATE_DEFAULT_MAX_ELEMENTS = 40
+_BROWSER_STATE_MAX_ELEMENTS = 120
+_BROWSER_STATE_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+}
+_LOCAL_CONTENT_TERMS = (
+    "file",
+    "folder",
+    "directory",
+    "path",
+    "desktop",
+    "notepad",
+    "document",
+    "on my pc",
+    "on this pc",
+    "in my pc",
+    "in this pc",
+    "local",
+)
 _ACTION_VERBS = (
     "open",
     "search",
@@ -175,6 +249,8 @@ _ACTION_VERBS = (
     "pause",
     "extract",
     "copy",
+    "read",
+    "get",
     "run",
     "create",
     "generate",
@@ -374,6 +450,24 @@ def _extract_local_search_query(text: str) -> str | None:
     return None
 
 
+def _normalize_open_app_candidate(raw: str) -> str:
+    normalized = _clean_phrase(raw).lower()
+    normalized = re.sub(r"^(?:the|a|an)\s+", "", normalized)
+    return normalized.strip()
+
+
+def _is_credible_open_app_token(raw: str) -> bool:
+    candidate = _normalize_open_app_candidate(raw)
+    if not candidate:
+        return False
+    if candidate in _OPEN_APP_GENERIC_TOKENS:
+        return False
+    parts = [part for part in re.split(r"[\s\-]+", candidate) if part]
+    if not parts:
+        return False
+    return any(part not in _OPEN_APP_GENERIC_TOKENS for part in parts)
+
+
 def _extract_open_app_name(text: str) -> str | None:
     lower = text.lower()
     for app in _APP_ALIASES:
@@ -381,8 +475,69 @@ def _extract_open_app_name(text: str) -> str | None:
             return app
     match = re.search(r"\b(?:open|launch|start)\s+([a-z0-9][a-z0-9 \-]{1,40})$", text, flags=re.IGNORECASE)
     if match:
-        return _clean_phrase(match.group(1))
+        candidate = _normalize_open_app_candidate(match.group(1))
+        if _is_credible_open_app_token(candidate):
+            return candidate
     return None
+
+
+def _has_credible_open_app_signal(text: str, args: dict[str, object]) -> bool:
+    source = str(text or "")
+    if _OPEN_APP_VERB_REGEX.search(source) is None:
+        return False
+    app_name = str(args.get("app_name", "")).strip()
+    if _is_credible_open_app_token(app_name):
+        return True
+    extracted = _extract_open_app_name(source)
+    return bool(extracted and _is_credible_open_app_token(extracted))
+
+
+def _looks_like_browser_state_read_request(text: str) -> bool:
+    source = str(text or "")
+    lower = source.lower()
+    if _BROWSER_STATE_VERB_REGEX.search(source) is None:
+        return False
+    if _BROWSER_STATE_TARGET_REGEX.search(source) is None:
+        return False
+
+    has_browser_signal = (
+        any(token in lower for token in _BROWSER_KEYWORDS)
+        or _extract_url(source) is not None
+        or re.search(r"\b(?:page|tab|site|web|video)\b", source, flags=re.IGNORECASE) is not None
+    )
+
+    if any(token in lower for token in _LOCAL_CONTENT_TERMS) and not has_browser_signal:
+        return False
+
+    if has_browser_signal:
+        return True
+    return re.search(r"\b(?:comments?|description)\b", source, flags=re.IGNORECASE) is not None
+
+
+def _coerce_browser_state_max_elements(value: int) -> int:
+    return max(1, min(_BROWSER_STATE_MAX_ELEMENTS, int(value)))
+
+
+def _extract_browser_state_max_elements(text: str) -> int:
+    source = str(text or "")
+    lower = source.lower()
+
+    quantity_match = _BROWSER_STATE_QUANTITY_REGEX.search(source)
+    if quantity_match:
+        return _coerce_browser_state_max_elements(int(quantity_match.group(1)))
+
+    verb_number_match = re.search(r"\b(?:copy|read|extract|get)\s+(?:the\s+)?(\d{1,3})\b", source, flags=re.IGNORECASE)
+    if verb_number_match:
+        return _coerce_browser_state_max_elements(int(verb_number_match.group(1)))
+
+    for word, value in _BROWSER_STATE_NUMBER_WORDS.items():
+        if re.search(
+            rf"\b(?:top|first|last|latest)?\s*{re.escape(word)}\s+(?:comments?|results?|items?|elements?|entries?|lines?)\b",
+            lower,
+        ):
+            return _coerce_browser_state_max_elements(value)
+
+    return _BROWSER_STATE_DEFAULT_MAX_ELEMENTS
 
 
 def extract_args(intent: str, text: str) -> dict[str, object]:
@@ -466,6 +621,17 @@ def extract_args(intent: str, text: str) -> dict[str, object]:
             args["element_name"] = _clean_phrase(match.group(1))
         return args
 
+    if intent == "browser_get_state":
+        state_limit = _extract_browser_state_max_elements(task)
+        args["max_elements"] = max(20, min(120, state_limit * 4))
+        args["text_limit"] = state_limit
+        target_match = _BROWSER_STATE_TARGET_REGEX.search(task)
+        if target_match:
+            args["text_query"] = target_match.group(0)
+        if re.search(r"\bcopy\b", lower):
+            args["copy_to_clipboard"] = True
+        return args
+
     if intent in {"search_local_paths", "search_in_explorer"}:
         query = _extract_local_search_query(task)
         if query:
@@ -482,14 +648,18 @@ def extract_args(intent: str, text: str) -> dict[str, object]:
 
     if intent == "write_in_notepad":
         content = _extract_notepad_text(task)
-        if content:
+        if content and content.lower() not in {"in a notepad file", "in notepad", "into notepad"}:
             args["text"] = content
+        if _NOTEPAD_PASTE_REGEX.search(task) and "notepad" in lower and "text" not in args:
+            args["paste_clipboard"] = True
         return args
 
     if intent == "save_text_to_desktop_file":
         quoted = _extract_quoted_values(task)
         if quoted:
             args["content"] = quoted[0]
+        if _DESKTOP_SAVE_REFERENCE_REGEX.search(lower) and "desktop" in lower:
+            args["from_clipboard"] = True
         file_name = _extract_filename(task, "txt")
         if file_name:
             args["filename"] = file_name
@@ -537,9 +707,23 @@ def _guardrail_rejection(intent: str, text: str, args: dict[str, object]) -> str
             return "browser_media_request_should_not_route_to_local_search"
 
     if intent == "open_app":
-        app_name = str(args.get("app_name", "")).lower()
+        if not _has_credible_open_app_signal(text, args):
+            return "open_app_requires_open_verb_and_app_signal"
+        app_name = _normalize_open_app_candidate(str(args.get("app_name", "")))
         if app_name in {"youtube", "chatgpt", "google"}:
             return "web_destination_should_use_browser_navigation"
+
+    if intent == "write_in_notepad":
+        has_text = bool(str(args.get("text", "")).strip())
+        paste_clipboard = bool(args.get("paste_clipboard"))
+        if not has_text and not paste_clipboard:
+            return "write_in_notepad_requires_text_or_clipboard_paste"
+
+    if intent == "save_text_to_desktop_file":
+        has_content = bool(str(args.get("content", "")).strip())
+        from_clipboard = bool(args.get("from_clipboard"))
+        if not has_content and not from_clipboard:
+            return "desktop_save_requires_content_or_clipboard_source"
 
     return ""
 
@@ -675,6 +859,44 @@ class IntentRouter:
                 rejected_reason=rejected_reason,
             )
 
+        if "notepad" in lowered and _NOTEPAD_PASTE_REGEX.search(content):
+            intent = "write_in_notepad"
+            confidence = 0.92
+            spec = self._catalog.get(intent, {})
+            tool = str(spec.get("tool", "")).strip()
+            args = extract_args(intent, content)
+            required = [str(arg) for arg in spec.get("required_args", ())]
+            missing_args = [name for name in required if name not in args or str(args.get(name, "")).strip() == ""]
+            rejected_reason = _guardrail_rejection(intent, content, args)
+            final_confidence = confidence if not rejected_reason else 0.0
+            return RouteDecision(
+                intent=intent,
+                confidence=max(0.0, min(1.0, float(final_confidence))),
+                tool=tool,
+                args=args,
+                missing_args=missing_args,
+                rejected_reason=rejected_reason,
+            )
+
+        if "desktop" in lowered and _DESKTOP_SAVE_REFERENCE_REGEX.search(lowered):
+            intent = "save_text_to_desktop_file"
+            confidence = 0.9
+            spec = self._catalog.get(intent, {})
+            tool = str(spec.get("tool", "")).strip()
+            args = extract_args(intent, content)
+            required = [str(arg) for arg in spec.get("required_args", ())]
+            missing_args = [name for name in required if name not in args or str(args.get(name, "")).strip() == ""]
+            rejected_reason = _guardrail_rejection(intent, content, args)
+            final_confidence = confidence if not rejected_reason else 0.0
+            return RouteDecision(
+                intent=intent,
+                confidence=max(0.0, min(1.0, float(final_confidence))),
+                tool=tool,
+                args=args,
+                missing_args=missing_args,
+                rejected_reason=rejected_reason,
+            )
+
         if (
             re.search(r"\b(?:play|click|open)\b", lowered)
             and any(token in lowered for token in ("video", "result", "1st", "first", "latest"))
@@ -682,6 +904,25 @@ class IntentRouter:
         ):
             intent = "browser_click"
             confidence = 0.91
+            spec = self._catalog.get(intent, {})
+            tool = str(spec.get("tool", "")).strip()
+            args = extract_args(intent, content)
+            required = [str(arg) for arg in spec.get("required_args", ())]
+            missing_args = [name for name in required if name not in args or str(args.get(name, "")).strip() == ""]
+            rejected_reason = _guardrail_rejection(intent, content, args)
+            final_confidence = confidence if not rejected_reason else 0.0
+            return RouteDecision(
+                intent=intent,
+                confidence=max(0.0, min(1.0, float(final_confidence))),
+                tool=tool,
+                args=args,
+                missing_args=missing_args,
+                rejected_reason=rejected_reason,
+            )
+
+        if _looks_like_browser_state_read_request(content):
+            intent = "browser_get_state"
+            confidence = 0.9
             spec = self._catalog.get(intent, {})
             tool = str(spec.get("tool", "")).strip()
             args = extract_args(intent, content)
