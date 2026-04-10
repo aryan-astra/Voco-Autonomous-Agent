@@ -35,6 +35,10 @@ set "OLLAMA_MODELS=%VOCO_RUNTIME_ROOT%\ollama\models"
 set "TEMP=%VOCO_RUNTIME_ROOT%\temp"
 set "TMP=%TEMP%"
 set "PIP_CACHE_DIR=%VOCO_RUNTIME_ROOT%\pip\cache"
+set "HF_HOME=%VOCO_RUNTIME_ROOT%\huggingface"
+set "HF_HUB_CACHE=%HF_HOME%\hub"
+set "TRANSFORMERS_CACHE=%HF_HOME%\transformers"
+set "OPENWAKEWORD_MODEL_DIR=%VOCO_RUNTIME_ROOT%\openwakeword\models"
 
 call :print_runtime_policy
 if "%VOCO_PRINT_CONFIG%"=="1" (
@@ -71,11 +75,15 @@ echo [VOCO]   OLLAMA_MODELS=%OLLAMA_MODELS%
 echo [VOCO]   TEMP=%TEMP%
 echo [VOCO]   TMP=%TMP%
 echo [VOCO]   PIP_CACHE_DIR=%PIP_CACHE_DIR%
+echo [VOCO]   HF_HOME=%HF_HOME%
+echo [VOCO]   HF_HUB_CACHE=%HF_HUB_CACHE%
+echo [VOCO]   TRANSFORMERS_CACHE=%TRANSFORMERS_CACHE%
+echo [VOCO]   OPENWAKEWORD_MODEL_DIR=%OPENWAKEWORD_MODEL_DIR%
 exit /b 0
 
 :ensure_runtime_directories
 echo [VOCO][STEP] Ensuring runtime directories exist...
-for %%D in ("%VOCO_RUNTIME_ROOT%" "%OLLAMA_MODELS%" "%TEMP%" "%PIP_CACHE_DIR%") do (
+for %%D in ("%VOCO_RUNTIME_ROOT%" "%OLLAMA_MODELS%" "%TEMP%" "%PIP_CACHE_DIR%" "%HF_HOME%" "%HF_HUB_CACHE%" "%TRANSFORMERS_CACHE%" "%OPENWAKEWORD_MODEL_DIR%") do (
     if not exist "%%~fD" (
         mkdir "%%~fD" >nul 2>&1
         if errorlevel 1 (

@@ -422,26 +422,32 @@ class VocoApp(App):
             missing = ", ".join(str(name) for name in dep_status["missing"])
             install_hint = str(dep_status.get("install_hint", "")).strip()
             self._voice_degraded = True
-            self._set_voice_status_indicator("DEGRADED", "missing deps", "yellow")
-            message = f"[VOCO VOICE] Voice unavailable (missing: {missing})."
+            self._set_voice_status_indicator("DEGRADED", "install voice deps", "yellow")
+            message = f"[VOCO VOICE] Missing deps: {missing}."
             if install_hint:
-                message = f"{message} Install with: {install_hint}"
+                message = f"{message} Run: {install_hint}"
             self._update_output(message, "yellow")
             return
 
         if not dep_status["runtime_ready"]:
             runtime_hint = str(dep_status.get("runtime_hint", "")).strip()
             fallback_note = str(dep_status.get("fallback_note", "")).strip()
+            wake_model_dir = str(dep_status.get("wake_model_dir", "")).strip()
+            hf_cache = str(dep_status.get("hf_cache", "")).strip()
             self._voice_degraded = True
-            self._set_voice_status_indicator("DEGRADED", "wake model unavailable", "red")
+            self._set_voice_status_indicator("DEGRADED", "check runtime cache", "red")
             runtime_error = str(dep_status.get("error", "")).strip()
-            message = "[VOCO VOICE] Wake model unavailable."
+            message = "[VOCO VOICE] Wake/ASR assets not ready."
             if runtime_hint:
                 message = f"{message} {runtime_hint}"
             elif runtime_error:
                 message = f"{message} Error: {runtime_error}"
             if fallback_note:
                 message = f"{message} {fallback_note}"
+            if wake_model_dir:
+                message = f"{message} Wake dir: {wake_model_dir}"
+            elif hf_cache:
+                message = f"{message} HF cache: {hf_cache}"
             self._update_output(message, "red")
             return
 
@@ -562,7 +568,7 @@ class VocoApp(App):
             return
 
         self._set_voice_status_indicator("STARTING")
-        chat_log.write(Text("[VOCO VOICE] Initializing openwakeword listener...", style="#C96B45"))
+        chat_log.write(Text("[VOCO VOICE] Initializing wake + ASR (openai/whisper-medium)...", style="#C96B45"))
 
         try:
             from voice.wake_voice import VocoVoice

@@ -7,6 +7,54 @@ import threading
 from collections import deque
 from typing import Callable
 
+
+def _normalize_bootstrap_path(path_value: str) -> str:
+    expanded = os.path.expandvars(os.path.expanduser(str(path_value)))
+    return os.path.abspath(expanded)
+
+
+def _default_runtime_root() -> str:
+    configured_root = str(os.getenv("VOCO_RUNTIME_ROOT", "")).strip()
+    if configured_root:
+        return _normalize_bootstrap_path(configured_root)
+    if os.path.isdir("O:\\"):
+        return _normalize_bootstrap_path("O:\\voco-runtime")
+    return _normalize_bootstrap_path(os.path.join(os.path.dirname(__file__), "..", ".voco-runtime"))
+
+
+def _bootstrap_voice_cache_env() -> None:
+    runtime_root = _default_runtime_root()
+    hf_home = str(os.getenv("HF_HOME", "")).strip() or os.path.join(runtime_root, "huggingface")
+    hf_hub_cache = str(os.getenv("HF_HUB_CACHE", "")).strip() or os.path.join(hf_home, "hub")
+    transformers_cache = str(os.getenv("TRANSFORMERS_CACHE", "")).strip() or os.path.join(hf_home, "transformers")
+    wake_model_dir = str(os.getenv("OPENWAKEWORD_MODEL_DIR", "")).strip() or os.path.join(
+        runtime_root,
+        "openwakeword",
+        "models",
+    )
+
+    paths = [
+        _normalize_bootstrap_path(runtime_root),
+        _normalize_bootstrap_path(hf_home),
+        _normalize_bootstrap_path(hf_hub_cache),
+        _normalize_bootstrap_path(transformers_cache),
+        _normalize_bootstrap_path(wake_model_dir),
+    ]
+    for path_value in paths:
+        try:
+            os.makedirs(path_value, exist_ok=True)
+        except Exception:
+            continue
+
+    os.environ["VOCO_RUNTIME_ROOT"] = _normalize_bootstrap_path(runtime_root)
+    os.environ["HF_HOME"] = _normalize_bootstrap_path(hf_home)
+    os.environ["HF_HUB_CACHE"] = _normalize_bootstrap_path(hf_hub_cache)
+    os.environ["TRANSFORMERS_CACHE"] = _normalize_bootstrap_path(transformers_cache)
+    os.environ["OPENWAKEWORD_MODEL_DIR"] = _normalize_bootstrap_path(wake_model_dir)
+
+
+_bootstrap_voice_cache_env()
+
 try:
     import numpy as np
 except ImportError:  # pragma: no cover - optional runtime dependency
@@ -18,9 +66,14 @@ except ImportError:  # pragma: no cover - optional runtime dependency
     sd = None
 
 try:
-    from faster_whisper import WhisperModel
+    from transformers import pipeline as transformers_pipeline
 except ImportError:  # pragma: no cover - optional runtime dependency
-    WhisperModel = None
+    transformers_pipeline = None
+
+try:
+    import torch
+except ImportError:  # pragma: no cover - optional runtime dependency
+    torch = None
 
 try:
     from openwakeword.model import Model as OpenWakeWordModel
@@ -31,13 +84,23 @@ except ImportError:  # pragma: no cover - optional runtime dependency
         OpenWakeWordModel = None
 
 try:
+    import openwakeword
+except ImportError:  # pragma: no cover - optional runtime dependency
+    openwakeword = None
+
+try:
+    from openwakeword.utils import download_models as download_openwakeword_models
+except ImportError:  # pragma: no cover - optional runtime dependency
+    download_openwakeword_models = None
+
+try:
     import webrtcvad
 except ImportError:  # pragma: no cover - optional runtime dependency
     webrtcvad = None
 
 
 class VocoVoice:
-    """Wake-word listener with openwakeword + faster-whisper transcription."""
+    """Wake-word listener with openwakeword + Hugging Face Whisper transcription."""
 
     SAMPLE_RATE = 16000
     WAKE_BLOCK_SIZE = 1280  # 80ms (openwakeword-preferred chunk size)
@@ -46,20 +109,31 @@ class VocoVoice:
     SILENCE_THRESHOLD = 0.012
     TRAILING_SILENCE_SECONDS = 0.9
     WAKE_LABEL_HINT = "jarvis"
-    DEFAULT_WHISPER_MODEL = "base.en"
-    VOICE_BASE_INSTALL_HINT = "pip install openwakeword sounddevice numpy faster-whisper"
+    WHISPER_MODEL_ID = "openai/whisper-medium"
+    DEFAULT_WHISPER_MODEL = WHISPER_MODEL_ID
+    VOICE_BASE_INSTALL_HINT = "pip install openwakeword sounddevice numpy transformers torch"
     VOICE_VAD_INSTALL_HINT = "pip install webrtcvad"
     WAKE_ONNX_RUNTIME_HINT = (
         "Wake model ONNX init failed. Install ONNX runtime with: pip install onnxruntime. "
-        "Ensure openwakeword ONNX models are available."
+        "Ensure openwakeword ONNX models are available in OPENWAKEWORD_MODEL_DIR."
     )
     WAKE_TFLITE_FALLBACK_ENV = "VOCO_WAKE_ALLOW_TFLITE_FALLBACK"
     WAKE_TFLITE_INSTALL_HINT = "pip install tflite-runtime"
+    VOCO_RUNTIME_ROOT_ENV = "VOCO_RUNTIME_ROOT"
+    HF_HOME_ENV = "HF_HOME"
+    HF_HUB_CACHE_ENV = "HF_HUB_CACHE"
+    TRANSFORMERS_CACHE_ENV = "TRANSFORMERS_CACHE"
+    OPENWAKEWORD_MODEL_DIR_ENV = "OPENWAKEWORD_MODEL_DIR"
+    _RUNTIME_POLICY_HINT = (
+        "Set VOCO_RUNTIME_ROOT or cache env vars (HF_HOME/HF_HUB_CACHE/OPENWAKEWORD_MODEL_DIR) "
+        "to a writable non-C path."
+    )
     _DEPENDENCY_PACKAGE_MAP = {
         "openwakeword": "openwakeword",
         "sounddevice": "sounddevice",
         "numpy": "numpy",
-        "faster-whisper": "faster-whisper",
+        "transformers": "transformers",
+        "torch": "torch",
     }
 
     @classmethod
@@ -74,6 +148,186 @@ class VocoVoice:
     def _allow_tflite_fallback(cls) -> bool:
         return str(os.getenv(cls.WAKE_TFLITE_FALLBACK_ENV, "")).strip() == "1"
 
+    @staticmethod
+    def _normalize_path(path_value: str) -> str:
+        expanded = os.path.expandvars(os.path.expanduser(path_value))
+        return os.path.abspath(expanded)
+
+    @staticmethod
+    def _is_c_drive(path_value: str) -> bool:
+        return os.path.splitdrive(os.path.abspath(path_value))[0].upper() == "C:"
+
+    @classmethod
+    def _resolve_runtime_root(cls) -> str:
+        configured_root = str(os.getenv(cls.VOCO_RUNTIME_ROOT_ENV, "")).strip()
+        if configured_root:
+            return cls._normalize_path(configured_root)
+        return _default_runtime_root()
+
+    @classmethod
+    def _configure_runtime_paths(cls) -> dict[str, str]:
+        runtime_root = cls._resolve_runtime_root()
+        hf_home = str(os.getenv(cls.HF_HOME_ENV, "")).strip() or os.path.join(runtime_root, "huggingface")
+        hf_hub_cache = str(os.getenv(cls.HF_HUB_CACHE_ENV, "")).strip() or os.path.join(hf_home, "hub")
+        transformers_cache = str(os.getenv(cls.TRANSFORMERS_CACHE_ENV, "")).strip() or os.path.join(
+            hf_home,
+            "transformers",
+        )
+        wake_model_dir = str(os.getenv(cls.OPENWAKEWORD_MODEL_DIR_ENV, "")).strip() or os.path.join(
+            runtime_root,
+            "openwakeword",
+            "models",
+        )
+
+        paths = {
+            "runtime_root": cls._normalize_path(runtime_root),
+            "hf_home": cls._normalize_path(hf_home),
+            "hf_hub_cache": cls._normalize_path(hf_hub_cache),
+            "transformers_cache": cls._normalize_path(transformers_cache),
+            "wake_model_dir": cls._normalize_path(wake_model_dir),
+        }
+
+        c_drive_paths = {
+            key: value for key, value in paths.items() if key != "runtime_root" and cls._is_c_drive(value)
+        }
+        if c_drive_paths:
+            details = ", ".join(f"{key}={value}" for key, value in c_drive_paths.items())
+            raise RuntimeError(f"Runtime path policy violation (C drive): {details}. {cls._RUNTIME_POLICY_HINT}")
+
+        for path_value in paths.values():
+            os.makedirs(path_value, exist_ok=True)
+
+        os.environ[cls.VOCO_RUNTIME_ROOT_ENV] = paths["runtime_root"]
+        os.environ[cls.HF_HOME_ENV] = paths["hf_home"]
+        os.environ[cls.HF_HUB_CACHE_ENV] = paths["hf_hub_cache"]
+        os.environ[cls.TRANSFORMERS_CACHE_ENV] = paths["transformers_cache"]
+        os.environ[cls.OPENWAKEWORD_MODEL_DIR_ENV] = paths["wake_model_dir"]
+        return paths
+
+    @staticmethod
+    def _replace_model_extension(download_url: str, extension: str) -> str:
+        filename = os.path.basename(download_url)
+        stem, _ = os.path.splitext(filename)
+        return f"{stem}{extension}"
+
+    @classmethod
+    def _openwakeword_assets(cls, wake_model_dir: str) -> dict[str, object]:
+        if openwakeword is None:
+            raise RuntimeError("openwakeword metadata is unavailable. Reinstall openwakeword.")
+
+        wake_urls = [str(meta.get("download_url", "")) for meta in getattr(openwakeword, "MODELS", {}).values()]
+        wake_urls = [url for url in wake_urls if url]
+        if not wake_urls:
+            raise RuntimeError("openwakeword model metadata is empty. Reinstall openwakeword.")
+
+        wake_models_onnx = [os.path.join(wake_model_dir, cls._replace_model_extension(url, ".onnx")) for url in wake_urls]
+        wake_models_tflite = [
+            os.path.join(wake_model_dir, cls._replace_model_extension(url, ".tflite")) for url in wake_urls
+        ]
+
+        feature_urls = {
+            str(name): str(meta.get("download_url", ""))
+            for name, meta in getattr(openwakeword, "FEATURE_MODELS", {}).items()
+            if str(meta.get("download_url", "")).strip()
+        }
+        feature_onnx = {
+            key: os.path.join(wake_model_dir, cls._replace_model_extension(url, ".onnx"))
+            for key, url in feature_urls.items()
+        }
+        feature_tflite = {
+            key: os.path.join(wake_model_dir, cls._replace_model_extension(url, ".tflite"))
+            for key, url in feature_urls.items()
+        }
+
+        melspec_onnx = next((path for key, path in feature_onnx.items() if "melspectrogram" in key.lower()), "")
+        embedding_onnx = next((path for key, path in feature_onnx.items() if "embedding" in key.lower()), "")
+        melspec_tflite = next((path for key, path in feature_tflite.items() if "melspectrogram" in key.lower()), "")
+        embedding_tflite = next((path for key, path in feature_tflite.items() if "embedding" in key.lower()), "")
+
+        required_onnx = list(dict.fromkeys([*wake_models_onnx, melspec_onnx, embedding_onnx]))
+        required_onnx = [path for path in required_onnx if path]
+        required_tflite = list(dict.fromkeys([*wake_models_tflite, melspec_tflite, embedding_tflite]))
+        required_tflite = [path for path in required_tflite if path]
+
+        return {
+            "wake_models_onnx": wake_models_onnx,
+            "wake_models_tflite": wake_models_tflite,
+            "melspec_onnx": melspec_onnx,
+            "embedding_onnx": embedding_onnx,
+            "melspec_tflite": melspec_tflite,
+            "embedding_tflite": embedding_tflite,
+            "required_onnx": required_onnx,
+            "required_tflite": required_tflite,
+        }
+
+    @classmethod
+    def _provision_openwakeword_assets(cls, wake_model_dir: str) -> dict[str, object]:
+        assets = cls._openwakeword_assets(wake_model_dir)
+        missing = [path for path in assets["required_onnx"] if not os.path.exists(path)]
+        if not missing:
+            return assets
+
+        if download_openwakeword_models is None:
+            raise RuntimeError(
+                "openwakeword model downloader is unavailable. Reinstall openwakeword so models can be prefetched."
+            )
+
+        try:
+            download_openwakeword_models(target_directory=wake_model_dir)
+        except TypeError:
+            download_openwakeword_models([], wake_model_dir)
+        except Exception as exc:  # pragma: no cover - network/runtime specific
+            raise RuntimeError(f"Failed to prefetch openwakeword models into '{wake_model_dir}': {exc}") from exc
+
+        still_missing = [path for path in assets["required_onnx"] if not os.path.exists(path)]
+        if still_missing:
+            missing_preview = ", ".join(os.path.basename(path) for path in still_missing[:4])
+            raise RuntimeError(
+                f"openwakeword ONNX assets are still missing in '{wake_model_dir}' ({missing_preview})."
+            )
+        return assets
+
+    @classmethod
+    def _create_wake_model_with_assets(cls, assets: dict[str, object]):
+        onnx_kwargs = {
+            "inference_framework": "onnx",
+            "wakeword_models": list(assets["wake_models_onnx"]),
+        }
+        if assets["melspec_onnx"]:
+            onnx_kwargs["melspec_model_path"] = str(assets["melspec_onnx"])
+        if assets["embedding_onnx"]:
+            onnx_kwargs["embedding_model_path"] = str(assets["embedding_onnx"])
+
+        try:
+            wake_model = OpenWakeWordModel(**onnx_kwargs)
+            return wake_model, "onnx"
+        except Exception as onnx_error:  # pragma: no cover - runtime/env specific
+            if not cls._allow_tflite_fallback():
+                raise RuntimeError(
+                    "Failed to initialize openwakeword model. "
+                    f"{cls.WAKE_ONNX_RUNTIME_HINT} Set {cls.WAKE_TFLITE_FALLBACK_ENV}=1 to try default framework fallback."
+                ) from onnx_error
+
+        tflite_kwargs = {
+            "wakeword_models": list(assets["wake_models_tflite"]),
+        }
+        if assets["melspec_tflite"]:
+            tflite_kwargs["melspec_model_path"] = str(assets["melspec_tflite"])
+        if assets["embedding_tflite"]:
+            tflite_kwargs["embedding_model_path"] = str(assets["embedding_tflite"])
+
+        try:
+            wake_model = OpenWakeWordModel(**tflite_kwargs)
+            return wake_model, "tflite"
+        except Exception as fallback_error:  # pragma: no cover - runtime/env specific
+            fallback_note = (
+                f"Default-framework fallback failed ({cls.WAKE_TFLITE_FALLBACK_ENV}=1). "
+                f"If you rely on this fallback, install with: {cls.WAKE_TFLITE_INSTALL_HINT}"
+            )
+            raise RuntimeError(
+                f"Failed to initialize openwakeword model. {cls.WAKE_ONNX_RUNTIME_HINT} {fallback_note}"
+            ) from fallback_error
+
     @classmethod
     def dependency_status(cls) -> dict[str, object]:
         missing = []
@@ -83,8 +337,10 @@ class VocoVoice:
             missing.append("sounddevice")
         if np is None:
             missing.append("numpy")
-        if WhisperModel is None:
-            missing.append("faster-whisper")
+        if transformers_pipeline is None:
+            missing.append("transformers")
+        if torch is None:
+            missing.append("torch")
 
         install_hint = cls._build_install_hint(missing)
         return {
@@ -104,39 +360,38 @@ class VocoVoice:
         status["fallback_attempted"] = False
         status["fallback_error"] = ""
         status["fallback_note"] = ""
-        status["whisper_model_default"] = cls.DEFAULT_WHISPER_MODEL
+        status["whisper_model_default"] = cls.WHISPER_MODEL_ID
+
+        try:
+            runtime_paths = cls._configure_runtime_paths()
+        except Exception as exc:
+            status["error"] = str(exc)
+            status["runtime_hint"] = cls._RUNTIME_POLICY_HINT
+            return status
+
+        status["runtime_root"] = runtime_paths["runtime_root"]
+        status["hf_cache"] = runtime_paths["hf_hub_cache"]
+        status["wake_model_dir"] = runtime_paths["wake_model_dir"]
+
         if not status["available"]:
             status["runtime_hint"] = str(status.get("install_hint", cls.VOICE_BASE_INSTALL_HINT))
             return status
 
         try:
-            OpenWakeWordModel(inference_framework="onnx")
+            assets = cls._provision_openwakeword_assets(runtime_paths["wake_model_dir"])
+            wake_model, wake_framework = cls._create_wake_model_with_assets(assets)
             status["runtime_ready"] = True
+            status["wake_framework"] = wake_framework
+            status["wake_model_count"] = len(assets["wake_models_onnx"])
+            del wake_model
             return status
         except Exception as exc:  # pragma: no cover - runtime/env specific
             status["error"] = str(exc)
-            status["runtime_hint"] = cls.WAKE_ONNX_RUNTIME_HINT
-
-        if not cls._allow_tflite_fallback():
             status["runtime_hint"] = (
-                f"{status['runtime_hint']} "
-                f"Set {cls.WAKE_TFLITE_FALLBACK_ENV}=1 to try default framework fallback."
+                f"{cls.WAKE_ONNX_RUNTIME_HINT} Runtime cache: {runtime_paths['wake_model_dir']}"
             )
-            return status
-
-        status["fallback_attempted"] = True
-        try:
-            OpenWakeWordModel()
-            status["runtime_ready"] = True
-            status["error"] = ""
-            status["runtime_hint"] = ""
-            return status
-        except Exception as exc:  # pragma: no cover - runtime/env specific
-            status["fallback_error"] = str(exc)
-            status["fallback_note"] = (
-                f"Default-framework fallback was attempted ({cls.WAKE_TFLITE_FALLBACK_ENV}=1) and failed. "
-                f"If you rely on this fallback, install with: {cls.WAKE_TFLITE_INSTALL_HINT}"
-            )
+            if cls._allow_tflite_fallback():
+                status["fallback_attempted"] = True
             return status
 
     def __init__(
@@ -152,17 +407,11 @@ class VocoVoice:
             install_hint = str(dep_status.get("install_hint", self.VOICE_BASE_INSTALL_HINT)).strip()
             raise RuntimeError(f"Voice dependencies missing: {missing}. Install with: {install_hint}")
 
+        self._runtime_paths = self._configure_runtime_paths()
+        self._wake_assets = self._provision_openwakeword_assets(self._runtime_paths["wake_model_dir"])
         self._wake_model = self._create_wake_model()
-        self._whisper_model_size = str(whisper_model_size or self.DEFAULT_WHISPER_MODEL).strip() or self.DEFAULT_WHISPER_MODEL
-        try:
-            self.whisper = WhisperModel(self._whisper_model_size, device="cpu", compute_type="int8")
-        except Exception as exc:
-            hint = (
-                f"Failed to initialize faster-whisper model '{self._whisper_model_size}'. "
-                f"Install or repair dependencies with: {self.VOICE_BASE_INSTALL_HINT}. "
-                "Ensure the model download/cache path is writable."
-            )
-            raise RuntimeError(f"{hint} Runtime error: {exc}") from exc
+        self._whisper_model_size = str(whisper_model_size or self.WHISPER_MODEL_ID).strip() or self.WHISPER_MODEL_ID
+        self.whisper = self._create_asr_pipeline(self._whisper_model_size)
         self.on_command = on_command_callback
         self._on_status = on_status_callback
         self._wake_threshold = self.WAKE_THRESHOLD if wake_threshold is None else wake_threshold
@@ -171,29 +420,28 @@ class VocoVoice:
         self._listening = False
         self._thread: threading.Thread | None = None
 
-    def _create_wake_model(self):
+    def _create_asr_pipeline(self, model_id: str):
         try:
-            return OpenWakeWordModel(inference_framework="onnx")
-        except Exception as exc:  # pragma: no cover - runtime/env specific
-            onnx_error = exc
-
-        onnx_hint = self.WAKE_ONNX_RUNTIME_HINT
-        if not self._allow_tflite_fallback():
-            raise RuntimeError(
-                "Failed to initialize openwakeword model. "
-                f"{onnx_hint} Set {self.WAKE_TFLITE_FALLBACK_ENV}=1 to try default framework fallback."
-            ) from onnx_error
-
-        try:
-            return OpenWakeWordModel()
-        except Exception as fallback_error:  # pragma: no cover - runtime/env specific
-            fallback_note = (
-                f"Default-framework fallback failed ({self.WAKE_TFLITE_FALLBACK_ENV}=1). "
-                f"If you rely on this fallback, install with: {self.WAKE_TFLITE_INSTALL_HINT}"
+            return transformers_pipeline(
+                "automatic-speech-recognition",
+                model=model_id,
+                tokenizer=model_id,
+                feature_extractor=model_id,
+                device=-1,
+                model_kwargs={"cache_dir": self._runtime_paths["hf_hub_cache"]},
             )
-            raise RuntimeError(
-                f"Failed to initialize openwakeword model. {onnx_hint} {fallback_note}"
-            ) from fallback_error
+        except Exception as exc:
+            hint = (
+                f"Failed to initialize Whisper ASR model '{model_id}'. "
+                f"Install or repair dependencies with: {self.VOICE_BASE_INSTALL_HINT}. "
+                f"Cache path: {self._runtime_paths['hf_hub_cache']}"
+            )
+            raise RuntimeError(f"{hint}. Runtime error: {exc}") from exc
+
+    def _create_wake_model(self):
+        wake_model, wake_framework = self._create_wake_model_with_assets(self._wake_assets)
+        self._wake_framework = wake_framework
+        return wake_model
 
     def _emit_status(self, message: str, level: str = "info") -> None:
         if self._on_status is None:
@@ -218,7 +466,10 @@ class VocoVoice:
 
     def _wake_word_loop(self) -> None:
         self._emit_status(
-            f"Wake listener active ({self.vad_mode} + faster-whisper:{self._whisper_model_size}).",
+            (
+                f"Wake listener active ({self.vad_mode}, wake:{getattr(self, '_wake_framework', 'onnx')}, "
+                f"asr:{self._whisper_model_size})."
+            ),
             "ready" if self.vad_mode == "webrtcvad" else "degraded",
         )
         try:
@@ -293,17 +544,27 @@ class VocoVoice:
 
         audio = np.concatenate(frames).astype(np.float32) / 32768.0
         try:
-            segments, _ = self.whisper.transcribe(audio, language="en", beam_size=1, vad_filter=False)
+            result = self.whisper(
+                {
+                    "raw": audio,
+                    "sampling_rate": self.SAMPLE_RATE,
+                }
+            )
         except Exception as exc:  # pragma: no cover - runtime/model specific
             self._emit_status(
                 (
                     f"Transcription failed ({self._whisper_model_size}): {exc}. "
-                    f"Check faster-whisper setup: {self.VOICE_BASE_INSTALL_HINT}"
+                    f"Check transformers setup: {self.VOICE_BASE_INSTALL_HINT}"
                 ),
                 "error",
             )
             return ""
-        return " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+
+        if isinstance(result, dict):
+            return str(result.get("text", "")).strip()
+        if isinstance(result, str):
+            return result.strip()
+        return ""
 
     def _is_speech_frame(self, pcm_frame) -> bool:
         if self._vad is not None:
