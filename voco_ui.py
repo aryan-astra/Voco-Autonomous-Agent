@@ -453,13 +453,17 @@ class VocoApp(App):
 
         if dep_status["vad_mode"] == "webrtcvad":
             self._voice_degraded = False
-            self._set_voice_status_indicator("READY", "direct mode default, WebRTC VAD")
+            self._set_voice_status_indicator("READY", "WebRTC VAD")
             return
 
         self._voice_degraded = True
-        self._set_voice_status_indicator("DEGRADED", "direct mode, silence VAD fallback", "yellow")
+        self._set_voice_status_indicator("DEGRADED", "fallback VAD", "yellow")
+        vad_install_hint = str(dep_status.get("vad_install_hint", "pip install webrtcvad")).strip()
         self._update_output(
-            "[VOCO VOICE] webrtcvad missing. Direct mode active with silence-heuristic VAD fallback.",
+            (
+                "[VOCO VOICE] webrtcvad missing. Direct mode active with silence-heuristic VAD fallback. "
+                f"Run: {vad_install_hint}"
+            ),
             "yellow",
         )
 
@@ -476,15 +480,15 @@ class VocoApp(App):
         if level == "ready":
             if self._voice_agent is not None and getattr(self._voice_agent, "vad_mode", "") == "webrtcvad":
                 self._voice_degraded = False
-                self._set_voice_status_indicator("ON", "direct mode, WebRTC VAD", "green")
+                self._set_voice_status_indicator("ON", "WebRTC VAD", "green")
                 return
             self._voice_degraded = True
-            self._set_voice_status_indicator("DEGRADED", "direct mode, silence VAD fallback", "yellow")
+            self._set_voice_status_indicator("DEGRADED", "fallback VAD", "yellow")
             return
 
         if level == "degraded":
             self._voice_degraded = True
-            self._set_voice_status_indicator("DEGRADED", "direct mode, silence VAD fallback", "yellow")
+            self._set_voice_status_indicator("DEGRADED", "fallback VAD", "yellow")
             return
 
         if level == "error":
@@ -587,15 +591,16 @@ class VocoApp(App):
             self._voice_enabled = True
             self._voice_degraded = getattr(self._voice_agent, "vad_mode", "") != "webrtcvad"
             if self._voice_degraded:
-                self._set_voice_status_indicator("DEGRADED", "direct mode, silence VAD fallback", "yellow")
+                self._set_voice_status_indicator("DEGRADED", "fallback VAD", "yellow")
                 chat_log.write(
                     Text(
-                        "[VOCO VOICE] Started in direct mode (silence VAD fallback). Wake-word mode is optional.",
+                        "[VOCO VOICE] Started in direct mode (silence VAD fallback). "
+                        "Run: pip install webrtcvad. Wake-word mode is optional.",
                         style="yellow",
                     )
                 )
                 return
-            self._set_voice_status_indicator("ON", "direct mode, WebRTC VAD", "green")
+            self._set_voice_status_indicator("ON", "WebRTC VAD", "green")
             chat_log.write(Text("[VOCO VOICE] Direct command listener started. Wake-word mode is optional.", style="#C96B45"))
         except Exception as exc:
             self._voice_agent = None
