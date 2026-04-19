@@ -246,6 +246,48 @@ Test-Path O:\voco-runtime\temp
 Test-Path O:\voco-runtime\pip\cache
 ```
 
+### Memory-efficient decomposition engine (CPU-only)
+
+VOCO now includes a standalone low-memory decomposition engine at:
+
+- `tools/memory_decomposition_engine.py`
+
+Design targets:
+
+- CPU-only inference (`n_gpu_layers=0`)
+- max context window `4096`
+- disk-backed step memory (`completed_steps.json`, `session_summary.txt`, `error_log.txt`)
+- fail-fast retries (single retry, then skip + log)
+
+Run with Ollama:
+
+```powershell
+python tools\memory_decomposition_engine.py "Plan and implement a file cleanup workflow" --backend ollama --model-name qwen2.5-coder:1.5b --storage-dir workspace\decomposition_memory
+```
+
+Run with llama-cpp-python + GGUF:
+
+```powershell
+python tools\memory_decomposition_engine.py "Generate and execute deployment checklist" --backend llama-cpp --model-path O:\models\qwen3-4b-instruct-q4_k_m.gguf --storage-dir workspace\decomposition_memory
+```
+
+Optional code execution for generated Python/bash blocks:
+
+```powershell
+python tools\memory_decomposition_engine.py "Create a diagnostics script and run it" --execute-code
+```
+
+Swap/virtual-memory recommendation for 8GB systems:
+
+- Linux:
+  - `sudo fallocate -l 8G /swapfile`
+  - `sudo chmod 600 /swapfile`
+  - `sudo mkswap /swapfile`
+  - `sudo swapon /swapfile`
+- Windows:
+  - `System Properties -> Advanced -> Performance (Settings) -> Advanced -> Virtual memory`
+  - Enable a custom paging file on a non-system drive with at least 8-12 GB.
+
 Optional voice dependencies (for Ctrl+G wake-word mode):
 
 ```powershell
