@@ -243,7 +243,7 @@ class VocoApp(App):
                             yield Static(self.MASCOT_FRAMES[0], id="mascot")
                             yield Label(_MODEL_META_LABEL, classes="meta")
                             yield Label("/workspace/voco/apps", classes="meta")
-                            yield Label("Voice: OFF", id="voice-status")
+                            yield Label("Voice: OFF (direct mode default)", id="voice-status")
 
                         # Right activity/information column.
                         with Vertical(id="right-column"):
@@ -319,7 +319,7 @@ class VocoApp(App):
         chat_log.write(Text("  /resume           Continue last workflow", style="#D4D4D4"))
         chat_log.write(Text("  /index            Build full file index", style="#D4D4D4"))
         chat_log.write(Text("  /index-app        Build installed app index", style="#D4D4D4"))
-        chat_log.write(Text("  Ctrl+G            Toggle wake-word voice", style="#D4D4D4"))
+        chat_log.write(Text("  Ctrl+G            Toggle voice (direct default; wake-word optional)", style="#D4D4D4"))
 
     async def _handle_slash_command(self, command: str, chat_log: RichLog) -> bool:
         """Handle slash commands and return True when a command was consumed."""
@@ -453,13 +453,13 @@ class VocoApp(App):
 
         if dep_status["vad_mode"] == "webrtcvad":
             self._voice_degraded = False
-            self._set_voice_status_indicator("READY", "WebRTC VAD")
+            self._set_voice_status_indicator("READY", "direct mode default, WebRTC VAD")
             return
 
         self._voice_degraded = True
-        self._set_voice_status_indicator("DEGRADED", "silence VAD fallback", "yellow")
+        self._set_voice_status_indicator("DEGRADED", "direct mode, silence VAD fallback", "yellow")
         self._update_output(
-            "[VOCO VOICE] webrtcvad missing. Using silence-heuristic VAD fallback.",
+            "[VOCO VOICE] webrtcvad missing. Direct mode active with silence-heuristic VAD fallback.",
             "yellow",
         )
 
@@ -476,15 +476,15 @@ class VocoApp(App):
         if level == "ready":
             if self._voice_agent is not None and getattr(self._voice_agent, "vad_mode", "") == "webrtcvad":
                 self._voice_degraded = False
-                self._set_voice_status_indicator("ON", "WebRTC VAD", "green")
+                self._set_voice_status_indicator("ON", "direct mode, WebRTC VAD", "green")
                 return
             self._voice_degraded = True
-            self._set_voice_status_indicator("DEGRADED", "silence VAD fallback", "yellow")
+            self._set_voice_status_indicator("DEGRADED", "direct mode, silence VAD fallback", "yellow")
             return
 
         if level == "degraded":
             self._voice_degraded = True
-            self._set_voice_status_indicator("DEGRADED", "silence VAD fallback", "yellow")
+            self._set_voice_status_indicator("DEGRADED", "direct mode, silence VAD fallback", "yellow")
             return
 
         if level == "error":
@@ -567,8 +567,13 @@ class VocoApp(App):
             chat_log.write(Text("[VOCO VOICE] Stopped.", style="#C96B45"))
             return
 
-        self._set_voice_status_indicator("STARTING")
-        chat_log.write(Text("[VOCO VOICE] Initializing wake + ASR (openai/whisper-medium)...", style="#C96B45"))
+        self._set_voice_status_indicator("STARTING", "direct mode")
+        chat_log.write(
+            Text(
+                "[VOCO VOICE] Initializing direct command mode + ASR (openai/whisper-medium)...",
+                style="#C96B45",
+            )
+        )
 
         try:
             from voice.wake_voice import VocoVoice
@@ -576,21 +581,22 @@ class VocoApp(App):
             self._voice_agent = VocoVoice(
                 on_command_callback=self._queue_voice_command,
                 on_status_callback=lambda msg, lvl: self.call_from_thread(self._handle_voice_status_event, msg, lvl),
+                interaction_mode=VocoVoice.INTERACTION_MODE_DIRECT,
             )
             self._voice_agent.start()
             self._voice_enabled = True
             self._voice_degraded = getattr(self._voice_agent, "vad_mode", "") != "webrtcvad"
             if self._voice_degraded:
-                self._set_voice_status_indicator("DEGRADED", "silence VAD fallback", "yellow")
+                self._set_voice_status_indicator("DEGRADED", "direct mode, silence VAD fallback", "yellow")
                 chat_log.write(
                     Text(
-                        "[VOCO VOICE] Started in degraded mode (silence VAD fallback).",
+                        "[VOCO VOICE] Started in direct mode (silence VAD fallback). Wake-word mode is optional.",
                         style="yellow",
                     )
                 )
                 return
-            self._set_voice_status_indicator("ON", "WebRTC VAD", "green")
-            chat_log.write(Text("[VOCO VOICE] Wake-word listener started.", style="#C96B45"))
+            self._set_voice_status_indicator("ON", "direct mode, WebRTC VAD", "green")
+            chat_log.write(Text("[VOCO VOICE] Direct command listener started. Wake-word mode is optional.", style="#C96B45"))
         except Exception as exc:
             self._voice_agent = None
             self._voice_enabled = False

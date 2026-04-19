@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections import deque
 from typing import Callable
 
@@ -100,7 +101,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency
 
 
 class VocoVoice:
-    """Wake-word listener with openwakeword + Hugging Face Whisper transcription."""
+    """Voice listener with optional wake-word gating + Hugging Face Whisper transcription."""
 
     SAMPLE_RATE = 16000
     WAKE_BLOCK_SIZE = 1280  # 80ms (openwakeword-preferred chunk size)
@@ -108,6 +109,14 @@ class VocoVoice:
     WAKE_THRESHOLD = 0.5
     SILENCE_THRESHOLD = 0.012
     TRAILING_SILENCE_SECONDS = 0.9
+    DIRECT_WAIT_FOR_SPEECH_SECONDS = 2.4
+    DIRECT_TRAILING_SILENCE_SECONDS = 0.6
+    DIRECT_PRE_ROLL_SECONDS = 0.2
+    DIRECT_SILENCE_THRESHOLD = 0.01
+    CAPTURE_IDLE_STATUS_COOLDOWN_SECONDS = 2.5
+    INTERACTION_MODE_DIRECT = "direct"
+    INTERACTION_MODE_WAKEWORD = "wakeword"
+    INTERACTION_MODES = {INTERACTION_MODE_DIRECT, INTERACTION_MODE_WAKEWORD}
     WAKE_LABEL_HINT = "jarvis"
     WHISPER_MODEL_ID = "openai/whisper-medium"
     DEFAULT_WHISPER_MODEL = WHISPER_MODEL_ID
@@ -400,6 +409,7 @@ class VocoVoice:
         whisper_model_size: str = DEFAULT_WHISPER_MODEL,
         wake_threshold: float | None = None,
         on_status_callback: Callable[[str, str], None] | None = None,
+        interaction_mode: str = INTERACTION_MODE_DIRECT,
     ):
         dep_status = self.dependency_status()
         if not dep_status["available"]:
@@ -415,10 +425,21 @@ class VocoVoice:
         self.on_command = on_command_callback
         self._on_status = on_status_callback
         self._wake_threshold = self.WAKE_THRESHOLD if wake_threshold is None else wake_threshold
-        self._vad = webrtcvad.Vad(2) if webrtcvad is not None else None
+        self._interaction_mode = self._normalize_interaction_mode(interaction_mode)
+        vad_aggressiveness = 1 if self._interaction_mode == self.INTERACTION_MODE_DIRECT else 2
+        self._vad = webrtcvad.Vad(vad_aggressiveness) if webrtcvad is not None else None
         self.vad_mode = "webrtcvad" if self._vad is not None else "silence-heuristic"
         self._listening = False
         self._thread: threading.Thread | None = None
+        self._status_cooldowns: dict[str, float] = {}
+
+    @classmethod
+    def _normalize_interaction_mode(cls, interaction_mode: str) -> str:
+        mode = str(interaction_mode or cls.INTERACTION_MODE_DIRECT).strip().lower()
+        if mode in cls.INTERACTION_MODES:
+            return mode
+        valid_modes = ", ".join(sorted(cls.INTERACTION_MODES))
+        raise ValueError(f"Unsupported interaction mode '{interaction_mode}'. Expected one of: {valid_modes}.")
 
     def _create_asr_pipeline(self, model_id: str):
         try:
@@ -451,6 +472,15 @@ class VocoVoice:
         except Exception:
             return
 
+    def _emit_status_throttled(self, key: str, message: str, level: str = "info", cooldown: float = 0.0) -> None:
+        if cooldown > 0.0:
+            now = time.monotonic()
+            last = self._status_cooldowns.get(key, 0.0)
+            if (now - last) < cooldown:
+                return
+            self._status_cooldowns[key] = now
+        self._emit_status(message, level)
+
     def start(self) -> None:
         if self._listening:
             return
@@ -465,9 +495,15 @@ class VocoVoice:
         self._thread = None
 
     def _wake_word_loop(self) -> None:
+        listener_label = (
+            "Direct command listener"
+            if self._interaction_mode == self.INTERACTION_MODE_DIRECT
+            else "Wake-word listener"
+        )
         self._emit_status(
             (
-                f"Wake listener active ({self.vad_mode}, wake:{getattr(self, '_wake_framework', 'onnx')}, "
+                f"{listener_label} active ({self.vad_mode}, mode:{self._interaction_mode}, "
+                f"wake:{getattr(self, '_wake_framework', 'onnx')}, "
                 f"asr:{self._whisper_model_size})."
             ),
             "ready" if self.vad_mode == "webrtcvad" else "degraded",
@@ -480,11 +516,11 @@ class VocoVoice:
                 blocksize=self.WAKE_BLOCK_SIZE,
             ) as stream:
                 while self._listening:
-                    frame, _ = stream.read(self.WAKE_BLOCK_SIZE)
-                    if not self._is_wake_word_detected(frame):
-                        continue
-
-                    self._emit_status("Wake word detected. Listening for command...", "step")
+                    if self._interaction_mode == self.INTERACTION_MODE_WAKEWORD:
+                        frame, _ = stream.read(self.WAKE_BLOCK_SIZE)
+                        if not self._is_wake_word_detected(frame):
+                            continue
+                        self._emit_status("Wake word detected. Listening for command...", "step")
                     command = self._capture_command(stream)
                     if command:
                         self.on_command(command)
@@ -508,11 +544,26 @@ class VocoVoice:
 
     def _capture_command(self, stream, max_seconds: int = 8) -> str:
         frames = []
-        pre_roll = deque(maxlen=int(0.30 * self.SAMPLE_RATE / self.COMMAND_FRAME_SIZE))
+        is_direct_mode = self._interaction_mode == self.INTERACTION_MODE_DIRECT
+        pre_roll_seconds = self.DIRECT_PRE_ROLL_SECONDS if is_direct_mode else 0.30
+        wait_for_speech_seconds = self.DIRECT_WAIT_FOR_SPEECH_SECONDS if is_direct_mode else float(max_seconds)
+        trailing_silence_seconds = (
+            self.DIRECT_TRAILING_SILENCE_SECONDS if is_direct_mode else self.TRAILING_SILENCE_SECONDS
+        )
+        silence_threshold = self.DIRECT_SILENCE_THRESHOLD if is_direct_mode else self.SILENCE_THRESHOLD
+        pre_roll = deque(maxlen=int(pre_roll_seconds * self.SAMPLE_RATE / self.COMMAND_FRAME_SIZE))
         speech_started = False
+        wait_frames = 0
         silence_frames = 0
-        max_silence_frames = int(self.TRAILING_SILENCE_SECONDS * self.SAMPLE_RATE / self.COMMAND_FRAME_SIZE)
+        max_wait_frames = int(wait_for_speech_seconds * self.SAMPLE_RATE / self.COMMAND_FRAME_SIZE)
+        max_silence_frames = int(trailing_silence_seconds * self.SAMPLE_RATE / self.COMMAND_FRAME_SIZE)
         max_frames = int(max_seconds * self.SAMPLE_RATE / self.COMMAND_FRAME_SIZE)
+        self._emit_status_throttled(
+            "capture_waiting",
+            "Waiting for speech...",
+            "step",
+            cooldown=self.CAPTURE_IDLE_STATUS_COOLDOWN_SECONDS,
+        )
 
         for _ in range(max_frames):
             if not self._listening:
@@ -521,11 +572,12 @@ class VocoVoice:
             frame, _ = stream.read(self.COMMAND_FRAME_SIZE)
             pcm_frame = np.asarray(frame).reshape(-1).astype(np.int16, copy=False)
             pre_roll.append(pcm_frame.copy())
-            is_speech = self._is_speech_frame(pcm_frame)
+            is_speech = self._is_speech_frame(pcm_frame, silence_threshold=silence_threshold)
 
             if is_speech:
                 if not speech_started:
                     speech_started = True
+                    self._emit_status("Speech detected.", "step")
                     frames.extend(list(pre_roll))
                     pre_roll.clear()
                 else:
@@ -538,11 +590,23 @@ class VocoVoice:
                 silence_frames += 1
                 if silence_frames >= max_silence_frames:
                     break
+                continue
+
+            wait_frames += 1
+            if wait_frames >= max_wait_frames:
+                break
 
         if not speech_started or not frames:
+            self._emit_status_throttled(
+                "capture_no_speech",
+                "No speech in window.",
+                "step",
+                cooldown=self.CAPTURE_IDLE_STATUS_COOLDOWN_SECONDS,
+            )
             return ""
 
         audio = np.concatenate(frames).astype(np.float32) / 32768.0
+        self._emit_status("Transcription started.", "step")
         try:
             result = self.whisper(
                 {
@@ -560,13 +624,23 @@ class VocoVoice:
             )
             return ""
 
+        text = ""
         if isinstance(result, dict):
-            return str(result.get("text", "")).strip()
-        if isinstance(result, str):
-            return result.strip()
-        return ""
+            text = str(result.get("text", "")).strip()
+        elif isinstance(result, str):
+            text = result.strip()
 
-    def _is_speech_frame(self, pcm_frame) -> bool:
+        if not text:
+            self._emit_status("Transcription empty.", "step")
+            return ""
+
+        preview = " ".join(text.split())
+        if len(preview) > 60:
+            preview = f"{preview[:57].rstrip()}..."
+        self._emit_status(f"Transcription success: {preview}", "step")
+        return text
+
+    def _is_speech_frame(self, pcm_frame, silence_threshold: float | None = None) -> bool:
         if self._vad is not None:
             try:
                 return bool(self._vad.is_speech(pcm_frame.tobytes(), self.SAMPLE_RATE))
@@ -576,4 +650,5 @@ class VocoVoice:
                 self._emit_status("webrtcvad failed, switched to silence heuristic VAD.", "degraded")
 
         amplitude = float(np.abs(pcm_frame.astype(np.int32)).mean()) / 32768.0
-        return amplitude >= self.SILENCE_THRESHOLD
+        threshold = self.SILENCE_THRESHOLD if silence_threshold is None else silence_threshold
+        return amplitude >= threshold
