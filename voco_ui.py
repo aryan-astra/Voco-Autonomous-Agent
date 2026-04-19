@@ -16,9 +16,6 @@ from orchestrator import run as orchestrator_run, start_fs_watcher, stop_fs_watc
 
 
 _agent_context = AgentContext()
-_MODEL_META_LABEL = f"{OLLAMA_MODEL} • Local LLM"
-
-
 class VocoApp(App):
     """Modern minimalist VOCO dashboard mockup."""
 
@@ -241,7 +238,8 @@ class VocoApp(App):
                         with Vertical(id="left-column"):
                             yield Label("Welcome back, Developer!", classes="welcome")
                             yield Static(self.MASCOT_FRAMES[0], id="mascot")
-                            yield Label(_MODEL_META_LABEL, classes="meta")
+                            yield Label(f"Text model: {OLLAMA_MODEL}", id="text-model", classes="meta")
+                            yield Label("Voice model: probing...", id="voice-model", classes="meta")
                             yield Label("/workspace/voco/apps", classes="meta")
                             yield Label("Voice: OFF (direct mode default)", id="voice-status")
 
@@ -274,6 +272,7 @@ class VocoApp(App):
         # Border title is set at runtime to keep string formatting explicit.
         self.query_one("#dashboard", Container).border_title = " VOCO v1.0.0 "
         self.query_one("#command-input", Input).focus()
+        self._set_text_model_indicator(OLLAMA_MODEL)
         self.set_interval(1.2, self._animate_mascot)
         self._fs_watcher_observer = start_fs_watcher()
         if not self._worker_thread.is_alive():
@@ -366,7 +365,10 @@ class VocoApp(App):
             await asyncio.sleep(0.15)
             chat_log.write(Text("[VOCO] Workspace", style="#C96B45"))
             chat_log.write(Text("  Root   /workspace/voco/apps", style="#D4D4D4"))
-            chat_log.write(Text(f"  Model  {_MODEL_META_LABEL}", style="#D4D4D4"))
+            text_model = str(self.query_one("#text-model", Label).renderable).replace("Text model:", "").strip()
+            voice_model = str(self.query_one("#voice-model", Label).renderable).replace("Voice model:", "").strip()
+            chat_log.write(Text(f"  Text   {text_model}", style="#D4D4D4"))
+            chat_log.write(Text(f"  Voice  {voice_model}", style="#D4D4D4"))
             chat_log.write(Text("  Files  12 indexed  •  3 modified", style="#D4D4D4"))
             return True
 
@@ -407,6 +409,18 @@ class VocoApp(App):
         indicator.update(f"Voice: {status}{suffix}")
         indicator.styles.color = color
 
+    def _set_text_model_indicator(self, model_name: str, color: str = "#7E7E81") -> None:
+        indicator = self.query_one("#text-model", Label)
+        resolved = str(model_name or OLLAMA_MODEL).strip() or OLLAMA_MODEL
+        indicator.update(f"Text model: {resolved}")
+        indicator.styles.color = color
+
+    def _set_voice_model_indicator(self, model_name: str, color: str = "#7E7E81") -> None:
+        indicator = self.query_one("#voice-model", Label)
+        resolved = str(model_name or "unknown").strip() or "unknown"
+        indicator.update(f"Voice model: {resolved}")
+        indicator.styles.color = color
+
     def _probe_voice_runtime(self) -> None:
         try:
             from voice.wake_voice import VocoVoice
@@ -414,9 +428,13 @@ class VocoApp(App):
             dep_status = VocoVoice.startup_status()
         except Exception as exc:
             self._voice_degraded = True
+            self._set_voice_model_indicator("unavailable", "red")
             self._set_voice_status_indicator("DEGRADED", "voice unavailable", "red")
             self._update_output(f"[VOCO VOICE] Voice init probe failed: {exc}", "red")
             return
+
+        default_voice_model = str(dep_status.get("whisper_model_default", "")).strip() or "openai/whisper-medium"
+        self._set_voice_model_indicator(default_voice_model)
 
         if not dep_status["available"]:
             missing = ", ".join(str(name) for name in dep_status["missing"])
@@ -587,6 +605,7 @@ class VocoApp(App):
                 on_status_callback=lambda msg, lvl: self.call_from_thread(self._handle_voice_status_event, msg, lvl),
                 interaction_mode=VocoVoice.INTERACTION_MODE_DIRECT,
             )
+            self._set_voice_model_indicator(getattr(self._voice_agent, "_whisper_model_size", "openai/whisper-medium"))
             self._voice_agent.start()
             self._voice_enabled = True
             self._voice_degraded = getattr(self._voice_agent, "vad_mode", "") != "webrtcvad"
@@ -606,6 +625,7 @@ class VocoApp(App):
             self._voice_agent = None
             self._voice_enabled = False
             self._voice_degraded = True
+            self._set_voice_model_indicator("unavailable", "red")
             self._set_voice_status_indicator("DEGRADED", "voice unavailable", "red")
             chat_log.write(Text(f"[VOCO VOICE] Failed to start: {exc}", style="red"))
 
