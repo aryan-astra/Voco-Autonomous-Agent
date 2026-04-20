@@ -5,14 +5,17 @@ from __future__ import annotations
 import atexit
 import importlib.util
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
+from constants import DB_WAL_MODE, WATCHDOG_DEBOUNCE_SEC, WORKSPACE_PATH
+
 _USER_PROFILE_MODULE_PATH = Path(__file__).with_name("user_profile.py")
-_PROJECT_MONITOR_ROOT = Path(r"O:\Coding-proj")
-_PROFILE_FOLDERS = ("Desktop", "Documents", "Downloads")
+_PROJECT_MONITOR_ROOT = WORKSPACE_PATH.resolve()
+_PROFILE_FOLDERS = ("Desktop", "Documents")
 
 _IGNORED_DIR_NAMES = {
     ".git",
@@ -53,6 +56,7 @@ _user_profile_class_attempted = False
 _user_profile_store: object | None = None
 _user_profile_store_attempted = False
 _watcher_observer: object | None = None
+_watcher_handler: "_UserProfileWatcherHandler | None" = None
 _watcher_lock = threading.Lock()
 _atexit_registered = False
 
@@ -106,6 +110,16 @@ def _is_ignored_path(path: Path) -> bool:
         return True
     name = path.name.lower()
     if name in _IGNORED_FILE_NAMES:
+        return True
+    protected_prefixes = (
+        str(Path(os.environ.get("WINDIR", r"C:\Windows")).resolve()).lower(),
+        str(Path(r"C:\Program Files").resolve()).lower(),
+        str(Path(r"C:\Program Files (x86)").resolve()).lower(),
+        str(Path(os.environ.get("APPDATA", r"C:\Users\Default\AppData\Roaming")).resolve()).lower(),
+        str(Path(os.environ.get("LOCALAPPDATA", r"C:\Users\Default\AppData\Local")).resolve()).lower(),
+    )
+    normalized = str(path).lower()
+    if any(normalized.startswith(prefix) for prefix in protected_prefixes):
         return True
     if any(name.endswith(suffix) for suffix in _IGNORED_SUFFIXES):
         return True
@@ -183,6 +197,12 @@ class _UserProfileWatcherHandler(FileSystemEventHandler):
         self._monitored_roots = monitored_roots
         self._recent_events: dict[tuple[str, str], float] = {}
         self._recent_lock = threading.Lock()
+        self._pending_events: list[dict[str, Any]] = []
+        self._pending_lock = threading.Lock()
+        self._flush_stop = threading.Event()
+        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._flush_thread.start()
+        self._ensure_profile_wal_mode()
 
     def _is_duplicate_event(self, action: str, path: str) -> bool:
         now = time.monotonic()
@@ -190,12 +210,79 @@ class _UserProfileWatcherHandler(FileSystemEventHandler):
         with self._recent_lock:
             previous = self._recent_events.get(key)
             self._recent_events[key] = now
-            if len(self._recent_events) > 4000:
-                threshold = now - 15.0
-                self._recent_events = {
-                    item_key: item_time for item_key, item_time in self._recent_events.items() if item_time >= threshold
-                }
+            if len(self._recent_events) > 5000:
+                oldest_items = sorted(self._recent_events.items(), key=lambda item: item[1])[:4000]
+                for stale_key, _ in oldest_items:
+                    self._recent_events.pop(stale_key, None)
         return previous is not None and (now - previous) < 0.35
+
+    def _ensure_profile_wal_mode(self) -> None:
+        if not DB_WAL_MODE:
+            return
+        connect_method = getattr(self._profile, "_connect", None)
+        if not callable(connect_method):
+            return
+        try:
+            conn = connect_method()
+        except Exception:
+            return
+        try:
+            if isinstance(conn, sqlite3.Connection):
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA busy_timeout=5000;")
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _flush_loop(self) -> None:
+        debounce_sec = max(1, int(WATCHDOG_DEBOUNCE_SEC))
+        while not self._flush_stop.wait(0.5):
+            self._flush_pending_events(force=False, debounce_sec=debounce_sec)
+        self._flush_pending_events(force=True, debounce_sec=debounce_sec)
+
+    def _flush_pending_events(self, *, force: bool, debounce_sec: int) -> None:
+        cutoff = time.monotonic() - debounce_sec
+        with self._pending_lock:
+            if not self._pending_events:
+                return
+            if not force:
+                ready_count = 0
+                for payload in self._pending_events:
+                    if float(payload.get("queued_at", 0.0)) <= cutoff:
+                        ready_count += 1
+                    else:
+                        break
+                if ready_count == 0:
+                    return
+                ready = self._pending_events[:ready_count]
+                self._pending_events = self._pending_events[ready_count:]
+            else:
+                ready = self._pending_events
+                self._pending_events = []
+
+        record_method = getattr(self._profile, "record_file_activity", None)
+        if not callable(record_method):
+            return
+        for payload in ready:
+            try:
+                record_method(
+                    path=str(payload["path"]),
+                    action=str(payload["action"]),
+                    tool_name="watchdog.fs_watcher",
+                    status="observed",
+                    metadata=dict(payload["metadata"]),
+                )
+            except Exception:
+                continue
+
+    def close(self) -> None:
+        self._flush_stop.set()
+        if self._flush_thread.is_alive():
+            self._flush_thread.join(timeout=2)
 
     def _record_activity(self, path_value: str | Path | None, action: str, metadata: dict[str, Any] | None = None) -> None:
         normalized_path = _normalize_path(path_value)
@@ -210,23 +297,18 @@ class _UserProfileWatcherHandler(FileSystemEventHandler):
         if self._is_duplicate_event(action, path_text):
             return
 
-        record_method = getattr(self._profile, "record_file_activity", None)
-        if not callable(record_method):
-            return
-
         payload = {"source": "watchdog"}
         if isinstance(metadata, dict):
             payload.update(metadata)
-        try:
-            record_method(
-                path=path_text,
-                action=action,
-                tool_name="watchdog.fs_watcher",
-                status="observed",
-                metadata=payload,
+        with self._pending_lock:
+            self._pending_events.append(
+                {
+                    "path": path_text,
+                    "action": action,
+                    "metadata": payload,
+                    "queued_at": time.monotonic(),
+                }
             )
-        except Exception:
-            return
 
     def on_created(self, event: FileSystemEvent) -> None:
         if getattr(event, "is_directory", False):
@@ -252,7 +334,7 @@ class _UserProfileWatcherHandler(FileSystemEventHandler):
 
 
 def start_filesystem_watcher() -> object | None:
-    global _watcher_observer, _atexit_registered
+    global _watcher_observer, _watcher_handler, _atexit_registered
     if Observer is None:
         return None
 
@@ -290,6 +372,7 @@ def start_filesystem_watcher() -> object | None:
             return None
 
         _watcher_observer = observer
+        _watcher_handler = handler
         if not _atexit_registered:
             atexit.register(stop_filesystem_watcher)
             _atexit_registered = True
@@ -297,7 +380,14 @@ def start_filesystem_watcher() -> object | None:
 
 
 def stop_filesystem_watcher(observer: object | None = None) -> None:
-    global _watcher_observer
+    global _watcher_observer, _watcher_handler
+    if _watcher_handler is not None:
+        try:
+            _watcher_handler.close()
+        except Exception:
+            pass
+        _watcher_handler = None
+
     target = observer if observer is not None else _watcher_observer
     if target is None:
         return

@@ -1,0 +1,15 @@
+numpy==2.2.6
+playwright==1.51.0
+pyautogui==0.9.54
+PyGetWindow==0.0.9
+pywinauto==0.6.9
+PyYAML==6.0.2
+requests==2.32.3
+rich==13.9.4
+scikit-learn==1.6.1
+sounddevice==0.5.1
+textual==1.0.0
+torch==2.6.0
+transformers==4.51.3
+watchdog==6.0.0
+WMI==1.5.1

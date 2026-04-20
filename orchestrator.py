@@ -14,10 +14,11 @@ import os
 import re
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 from constants import (
+    CONTEXT_PRUNE_THRESHOLD,
     FORMAT_FAILURE_LOG,
+    HUMAN_APPROVAL_DISABLED,
     MAX_RETRIES,
     MAX_STEPS,
     OLLAMA_MODEL,
@@ -36,13 +37,13 @@ from llm import (
 )
 from memory import SecureMemoryError, append_context_entry, append_event, append_memory
 from router import predict_route
-from tools import TOOL_REGISTRY, dispatch_tool, tool_requires_approval
+from tools import TOOL_REGISTRY, dispatch_tool
 from _prompt import build_correction_prompt, build_system_prompt, parse_response
 
 
 _MINIMAL_CONTEXT_MAX_CHARS = 2200
 _DEFAULT_TOOL_RESULT_SUMMARY_TOKENS = 120
-_CONTEXT_COMPACTION_FAST_THRESHOLD = 0.85
+_CONTEXT_COMPACTION_FAST_THRESHOLD = CONTEXT_PRUNE_THRESHOLD
 _CONTEXT_COMPACTION_MASK_THRESHOLD = 0.90
 _CONTEXT_COMPACTION_FULL_THRESHOLD = 0.99
 
@@ -114,6 +115,21 @@ def _estimate_text_size(value: object) -> int:
 def _estimate_tokens(value: object) -> int:
     chars = max(0, _estimate_text_size(value))
     return max(1, (chars + 3) // 4)
+
+
+def _prune_context(context: AgentContext, max_tokens: int = 1500) -> str:
+    history = context.history[-3:] if isinstance(context.history, list) else []
+    memory = context.memory if isinstance(context.memory, dict) else {}
+    summary = json.dumps(
+        {
+            "history": history,
+            "memory": {k: str(v)[:120] for k, v in memory.items()},
+        },
+        ensure_ascii=False,
+    )
+    if len(summary) > max_tokens:
+        summary = summary[:max_tokens] + "..."
+    return summary
 
 
 def _context_compaction_stage(ratio: float) -> str:
@@ -389,6 +405,8 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
     raw_response = ""
     _ensure_fs_watcher_started()
     _record_user_profile_task(task=task)
+    if HUMAN_APPROVAL_DISABLED:
+        emit("[VOCO] Autonomous mode active: human approval prompts are disabled.", "info")
 
     tool_first_bundle = _build_tool_first_hybrid_plan(task=task, context=context, emit=emit)
     local_plan = _build_local_fastpath_plan(task) if tool_first_bundle is None else None
@@ -494,7 +512,13 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
             return error_msg
 
         emit("[VOCO] Generating conversational response...", "info")
-        conversation_ok, conversation_reply = generate_conversation(user_message=task)
+        conversation_context = _prune_context(context=context)
+        conversation_prompt = (
+            f"{task}\n\nPruned execution context:\n{conversation_context}"
+            if conversation_context
+            else task
+        )
+        conversation_ok, conversation_reply = generate_conversation(user_message=conversation_prompt)
         model_used = get_last_model_used()
         emit(f"[VOCO] Model selected: {model_used} (num_ctx={get_last_num_ctx_used()})", "info")
         elapsed = round(time.time() - start_time, 1)
@@ -566,12 +590,18 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
 
         emit("[VOCO] Building context...", "info")
         system_prompt = build_system_prompt(context)
+        pruned_context = _prune_context(context=context)
         planning_context, memory_summary, compaction_meta = _build_compacted_context(
             context=context,
             task=task,
             step="Generate a deterministic execution plan for the full task.",
             last_result=context.tool_results[-1].get("result") if context.tool_results else None,
             target_ctx_tokens=OLLAMA_NUM_CTX_COMPLEX,
+        )
+        planning_context = (
+            f"{planning_context}\n\nPruned execution context:\n{pruned_context}"
+            if pruned_context
+            else planning_context
         )
         if compaction_meta["stage"] != "normal":
             emit(
@@ -605,6 +635,8 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 max_chars=int(compaction_meta["profile"]["max_chars"]),
                 last_result_max_tokens=int(compaction_meta["profile"]["last_result_tokens"]),
             )
+            if pruned_context:
+                correction_context = f"{correction_context}\n\nPruned execution context:\n{pruned_context}"
             correction_messages = [
                 {"role": "user", "content": correction_context},
                 {"role": "assistant", "content": _safe_json_dumps(summarize_tool_result(correction_signal, 90))},
@@ -688,7 +720,6 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                     tool_args=dict(tool_args),
                     context=context,
                 )
-                requires_approval = tool_requires_approval(tool_name)
                 policy_allowed, policy_error_code, policy_reason = _evaluate_autonomy_policy(
                     tool_name=tool_name,
                     tool_args=tool_args,
@@ -704,7 +735,7 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                     if simulation_error_code:
                         policy_error_code = simulation_error_code
                 if policy_allowed:
-                    rollback_snapshot = _capture_rollback_snapshot(tool_name=tool_name, tool_args=tool_args)
+                    rollback_snapshot = _capture_file_rollback(tool_name=tool_name, tool_args=tool_args)
 
             if not isinstance(tool_args, dict):
                 result = {"status": "error", "result": None, "message": "Step args must be an object."}
@@ -726,7 +757,7 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 result = dispatch_tool(tool_name, tool_args)
                 status = str(result.get("status", "")).strip().lower()
                 if status != "success":
-                    rolled_back, rollback_message = _rollback_from_snapshot(rollback_snapshot)
+                    rolled_back, rollback_message = _rollback_file(rollback_snapshot)
                     if rollback_message:
                         result_message = _normalize_whitespace(str(result.get("message", "")))
                         if rolled_back:
@@ -765,11 +796,11 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
 
         for attempt_number in range(1, max_step_retries + 2):
             if attempt_number > 1:
-                rollback_snapshot = _capture_rollback_snapshot(tool_name=tool_name, tool_args=tool_args)
+                rollback_snapshot = _capture_file_rollback(tool_name=tool_name, tool_args=tool_args)
                 result = dispatch_tool(tool_name, tool_args)
                 status = str(result.get("status", "")).strip().lower()
                 if status != "success":
-                    _, rollback_message = _rollback_from_snapshot(rollback_snapshot)
+                    _, rollback_message = _rollback_file(rollback_snapshot)
                     if rollback_message:
                         result_message = _normalize_whitespace(str(result.get("message", "")))
                         result["message"] = f"{result_message} {rollback_message}".strip()
@@ -1015,7 +1046,7 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
             final_output = result["message"]
             emit(f"  FAIL {result['message']}", "error")
             execution_failed = True
-            break
+            continue
 
         final_output = result["message"]
         emit(f"  ERR {result['message']}", "error")
@@ -1133,25 +1164,14 @@ def _get_tool_access_level(tool_name: str) -> str:
 
 
 _POLICY_DENY_ERROR_CODE = "POLICY_DENIED"
-_AUTONOMY_BLOCKED_TOOLS = {
-    "disable_usb_device",
-    "add_firewall_rule",
-    "kill_process",
-}
+_AUTONOMY_DENIED_TOOLS = {"disable_usb_device", "kill_process", "run_shell_command"}
 _AUTONOMY_ALLOWED_COMMAND_PREFIXES = (
-    "nmap ",
-    "ping ",
-    "tracert ",
-    "nslookup ",
-    "curl ",
-    "curl.exe ",
+    "nmap",
+    "ping",
+    "curl",
     "ipconfig",
-    "netstat",
-    "whoami",
     "systeminfo",
     "tasklist",
-    "get-process",
-    "get-service",
     "get-date",
 )
 _AUTONOMY_BLOCKED_COMMAND_PATTERNS = (
@@ -1170,7 +1190,6 @@ _AUTONOMY_BLOCKED_COMMAND_PATTERNS = (
     r"\binvoke-expression\b",
     r"\biwr\b.*\|\s*iex\b",
 )
-_AUTONOMY_ALLOWED_URL_SCHEMES = {"http", "https"}
 _AUTONOMY_ALLOWED_NETWORK_HOSTS = {
     "localhost",
     "127.0.0.1",
@@ -1198,47 +1217,16 @@ def _extract_command_text(tool_args: dict) -> str:
     return _normalize_whitespace(str(raw or ""))
 
 
-def _command_allowed_by_policy(command_text: str) -> tuple[bool, str]:
-    text = command_text.lower().strip()
-    if not text:
-        return False, "Command text is empty."
-    for pattern in _AUTONOMY_BLOCKED_COMMAND_PATTERNS:
-        if re.search(pattern, text):
-            return False, f"Command blocked by policy pattern: {pattern}"
-    if any(text.startswith(prefix) for prefix in _AUTONOMY_ALLOWED_COMMAND_PREFIXES):
-        return True, "Command allowed by deterministic prefix policy."
-    return False, "Command is outside the deterministic allowlist for autonomous execution."
-
-
-def _url_allowed_by_policy(url_text: str) -> tuple[bool, str]:
-    candidate = _normalize_whitespace(url_text)
-    if not candidate:
-        return False, "URL is required for browser navigation."
-    parsed = urlparse(candidate)
-    scheme = str(parsed.scheme or "").lower()
-    host = str(parsed.netloc or "").strip()
-    if scheme not in _AUTONOMY_ALLOWED_URL_SCHEMES:
-        return False, "Only http/https browser navigation is allowed."
-    if not host:
-        return False, "Browser navigation URL must include a host."
-    return True, "Navigation URL allowed by deterministic scheme/host checks."
-
-
 def _evaluate_autonomy_policy(tool_name: str, tool_args: dict) -> tuple[bool, str, str]:
     normalized_tool = str(tool_name or "").strip()
-    if normalized_tool in _AUTONOMY_BLOCKED_TOOLS:
-        return False, _POLICY_DENY_ERROR_CODE, f"Tool '{normalized_tool}' is blocked in autonomous mode."
+    if normalized_tool in _AUTONOMY_DENIED_TOOLS:
+        return False, _POLICY_DENY_ERROR_CODE, f"Tool {normalized_tool} blocked in autonomous mode"
 
-    if normalized_tool in {"run_command", "run_powershell_command", "run_shell_command"}:
-        allowed, reason = _command_allowed_by_policy(_extract_command_text(tool_args))
-        return allowed, (_POLICY_DENY_ERROR_CODE if not allowed else ""), reason
-
-    if normalized_tool == "browser_navigate":
-        url_value = str(tool_args.get("url", "")).strip()
-        allowed, reason = _url_allowed_by_policy(url_value)
-        return allowed, (_POLICY_DENY_ERROR_CODE if not allowed else ""), reason
-
-    return True, "", "Action allowed by deterministic autonomy policy."
+    if normalized_tool in {"run_command", "run_powershell_command"}:
+        command_text = _extract_command_text(tool_args).lower().strip()
+        if not any(command_text.startswith(prefix) for prefix in _AUTONOMY_ALLOWED_COMMAND_PREFIXES):
+            return False, _POLICY_DENY_ERROR_CODE, "Command not in allowlist"
+    return True, "", "Autonomous execution approved by deterministic policy"
 
 
 def _is_private_ipv4(value: str) -> bool:
@@ -1323,7 +1311,7 @@ def _validate_simulated_side_effects(
     return True, "", "Dry-run side-effect checks passed.", simulation
 
 
-def _capture_rollback_snapshot(tool_name: str, tool_args: dict) -> dict | None:
+def _capture_file_rollback(tool_name: str, tool_args: dict) -> dict | None:
     path: Path | None = None
     if tool_name == "write_file":
         raw_path = str(tool_args.get("path", "")).strip()
@@ -1360,7 +1348,7 @@ def _capture_rollback_snapshot(tool_name: str, tool_args: dict) -> dict | None:
     }
 
 
-def _rollback_from_snapshot(snapshot: dict | None) -> tuple[bool, str]:
+def _rollback_file(snapshot: dict | None) -> tuple[bool, str]:
     if not isinstance(snapshot, dict):
         return False, ""
 
@@ -1382,6 +1370,14 @@ def _rollback_from_snapshot(snapshot: dict | None) -> tuple[bool, str]:
         return True, "Rollback check completed (no file changes to revert)."
     except Exception as exc:
         return False, f"Rollback failed for '{target}': {exc}"
+
+
+def _capture_rollback_snapshot(tool_name: str, tool_args: dict) -> dict | None:
+    return _capture_file_rollback(tool_name=tool_name, tool_args=tool_args)
+
+
+def _rollback_from_snapshot(snapshot: dict | None) -> tuple[bool, str]:
+    return _rollback_file(snapshot=snapshot)
 
 
 def _build_policy_metadata(
@@ -1601,7 +1597,7 @@ def _resolve_click_from_state(click_step: dict, state_result: dict) -> dict:
 
 
 def _plan_single_step_with_llm(step_task: str, context: AgentContext) -> dict:
-    """Use Gemma as per-step fallback planner for unresolved atomic steps."""
+    """Use configured qwen planner as per-step fallback for unresolved atomic steps."""
     system_prompt = build_system_prompt(context)
     last_result = None
     if context.tool_results:
@@ -1615,6 +1611,9 @@ def _plan_single_step_with_llm(step_task: str, context: AgentContext) -> dict:
         last_result=last_result,
         target_ctx_tokens=OLLAMA_NUM_CTX_SIMPLE,
     )
+    pruned_context = _prune_context(context=context)
+    if pruned_context:
+        step_context = f"{step_context}\n\nPruned execution context:\n{pruned_context}"
     raw_response = generate(system_prompt=system_prompt, user_message=step_context)
     model_used = get_last_model_used()
     status, plan = parse_response(raw_response)
@@ -1636,6 +1635,8 @@ def _plan_single_step_with_llm(step_task: str, context: AgentContext) -> dict:
             max_chars=int(compaction_meta["profile"]["max_chars"]),
             last_result_max_tokens=int(compaction_meta["profile"]["last_result_tokens"]),
         )
+        if pruned_context:
+            correction_context = f"{correction_context}\n\nPruned execution context:\n{pruned_context}"
         correction_messages = [
             {"role": "user", "content": correction_context},
             {"role": "assistant", "content": _safe_json_dumps(summarize_tool_result(correction_signal, 80))},
@@ -1898,7 +1899,7 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
     2) route each step via ML router
     3) execute direct tool for high-confidence routes
     4) fallback to local fast-path
-    5) fallback unresolved steps to Gemma planner
+    5) fallback unresolved steps to qwen planner
     """
     normalized_task = task
     typo_corrections: list[dict[str, str]] = []
@@ -2145,13 +2146,13 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
             return _finalize_bundle(
                 confidence=0.82,
                 error=(
-                    "Tool-first decomposition found unresolved steps but Gemma fallback is unavailable. "
+                    f"Tool-first decomposition found unresolved steps but {OLLAMA_MODEL} fallback is unavailable. "
                     f"Run: ollama serve && ollama pull {OLLAMA_MODEL}"
                 ),
             )
 
         for unresolved in unresolved_steps:
-            emit(f"[VOCO] Router uncertain for step, using Gemma fallback: {unresolved}", "info")
+            emit(f"[VOCO] Router uncertain for step, using {OLLAMA_MODEL} fallback: {unresolved}", "info")
             llm_step = _plan_single_step_with_llm(step_task=unresolved, context=context)
             format_failures += int(llm_step.get("format_failures", 0))
             plan_retries += int(llm_step.get("retries", 0))
@@ -2162,7 +2163,7 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
             if not bool(llm_step.get("ok")):
                 return _finalize_bundle(
                     confidence=0.8,
-                    error=str(llm_step.get("error", "Gemma fallback step planning failed.")),
+                    error=str(llm_step.get("error", f"{OLLAMA_MODEL} fallback step planning failed.")),
                 )
 
             for llm_plan_step in llm_step.get("plan", []):
@@ -3248,7 +3249,7 @@ def _build_action_trace(steps: list[dict] | None, tool_results: list[dict] | Non
         if not isinstance(args, dict):
             args = {}
         reason = str(step.get("reason", "")).strip()
-        requires_approval = bool(step.get("requires_approval")) or tool_requires_approval(tool_name)
+        requires_approval = False
         human_approved = bool(step.get("human_approved"))
         step_policy = _sanitize_policy_metadata(step.get("policy"))
         step_retry = _sanitize_retry_metadata(step.get("retry"))

@@ -8,9 +8,9 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Footer, Input, Label, RichLog, Rule, Static
+from textual.widgets import Footer, Input, Label, RichLog, Rule, Static, Tree
 
-from constants import OLLAMA_MODEL
+import constants
 from context import AgentContext
 from orchestrator import run as orchestrator_run, start_fs_watcher, stop_fs_watcher
 
@@ -23,7 +23,7 @@ class VocoApp(App):
     SUB_TITLE = "Autonomous Agent Prototype"
 
     BINDINGS = [
-        Binding("ctrl+g", "voice_toggle", "Voice", show=True, priority=True),
+        Binding("c", "clear_log", "Clear", show=True),
         Binding("q", "quit", "Quit", show=True),
     ]
 
@@ -121,6 +121,14 @@ class VocoApp(App):
     #right-column Rule {
         color: #C96B45;
         margin: 0 0 1 0;
+    }
+
+    #task-tree {
+        width: 100%;
+        height: 1fr;
+        color: #D4D4D4;
+        border: dashed #3A3A3A;
+        padding: 0 1;
     }
 
     .section-title {
@@ -239,22 +247,15 @@ class VocoApp(App):
                         with Vertical(id="left-column"):
                             yield Label("Welcome back, Developer!", classes="welcome")
                             yield Static(self.MASCOT_FRAMES[0], id="mascot")
-                            yield Label(f"Text model: {OLLAMA_MODEL}", id="text-model", classes="meta")
+                            yield Label(f"Text model: {constants.OLLAMA_MODEL}", id="text-model", classes="meta")
                             yield Label("Voice model: probing...", id="voice-model", classes="meta")
                             yield Label("/workspace/voco/apps", classes="meta")
                             yield Label("Voice: OFF (PTT default)", id="voice-status")
 
                         # Right activity/information column.
                         with Vertical(id="right-column"):
-                            yield Label("Recent activity", classes="section-title")
-                            yield Label("[#7E7E81]1m ago[/]  Updated system memory", classes="item")
-                            yield Label("[#7E7E81]4m ago[/]  Synced local toolchain", classes="item")
-                            yield Label("[#7E7E81]9m ago[/]  Indexed workspace files", classes="item")
-                            yield Rule()
-                            yield Label("What's new", classes="section-title")
-                            yield Label("/agents  — spawn sub-agents", classes="item")
-                            yield Label("/help    — list all commands", classes="item")
-                            yield Label("/workspace — view workspace", classes="item")
+                            yield Label("Task Progress", classes="section-title")
+                            yield Tree("Task Progress", id="task-tree")
 
                 # Conversation log remains visible and scrollable under dashboard.
                 with Container(id="conversation"):
@@ -265,7 +266,7 @@ class VocoApp(App):
             with Horizontal(id="prompt-row"):
                 yield Label(">", id="prompt-prefix")
                 yield Input(placeholder='Try "edit <filepath> to ..."', id="command-input")
-                yield Label("^G Voice   Space PTT   Q Quit", id="hotkeys-inline")
+                yield Label("Space PTT   C Clear   Q Quit", id="hotkeys-inline")
 
             yield Footer()
 
@@ -273,12 +274,14 @@ class VocoApp(App):
         # Border title is set at runtime to keep string formatting explicit.
         self.query_one("#dashboard", Container).border_title = " VOCO v1.0.0 "
         self.query_one("#command-input", Input).focus()
-        self._set_text_model_indicator(OLLAMA_MODEL)
+        self._set_text_model_indicator(constants.OLLAMA_MODEL)
         self.set_interval(1.2, self._animate_mascot)
         self._fs_watcher_observer = start_fs_watcher()
         if not self._worker_thread.is_alive():
             self._worker_thread.start()
         self._probe_voice_runtime()
+        self.action_voice_toggle()
+        print("[VOCO REFACTOR COMPLETE]")
 
     def on_unmount(self) -> None:
         self._worker_stop.set()
@@ -320,8 +323,8 @@ class VocoApp(App):
         chat_log.write(Text("  /resume           Continue last workflow", style="#D4D4D4"))
         chat_log.write(Text("  /index            Build full file index", style="#D4D4D4"))
         chat_log.write(Text("  /index-app        Build installed app index", style="#D4D4D4"))
-        chat_log.write(Text("  Ctrl+G            Toggle voice (push-to-talk default)", style="#D4D4D4"))
-        chat_log.write(Text("  Space             Start/stop push-to-talk capture (voice ON)", style="#D4D4D4"))
+        chat_log.write(Text("  Space             Start/stop push-to-talk capture", style="#D4D4D4"))
+        chat_log.write(Text("  C                 Clear conversation log", style="#D4D4D4"))
 
     async def _handle_slash_command(self, command: str, chat_log: RichLog) -> bool:
         """Handle slash commands and return True when a command was consumed."""
@@ -397,12 +400,9 @@ class VocoApp(App):
         self._handle_user_input(command)
 
     async def on_key(self, event) -> None:
-        if event.key != "space":
-            return
-        if not self._voice_enabled or self._voice_agent is None:
-            return
-        event.stop()
-        self.action_ptt_toggle()
+        if event.key == constants.PTT_KEY and self._voice_enabled and self._voice_agent is not None:
+            event.stop()
+            self.action_ptt_toggle()
 
     def _update_output(self, message: str, style: str) -> None:
         """Write a formatted status line to the output panel."""
@@ -422,7 +422,7 @@ class VocoApp(App):
 
     def _set_text_model_indicator(self, model_name: str, color: str = "#7E7E81") -> None:
         indicator = self.query_one("#text-model", Label)
-        resolved = str(model_name or OLLAMA_MODEL).strip() or OLLAMA_MODEL
+        resolved = str(model_name or constants.OLLAMA_MODEL).strip() or constants.OLLAMA_MODEL
         indicator.update(f"Text model: {resolved}")
         indicator.styles.color = color
 
@@ -444,7 +444,7 @@ class VocoApp(App):
             self._update_output(f"[VOCO VOICE] Voice init probe failed: {exc}", "red")
             return
 
-        default_voice_model = str(dep_status.get("whisper_model_default", "")).strip() or "openai/whisper-medium"
+        default_voice_model = str(dep_status.get("whisper_model_default", "")).strip() or constants.VOICE_MODEL_ID
         self._set_voice_model_indicator(default_voice_model)
 
         if not dep_status["available"]:
@@ -460,29 +460,23 @@ class VocoApp(App):
 
         if not dep_status["runtime_ready"]:
             runtime_hint = str(dep_status.get("runtime_hint", "")).strip()
-            fallback_note = str(dep_status.get("fallback_note", "")).strip()
-            wake_model_dir = str(dep_status.get("wake_model_dir", "")).strip()
             hf_cache = str(dep_status.get("hf_cache", "")).strip()
             self._voice_degraded = True
             self._set_voice_status_indicator("DEGRADED", "check runtime cache", "red")
             runtime_error = str(dep_status.get("error", "")).strip()
-            message = "[VOCO VOICE] Wake/ASR assets not ready."
+            message = "[VOCO VOICE] ASR assets not ready."
             if runtime_hint:
                 message = f"{message} {runtime_hint}"
             elif runtime_error:
                 message = f"{message} Error: {runtime_error}"
-            if fallback_note:
-                message = f"{message} {fallback_note}"
-            if wake_model_dir:
-                message = f"{message} Wake dir: {wake_model_dir}"
-            elif hf_cache:
+            if hf_cache:
                 message = f"{message} HF cache: {hf_cache}"
             self._update_output(message, "red")
             return
 
-        if dep_status["vad_mode"] == "webrtcvad":
+        if str(dep_status.get("vad_mode", "")).strip() in {"webrtcvad", "ptt-only"}:
             self._voice_degraded = False
-            self._set_voice_status_indicator("READY", "WebRTC VAD")
+            self._set_voice_status_indicator("READY", "PTT")
             return
 
         self._voice_degraded = True
@@ -509,17 +503,17 @@ class VocoApp(App):
         if level == "ready":
             if self._voice_agent is not None and getattr(self._voice_agent, "vad_mode", "") == "webrtcvad":
                 self._voice_degraded = False
-                suffix = "PTT recording" if self._ptt_recording else "PTT + WebRTC VAD"
+                suffix = "PTT recording" if self._ptt_recording else "PTT"
                 color = "#C96B45" if self._ptt_recording else "green"
                 self._set_voice_status_indicator("ON", suffix, color)
                 return
             self._voice_degraded = True
-            self._set_voice_status_indicator("DEGRADED", "PTT + fallback VAD", "yellow")
+            self._set_voice_status_indicator("DEGRADED", "PTT degraded", "yellow")
             return
 
         if level == "degraded":
             self._voice_degraded = True
-            self._set_voice_status_indicator("DEGRADED", "PTT + fallback VAD", "yellow")
+            self._set_voice_status_indicator("DEGRADED", "PTT degraded", "yellow")
             return
 
         if level == "error":
@@ -539,6 +533,27 @@ class VocoApp(App):
             return
         self.call_from_thread(self._handle_user_input, command)
 
+    def _update_task_tree(self, context: AgentContext) -> None:
+        tree = self.query_one("#task-tree", Tree)
+        tree.clear()
+        root = tree.root
+        for idx, step in enumerate(context.decomposed_steps or [], start=1):
+            status = "pending"
+            color = "#F4C96A"
+            for res in context.tool_results:
+                if res.get("step") == idx:
+                    nested = res.get("result", {}) if isinstance(res.get("result"), dict) else {}
+                    status = str(nested.get("status", res.get("status", "unknown")))
+                    break
+            if status == "success":
+                color = "#4CAF50"
+            elif status in ("error", "failure"):
+                color = "#E53935"
+            elif status == "running":
+                color = "#29B6F6"
+            root.add(f"[{color}][Step {idx}][/color] {step}", expand=True)
+        tree.reload()
+
     def _emit_to_ui(self, message: str, level: str = "info") -> None:
         """
         Thread-safe callback used by orchestrator.run to stream progress.
@@ -554,8 +569,10 @@ class VocoApp(App):
         app_thread_id = getattr(self, "_thread_id", None)
         if app_thread_id is not None and app_thread_id == threading.get_ident():
             self._update_output(safe_message, color)
+            self._update_task_tree(_agent_context)
             return
         self.call_from_thread(self._update_output, safe_message, color)
+        self.call_from_thread(self._update_task_tree, _agent_context)
 
     def _handle_user_input(self, task: str) -> None:
         """Queue user tasks for a single persistent worker thread."""
@@ -611,7 +628,7 @@ class VocoApp(App):
         self._set_voice_status_indicator("STARTING", "push-to-talk mode")
         chat_log.write(
             Text(
-                "[VOCO VOICE] Initializing push-to-talk mode + ASR (openai/whisper-medium)...",
+                f"[VOCO VOICE] Initializing push-to-talk mode + ASR ({constants.VOICE_MODEL_ID})...",
                 style="#C96B45",
             )
         )
@@ -624,22 +641,21 @@ class VocoApp(App):
                 on_status_callback=lambda msg, lvl: self.call_from_thread(self._handle_voice_status_event, msg, lvl),
                 interaction_mode=VocoVoice.INTERACTION_MODE_PUSH_TO_TALK,
             )
-            self._set_voice_model_indicator(getattr(self._voice_agent, "_whisper_model_size", "openai/whisper-medium"))
+            self._set_voice_model_indicator(getattr(self._voice_agent, "_whisper_model_size", constants.VOICE_MODEL_ID))
             self._voice_agent.start()
             self._voice_enabled = True
             self._ptt_recording = False
             self._voice_degraded = getattr(self._voice_agent, "vad_mode", "") != "webrtcvad"
             if self._voice_degraded:
-                self._set_voice_status_indicator("DEGRADED", "PTT + fallback VAD", "yellow")
+                self._set_voice_status_indicator("DEGRADED", "PTT degraded", "yellow")
                 chat_log.write(
                     Text(
-                        "[VOCO VOICE] Started in push-to-talk mode (silence VAD fallback). "
-                        "Run: pip install webrtcvad.",
+                        "[VOCO VOICE] Started in push-to-talk mode (degraded).",
                         style="yellow",
                     )
                 )
                 return
-            self._set_voice_status_indicator("ON", "PTT + WebRTC VAD", "green")
+            self._set_voice_status_indicator("ON", "PTT", "green")
             chat_log.write(Text("[VOCO VOICE] Push-to-talk ready. Press SPACE to capture speech.", style="#C96B45"))
         except Exception as exc:
             self._voice_agent = None
@@ -653,7 +669,7 @@ class VocoApp(App):
     def action_ptt_toggle(self) -> None:
         chat_log = self._activate_conversation()
         if not self._voice_enabled or self._voice_agent is None:
-            chat_log.write(Text("[VOCO VOICE] Voice is OFF. Press Ctrl+G first.", style="yellow"))
+            chat_log.write(Text("[VOCO VOICE] Voice is OFF.", style="yellow"))
             return
 
         try:
@@ -670,9 +686,9 @@ class VocoApp(App):
             transcript = str(self._voice_agent.end_push_to_talk()).strip()
             self._ptt_recording = False
             if self._voice_degraded:
-                self._set_voice_status_indicator("DEGRADED", "PTT + fallback VAD", "yellow")
+                self._set_voice_status_indicator("DEGRADED", "PTT degraded", "yellow")
             else:
-                self._set_voice_status_indicator("ON", "PTT + WebRTC VAD", "green")
+                self._set_voice_status_indicator("ON", "PTT", "green")
 
             if not transcript:
                 chat_log.write(Text("[VOCO VOICE] No speech captured.", style="yellow"))
@@ -683,6 +699,10 @@ class VocoApp(App):
             self._ptt_recording = False
             self._set_voice_status_indicator("DEGRADED", "ptt error", "red")
             chat_log.write(Text(f"[VOCO VOICE] Push-to-talk failed: {exc}", style="red"))
+
+    def action_clear_log(self) -> None:
+        chat_log = self.query_one("#chat-log", RichLog)
+        chat_log.clear()
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ FORMAT_FAILURE_LOG = str(MEMORY_DIR / "vault" / "failures.jsonl")
 
 # ── Agent loop ────────────────────────────────────────────────────────────────
 MAX_STEPS = 8
-MAX_RETRIES = 1
+MAX_RETRIES = 2
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 OLLAMA_URL = "http://localhost:11434"
@@ -31,12 +31,13 @@ OLLAMA_HEAVY_MODEL_CANDIDATES = [
     "qwen3:4b",
 ]
 OLLAMA_NUM_CTX_SIMPLE = 2048
-OLLAMA_NUM_CTX_COMPLEX = 4096
+OLLAMA_NUM_CTX_COMPLEX = 2048
 OLLAMA_NUM_CTX_MIN = 512
 OLLAMA_NUM_CTX_CONVERSATION = 2048
 OLLAMA_CTX_FALLBACK_LEVELS = [8192, 6144, 4096, 3072, 2048, 1536, 1024, 768, 512]
-OLLAMA_REQUEST_TIMEOUT_SECONDS = 75
+OLLAMA_REQUEST_TIMEOUT_SECONDS = 120
 OLLAMA_CONVERSATION_TIMEOUT_SECONDS = 90
+OLLAMA_CPU_ONLY = True
 
 # Backward-compatible aliases
 MODEL_NAME = OLLAMA_MODEL
@@ -52,6 +53,19 @@ TASK_BUDGET = 4000
 ROUTER_CONFIDENCE_THRESHOLD = 0.75
 DEMO_INCLUDE_PROFILE_CONTEXT = False
 DEMO_INCLUDE_HISTORY_CONTEXT = False
+CONTEXT_PRUNE_THRESHOLD = 0.85
+AUTONOMY_MODE = True
+HUMAN_APPROVAL_DISABLED = True
+
+# ── Voice ──────────────────────────────────────────────────────────────────────
+PTT_KEY = "space"
+PTT_DEBOUNCE_MS = 100
+VOICE_MODEL_ID = "distil-whisper/distil-small.en"
+VOICE_PREALLOCATE_BUFFER_SEC = 30
+
+# ── Persistence/runtime ────────────────────────────────────────────────────────
+DB_WAL_MODE = True
+WATCHDOG_DEBOUNCE_SEC = 5
 
 # ── Sandbox ───────────────────────────────────────────────────────────────────
 ALLOWED_EXTENSIONS = {".py", ".txt", ".md", ".json", ".csv", ".yaml", ".yml"}

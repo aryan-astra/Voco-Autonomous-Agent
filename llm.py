@@ -1,5 +1,6 @@
 """Ollama client for VOCO JSON action-plan generation."""
 
+import gc
 import json
 import time
 
@@ -11,6 +12,7 @@ from constants import (
     OLLAMA_HEAVY_MODEL_CANDIDATES,
     OLLAMA_MODEL,
     OLLAMA_CONVERSATION_TIMEOUT_SECONDS,
+    OLLAMA_CPU_ONLY,
     OLLAMA_NUM_CTX_CONVERSATION,
     OLLAMA_NUM_CTX_COMPLEX,
     OLLAMA_NUM_CTX_MIN,
@@ -164,19 +166,19 @@ def _post_chat(
     timeout_seconds: int,
     num_predict: int | None = None,
 ) -> requests.Response:
+    options = {
+        "temperature": temperature,
+        "num_predict": 1024 if num_predict is None else num_predict,
+        "num_ctx": num_ctx,
+    }
+    if OLLAMA_CPU_ONLY:
+        options["num_gpu"] = 0
     payload = {
         "model": model_name,
         "messages": messages,
         "stream": False,
-        "options": {
-            "temperature": temperature,
-            "top_p": 0.9,
-            "repeat_penalty": 1.1,
-            "num_ctx": num_ctx,
-        },
+        "options": options,
     }
-    if num_predict is not None:
-        payload["options"]["num_predict"] = num_predict
     return requests.post(OLLAMA_CHAT_URL, json=payload, timeout=timeout_seconds)
 
 
@@ -202,14 +204,28 @@ def _generate_result_internal(
     for ctx in primary_ctx_chain:
         try:
             _last_num_ctx_used = ctx
-            response = _post_chat(
-                messages=messages,
-                model_name=selected_model,
-                temperature=temperature,
-                num_ctx=ctx,
-                timeout_seconds=timeout_seconds,
-                num_predict=num_predict,
-            )
+            try:
+                response = _post_chat(
+                    messages=messages,
+                    model_name=selected_model,
+                    temperature=temperature,
+                    num_ctx=ctx,
+                    timeout_seconds=timeout_seconds,
+                    num_predict=num_predict,
+                )
+            except requests.exceptions.Timeout:
+                retry_ctx = max(OLLAMA_NUM_CTX_MIN, ctx - 512)
+                if retry_ctx == ctx:
+                    raise
+                _last_num_ctx_used = retry_ctx
+                response = _post_chat(
+                    messages=messages,
+                    model_name=selected_model,
+                    temperature=temperature,
+                    num_ctx=retry_ctx,
+                    timeout_seconds=timeout_seconds,
+                    num_predict=num_predict,
+                )
             response.raise_for_status()
             return True, response.json()["message"]["content"]
         except requests.exceptions.ConnectionError:
@@ -237,14 +253,28 @@ def _generate_result_internal(
         for ctx in primary_ctx_chain:
             try:
                 _last_num_ctx_used = ctx
-                response = _post_chat(
-                    messages=messages,
-                    model_name=fallback_model,
-                    temperature=temperature,
-                    num_ctx=ctx,
-                    timeout_seconds=timeout_seconds,
-                    num_predict=num_predict,
-                )
+                try:
+                    response = _post_chat(
+                        messages=messages,
+                        model_name=fallback_model,
+                        temperature=temperature,
+                        num_ctx=ctx,
+                        timeout_seconds=timeout_seconds,
+                        num_predict=num_predict,
+                    )
+                except requests.exceptions.Timeout:
+                    retry_ctx = max(OLLAMA_NUM_CTX_MIN, ctx - 512)
+                    if retry_ctx == ctx:
+                        raise
+                    _last_num_ctx_used = retry_ctx
+                    response = _post_chat(
+                        messages=messages,
+                        model_name=fallback_model,
+                        temperature=temperature,
+                        num_ctx=retry_ctx,
+                        timeout_seconds=timeout_seconds,
+                        num_predict=num_predict,
+                    )
                 response.raise_for_status()
                 _last_model_used = fallback_model
                 return True, response.json()["message"]["content"]
@@ -268,14 +298,17 @@ def _generate_result_internal(
 
 def _generate_internal(messages: list[dict], user_message: str, temperature: float) -> str:
     """Generate a JSON plan response, converting transport errors into report_failure plans."""
-    success, content = _generate_result_internal(
-        messages=messages,
-        user_message=user_message,
-        temperature=temperature,
-    )
-    if success:
-        return content
-    return _failure_plan(content)
+    try:
+        success, content = _generate_result_internal(
+            messages=messages,
+            user_message=user_message,
+            temperature=temperature,
+        )
+        if success:
+            return content
+        return _failure_plan(content)
+    finally:
+        gc.collect()
 
 
 def generate(system_prompt: str, user_message: str, temperature: float = 0.1) -> str:
@@ -299,21 +332,24 @@ def generate_conversation(user_message: str, temperature: float = 0.2) -> tuple[
         "You are VOCO, a local desktop assistant. "
         "Reply naturally in plain text and keep responses concise."
     )
-    success, content = _generate_result_internal(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        user_message=user_message,
-        temperature=temperature,
-        prefer_fast=True,
-        preferred_ctx=OLLAMA_NUM_CTX_CONVERSATION,
-        timeout_seconds=OLLAMA_CONVERSATION_TIMEOUT_SECONDS,
-        num_predict=160,
-    )
-    if success and not content.strip():
-        return False, "LLM returned an empty response."
-    return success, content.strip()
+    try:
+        success, content = _generate_result_internal(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            user_message=user_message,
+            temperature=temperature,
+            prefer_fast=True,
+            preferred_ctx=OLLAMA_NUM_CTX_CONVERSATION,
+            timeout_seconds=OLLAMA_CONVERSATION_TIMEOUT_SECONDS,
+            num_predict=160,
+        )
+        if success and not content.strip():
+            return False, "LLM returned an empty response."
+        return success, content.strip()
+    finally:
+        gc.collect()
 
 
 def generate_with_history(system_prompt: str, messages: list, temperature: float = 0.05) -> str:
@@ -322,14 +358,17 @@ def generate_with_history(system_prompt: str, messages: list, temperature: float
     Used for correction retries after formatting failures.
     """
     full_messages = [{"role": "system", "content": system_prompt}] + messages
-    result = _generate_internal(
-        messages=full_messages,
-        user_message=messages[-1]["content"] if messages else "",
-        temperature=temperature,
-    )
-    if "retry failed" not in result and "\"reason\": \"connection error\"" in result:
-        return result.replace("\"reason\": \"connection error\"", "\"reason\": \"retry error\"")
-    return result
+    try:
+        result = _generate_internal(
+            messages=full_messages,
+            user_message=messages[-1]["content"] if messages else "",
+            temperature=temperature,
+        )
+        if "retry failed" not in result and "\"reason\": \"connection error\"" in result:
+            return result.replace("\"reason\": \"connection error\"", "\"reason\": \"retry error\"")
+        return result
+    finally:
+        gc.collect()
 
 
 def check_ollama_running() -> bool:
