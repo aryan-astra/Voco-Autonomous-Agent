@@ -5,7 +5,17 @@ updated-till-now.md
 __pycache__/
 *.pyc
 report.*.json
+eval_report_*.json
 workspace/screenshot_*.png
+workspace/misroute_benchmark*.json
+
+# Local memory/state artifacts
+memory/*.db
+memory/project_state.md
+
+# Local generated analysis dumps
+repomix-output.xml
+voconew.xml
 
 # Sensitive local vault runtime files
 memory/vault/*
