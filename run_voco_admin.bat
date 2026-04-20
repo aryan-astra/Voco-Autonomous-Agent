@@ -59,7 +59,7 @@ if errorlevel 1 (
 call :ensure_ollama_ready
 if errorlevel 1 exit /b 1
 
-call :ensure_voco_agent
+call :ensure_qwen3_model
 if errorlevel 1 exit /b 1
 
 call :launch_voco_ui
@@ -136,27 +136,22 @@ if %VOCO_OLLAMA_WAIT% GEQ 15 (
 timeout /t 2 /nobreak >nul
 goto :wait_for_ollama
 
-:ensure_voco_agent
-echo [VOCO][STEP] Ensuring Ollama model "voco-agent" exists...
-ollama show voco-agent >nul 2>&1
+:ensure_qwen3_model
+echo [VOCO][STEP] Ensuring Ollama model "qwen3:4b" exists...
+ollama show qwen3:4b >nul 2>&1
 if not errorlevel 1 (
-    echo [VOCO][INFO] Model "voco-agent" already exists.
+    echo [VOCO][INFO] Model "qwen3:4b" already exists.
     exit /b 0
 )
 
-if not exist "models\voco_model.Modelfile" (
-    echo [VOCO][ERROR] Missing model definition: models\voco_model.Modelfile
-    exit /b 1
-)
-
-echo [VOCO][INFO] Creating model "voco-agent" from models\voco_model.Modelfile...
-ollama create voco-agent -f models\voco_model.Modelfile
+echo [VOCO][INFO] Pulling model "qwen3:4b"...
+ollama pull qwen3:4b
 if errorlevel 1 (
-    echo [VOCO][ERROR] Failed to create model "voco-agent".
+    echo [VOCO][ERROR] Failed to pull model "qwen3:4b".
     exit /b 1
 )
 
-echo [VOCO][INFO] Model "voco-agent" is ready.
+echo [VOCO][INFO] Model "qwen3:4b" is ready.
 exit /b 0
 
 :launch_voco_ui

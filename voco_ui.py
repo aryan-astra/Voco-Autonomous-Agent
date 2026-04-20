@@ -222,6 +222,7 @@ class VocoApp(App):
         self._voice_agent = None
         self._voice_enabled = False
         self._voice_degraded = False
+        self._ptt_recording = False
         self._fs_watcher_observer = None
 
     def compose(self) -> ComposeResult:
@@ -241,7 +242,7 @@ class VocoApp(App):
                             yield Label(f"Text model: {OLLAMA_MODEL}", id="text-model", classes="meta")
                             yield Label("Voice model: probing...", id="voice-model", classes="meta")
                             yield Label("/workspace/voco/apps", classes="meta")
-                            yield Label("Voice: OFF (direct mode default)", id="voice-status")
+                            yield Label("Voice: OFF (PTT default)", id="voice-status")
 
                         # Right activity/information column.
                         with Vertical(id="right-column"):
@@ -264,7 +265,7 @@ class VocoApp(App):
             with Horizontal(id="prompt-row"):
                 yield Label(">", id="prompt-prefix")
                 yield Input(placeholder='Try "edit <filepath> to ..."', id="command-input")
-                yield Label("^G Voice   Q Quit", id="hotkeys-inline")
+                yield Label("^G Voice   Space PTT   Q Quit", id="hotkeys-inline")
 
             yield Footer()
 
@@ -294,6 +295,7 @@ class VocoApp(App):
                 pass
             self._voice_agent = None
             self._voice_enabled = False
+            self._ptt_recording = False
         self._set_voice_status_indicator("OFF")
 
     def _animate_mascot(self) -> None:
@@ -318,7 +320,8 @@ class VocoApp(App):
         chat_log.write(Text("  /resume           Continue last workflow", style="#D4D4D4"))
         chat_log.write(Text("  /index            Build full file index", style="#D4D4D4"))
         chat_log.write(Text("  /index-app        Build installed app index", style="#D4D4D4"))
-        chat_log.write(Text("  Ctrl+G            Toggle voice (direct default; wake-word optional)", style="#D4D4D4"))
+        chat_log.write(Text("  Ctrl+G            Toggle voice (push-to-talk default)", style="#D4D4D4"))
+        chat_log.write(Text("  Space             Start/stop push-to-talk capture (voice ON)", style="#D4D4D4"))
 
     async def _handle_slash_command(self, command: str, chat_log: RichLog) -> bool:
         """Handle slash commands and return True when a command was consumed."""
@@ -392,6 +395,14 @@ class VocoApp(App):
             return
 
         self._handle_user_input(command)
+
+    async def on_key(self, event) -> None:
+        if event.key != "space":
+            return
+        if not self._voice_enabled or self._voice_agent is None:
+            return
+        event.stop()
+        self.action_ptt_toggle()
 
     def _update_output(self, message: str, style: str) -> None:
         """Write a formatted status line to the output panel."""
@@ -479,7 +490,7 @@ class VocoApp(App):
         vad_install_hint = str(dep_status.get("vad_install_hint", "pip install webrtcvad")).strip()
         self._update_output(
             (
-                "[VOCO VOICE] webrtcvad missing. Direct mode active with silence-heuristic VAD fallback. "
+                "[VOCO VOICE] webrtcvad missing. Push-to-talk mode active with silence-heuristic VAD fallback. "
                 f"Run: {vad_install_hint}"
             ),
             "yellow",
@@ -498,15 +509,17 @@ class VocoApp(App):
         if level == "ready":
             if self._voice_agent is not None and getattr(self._voice_agent, "vad_mode", "") == "webrtcvad":
                 self._voice_degraded = False
-                self._set_voice_status_indicator("ON", "WebRTC VAD", "green")
+                suffix = "PTT recording" if self._ptt_recording else "PTT + WebRTC VAD"
+                color = "#C96B45" if self._ptt_recording else "green"
+                self._set_voice_status_indicator("ON", suffix, color)
                 return
             self._voice_degraded = True
-            self._set_voice_status_indicator("DEGRADED", "fallback VAD", "yellow")
+            self._set_voice_status_indicator("DEGRADED", "PTT + fallback VAD", "yellow")
             return
 
         if level == "degraded":
             self._voice_degraded = True
-            self._set_voice_status_indicator("DEGRADED", "fallback VAD", "yellow")
+            self._set_voice_status_indicator("DEGRADED", "PTT + fallback VAD", "yellow")
             return
 
         if level == "error":
@@ -577,6 +590,12 @@ class VocoApp(App):
     def action_voice_toggle(self) -> None:
         chat_log = self._activate_conversation()
         if self._voice_enabled and self._voice_agent is not None:
+            if self._ptt_recording:
+                try:
+                    self._voice_agent.end_push_to_talk()
+                except Exception:
+                    pass
+                self._ptt_recording = False
             try:
                 self._voice_agent.stop()
             except Exception as exc:
@@ -585,14 +604,14 @@ class VocoApp(App):
             self._voice_enabled = False
             self._voice_agent = None
             self._voice_degraded = False
-            self._set_voice_status_indicator("OFF")
+            self._set_voice_status_indicator("OFF", "PTT default")
             chat_log.write(Text("[VOCO VOICE] Stopped.", style="#C96B45"))
             return
 
-        self._set_voice_status_indicator("STARTING", "direct mode")
+        self._set_voice_status_indicator("STARTING", "push-to-talk mode")
         chat_log.write(
             Text(
-                "[VOCO VOICE] Initializing direct command mode + ASR (openai/whisper-medium)...",
+                "[VOCO VOICE] Initializing push-to-talk mode + ASR (openai/whisper-medium)...",
                 style="#C96B45",
             )
         )
@@ -603,31 +622,67 @@ class VocoApp(App):
             self._voice_agent = VocoVoice(
                 on_command_callback=self._queue_voice_command,
                 on_status_callback=lambda msg, lvl: self.call_from_thread(self._handle_voice_status_event, msg, lvl),
-                interaction_mode=VocoVoice.INTERACTION_MODE_DIRECT,
+                interaction_mode=VocoVoice.INTERACTION_MODE_PUSH_TO_TALK,
             )
             self._set_voice_model_indicator(getattr(self._voice_agent, "_whisper_model_size", "openai/whisper-medium"))
             self._voice_agent.start()
             self._voice_enabled = True
+            self._ptt_recording = False
             self._voice_degraded = getattr(self._voice_agent, "vad_mode", "") != "webrtcvad"
             if self._voice_degraded:
-                self._set_voice_status_indicator("DEGRADED", "fallback VAD", "yellow")
+                self._set_voice_status_indicator("DEGRADED", "PTT + fallback VAD", "yellow")
                 chat_log.write(
                     Text(
-                        "[VOCO VOICE] Started in direct mode (silence VAD fallback). "
-                        "Run: pip install webrtcvad. Wake-word mode is optional.",
+                        "[VOCO VOICE] Started in push-to-talk mode (silence VAD fallback). "
+                        "Run: pip install webrtcvad.",
                         style="yellow",
                     )
                 )
                 return
-            self._set_voice_status_indicator("ON", "WebRTC VAD", "green")
-            chat_log.write(Text("[VOCO VOICE] Direct command listener started. Wake-word mode is optional.", style="#C96B45"))
+            self._set_voice_status_indicator("ON", "PTT + WebRTC VAD", "green")
+            chat_log.write(Text("[VOCO VOICE] Push-to-talk ready. Press SPACE to capture speech.", style="#C96B45"))
         except Exception as exc:
             self._voice_agent = None
             self._voice_enabled = False
             self._voice_degraded = True
+            self._ptt_recording = False
             self._set_voice_model_indicator("unavailable", "red")
             self._set_voice_status_indicator("DEGRADED", "voice unavailable", "red")
             chat_log.write(Text(f"[VOCO VOICE] Failed to start: {exc}", style="red"))
+
+    def action_ptt_toggle(self) -> None:
+        chat_log = self._activate_conversation()
+        if not self._voice_enabled or self._voice_agent is None:
+            chat_log.write(Text("[VOCO VOICE] Voice is OFF. Press Ctrl+G first.", style="yellow"))
+            return
+
+        try:
+            if not self._ptt_recording:
+                started = bool(self._voice_agent.begin_push_to_talk())
+                if not started:
+                    chat_log.write(Text("[VOCO VOICE] Push-to-talk start failed.", style="red"))
+                    return
+                self._ptt_recording = True
+                self._set_voice_status_indicator("LISTENING", "PTT recording", "#C96B45")
+                chat_log.write(Text("[VOCO VOICE] Recording... press SPACE again to transcribe.", style="#C96B45"))
+                return
+
+            transcript = str(self._voice_agent.end_push_to_talk()).strip()
+            self._ptt_recording = False
+            if self._voice_degraded:
+                self._set_voice_status_indicator("DEGRADED", "PTT + fallback VAD", "yellow")
+            else:
+                self._set_voice_status_indicator("ON", "PTT + WebRTC VAD", "green")
+
+            if not transcript:
+                chat_log.write(Text("[VOCO VOICE] No speech captured.", style="yellow"))
+                return
+            chat_log.write(Text(f"[VOCO VOICE] {transcript}", style="#D4D4D4"))
+            self._queue_voice_command(transcript)
+        except Exception as exc:
+            self._ptt_recording = False
+            self._set_voice_status_indicator("DEGRADED", "ptt error", "red")
+            chat_log.write(Text(f"[VOCO VOICE] Push-to-talk failed: {exc}", style="red"))
 
 
 if __name__ == "__main__":

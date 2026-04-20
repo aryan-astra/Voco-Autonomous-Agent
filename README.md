@@ -38,7 +38,7 @@ VOCO has 3 main parts:
 
 We implemented the full Phase-1 build and major fixes:
 
-- Gemma/Ollama chat integration
+- Qwen/Ollama chat integration
 - JSON action-plan parser flow
 - Windows tool registry (browser + OS + file + profile tools)
 - TUI wired to real orchestrator in background thread
@@ -47,7 +47,7 @@ We implemented the full Phase-1 build and major fixes:
 - Better UI logging (fixed garbled `[voco]` style output)
 - Better LLM error messages for HTTP 500 / timeout
 - **Local fast-path** for basic commands (`mute`, `un-mute`, screenshot, running apps)
-- **Single-model pinning** to `voco-agent` with adaptive context fallback
+- **Single-model pinning** to `qwen3:4b` with adaptive context fallback
 - **Closed-loop browser tools** (`browser_navigate`, `browser_get_state`, `browser_type`, `browser_click`, `browser_press_key`)
 - **Stress browser suite** (`browser_stress_50_sites`) with deterministic per-site retries/timeouts + telemetry (opens each site in a separate tab by default)
 - **YouTube comment export pipeline** (`youtube_comment_pipeline`) with play/pause/comment extraction + Desktop `.txt` save
@@ -55,8 +55,8 @@ We implemented the full Phase-1 build and major fixes:
 - **Desktop UI automation tools** (`get_window_state`, `click_in_window`)
 - **Existing document opener** (`open_existing_document`) for opening already-present PDF/PPT/PPTX files from your PC
 - **Index-backed local search** (`index_files`, `index_apps`, `search_file`) with `/index` and `/index-app`
-- **Approval-gated system tools** (`run_command`, `disable_usb_device`, `add_firewall_rule`)
-- **Wake-word voice pipeline module** at `voice/wake_voice.py` (optional dependencies)
+- **Deterministic policy-guarded system tools** (`run_command`, `disable_usb_device`, `add_firewall_rule`)
+- **Voice pipeline module** at `voice/wake_voice.py` with push-to-talk and optional wake-word modes
 
 ---
 
@@ -80,14 +80,14 @@ Examples:
 - `create benchmark_codegen.py and run web codegen autofix`
 - `open file explorer and find for AIOT-content folder`
 - `open notepad and click file`
-- `run command Get-Date` (requires explicit approval phrase)
+- `run command Get-Date` (subject to deterministic autonomous policy checks)
 
 ### 2) Tool-first decomposition is default for non-trivial requests
 VOCO now splits non-trivial prompts into atomic steps before execution.
 
 - each step is routed with a lightweight ML router + deterministic argument extraction
 - direct tool execution is used for high-confidence valid-arg routes
-- fallback order is: direct router tool -> local fast-path rule -> Gemma step planner
+- fallback order is: direct router tool -> local fast-path rule -> LLM step planner
 - browser/media terms are blocked from local file-search routing to prevent misclassification
 
 ### 3) Duplicate window guard is on by default
@@ -139,8 +139,8 @@ VOCO supports explicit profile modes: **default**, **snapshot**, and **automatio
 - Firefox always runs in automation mode even if default/snapshot is requested.
 - Responses include: `browser`, `profile_mode` (requested), `effective_profile_mode` (actual), and `launch_mode`.
 
-### 9) voco-agent capabilities in this setup
-From `ollama show voco-agent`, the local model exposes:
+### 9) qwen3:4b capabilities in this setup
+From `ollama show qwen3:4b`, the local model exposes:
 
 - completion
 - tools
@@ -164,9 +164,9 @@ Sensitive vault data is encrypted at rest with Windows DPAPI.
 - **Implemented scope:** **L1-L3 only** (user-space orchestration).
 - **L1 (UI Automation):** window/control interactions.
 - **L2 (Native user/admin APIs):** browser/files/process/app operations.
-- **L3 (Privileged system controls):** explicit human approval is required before execution
-  (set `args.human_approval=true` or include an explicit approval phrase in the task).
-  Missing approval is deterministically rejected with `POLICY_APPROVAL_REQUIRED`.
+- **L3 (Privileged system controls):** no manual confirmation prompts in execution flow.
+  A deterministic autonomous policy engine allow/deny checks these actions before dispatch.
+  Denied actions are rejected with explicit policy error messages in trace output.
 - **L4 (Kernel/driver):** intentionally excluded from current VOCO scope (not implemented).
 
 ---
@@ -202,7 +202,6 @@ Provision the base model and create the exact model used by current VOCO config:
 
 ```powershell
 ollama pull qwen3:4b
-ollama create voco-agent -f models\voco_model.Modelfile
 ```
 
 ## 3) Run VOCO UI
@@ -288,7 +287,7 @@ Swap/virtual-memory recommendation for 8GB systems:
   - `System Properties -> Advanced -> Performance (Settings) -> Advanced -> Virtual memory`
   - Enable a custom paging file on a non-system drive with at least 8-12 GB.
 
-Optional voice dependencies (for Ctrl+G wake-word mode):
+Optional voice dependencies (for Ctrl+G voice + SPACEBAR push-to-talk mode):
 
 ```powershell
 pip install openwakeword sounddevice numpy faster-whisper
@@ -539,5 +538,5 @@ Current limitation:
 ## Final note
 
 VOCO is now much more usable for daily basic commands on this device.  
-For complex tasks, stability still depends on available memory/CPU headroom for `voco-agent`.
+For complex tasks, stability still depends on available memory/CPU headroom for `qwen3:4b`.
 

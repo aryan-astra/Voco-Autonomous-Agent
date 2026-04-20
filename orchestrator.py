@@ -8,17 +8,20 @@ from __future__ import annotations
 import datetime
 import difflib
 import importlib.util
+import ipaddress
 import json
 import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from constants import (
     FORMAT_FAILURE_LOG,
     MAX_RETRIES,
     MAX_STEPS,
     OLLAMA_MODEL,
+    WORKSPACE_PATH,
 )
 from context import AgentContext
 from llm import (
@@ -513,8 +516,11 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
     for index, step in enumerate(bounded_plan, start=1):
         requires_approval = False
         human_approved = False
-        privileged_action = False
-        approval_error_code = ""
+        policy_allowed = True
+        policy_reason = ""
+        policy_error_code = ""
+        policy_simulation: dict[str, list[str]] = {"files": [], "ports": [], "networks": []}
+        rollback_snapshot: dict | None = None
         tool_name = "unknown"
         tool_args: dict = {}
         reason = ""
@@ -524,7 +530,9 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
             requires_approval=requires_approval,
             human_approved=human_approved,
             policy_scope=context.access_level_policy,
-            approval_error_code=approval_error_code,
+            policy_allowed=policy_allowed,
+            policy_reason=policy_reason,
+            policy_error_code=policy_error_code,
         )
         if not isinstance(step, dict):
             result = {"status": "error", "result": None, "message": "Invalid step payload (expected object)."}
@@ -540,36 +548,60 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                     context=context,
                 )
                 requires_approval = tool_requires_approval(tool_name)
-                privileged_action = _is_privileged_tool_action(
+                policy_allowed, policy_error_code, policy_reason = _evaluate_autonomy_policy(
                     tool_name=tool_name,
-                    requires_approval=requires_approval,
+                    tool_args=tool_args,
                 )
-                if privileged_action:
-                    human_approved = _has_human_approval(task=task, args=tool_args)
+                if policy_allowed:
+                    (
+                        policy_allowed,
+                        simulation_error_code,
+                        simulation_reason,
+                        policy_simulation,
+                    ) = _validate_simulated_side_effects(tool_name=tool_name, tool_args=tool_args)
+                    policy_reason = simulation_reason
+                    if simulation_error_code:
+                        policy_error_code = simulation_error_code
+                if policy_allowed:
+                    rollback_snapshot = _capture_rollback_snapshot(tool_name=tool_name, tool_args=tool_args)
 
             if not isinstance(tool_args, dict):
                 result = {"status": "error", "result": None, "message": "Step args must be an object."}
             elif tool_name not in TOOL_REGISTRY:
                 result = {"status": "error", "result": None, "message": f"Unknown tool: '{tool_name}'"}
-            elif privileged_action and not human_approved:
-                approval_error_code = _POLICY_APPROVAL_ERROR_CODE
+            elif not policy_allowed:
                 policy_metadata = _build_policy_metadata(
                     tool_name=tool_name,
                     requires_approval=requires_approval,
                     human_approved=human_approved,
                     policy_scope=context.access_level_policy,
-                    approval_error_code=approval_error_code,
+                    policy_allowed=policy_allowed,
+                    policy_reason=policy_reason,
+                    policy_error_code=policy_error_code,
+                    simulation=policy_simulation,
                 )
-                result = _build_approval_required_result(tool_name=tool_name, policy_metadata=policy_metadata)
+                result = _build_policy_denied_result(tool_name=tool_name, policy_metadata=policy_metadata)
             else:
                 result = dispatch_tool(tool_name, tool_args)
+                status = str(result.get("status", "")).strip().lower()
+                if status != "success":
+                    rolled_back, rollback_message = _rollback_from_snapshot(rollback_snapshot)
+                    if rollback_message:
+                        result_message = _normalize_whitespace(str(result.get("message", "")))
+                        if rolled_back:
+                            result["message"] = f"{result_message} {rollback_message}".strip()
+                        else:
+                            result["message"] = f"{result_message} {rollback_message}".strip()
 
         policy_metadata = _build_policy_metadata(
             tool_name=tool_name,
             requires_approval=requires_approval,
             human_approved=human_approved,
             policy_scope=context.access_level_policy,
-            approval_error_code=approval_error_code,
+            policy_allowed=policy_allowed,
+            policy_reason=policy_reason,
+            policy_error_code=policy_error_code,
+            simulation=policy_simulation,
         )
         step_reason = _format_step_reason_with_policy(reason=reason, policy_metadata=policy_metadata)
         emit(
@@ -592,7 +624,14 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
 
         for attempt_number in range(1, max_step_retries + 2):
             if attempt_number > 1:
+                rollback_snapshot = _capture_rollback_snapshot(tool_name=tool_name, tool_args=tool_args)
                 result = dispatch_tool(tool_name, tool_args)
+                status = str(result.get("status", "")).strip().lower()
+                if status != "success":
+                    _, rollback_message = _rollback_from_snapshot(rollback_snapshot)
+                    if rollback_message:
+                        result_message = _normalize_whitespace(str(result.get("message", "")))
+                        result["message"] = f"{result_message} {rollback_message}".strip()
 
             classification = _classify_tool_failure(tool_name=tool_name, result=result)
             status = str(result.get("status", "")).strip().lower()
@@ -760,7 +799,9 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                         requires_approval=False,
                         human_approved=False,
                         policy_scope=context.access_level_policy,
-                        approval_error_code="",
+                        policy_allowed=True,
+                        policy_reason="Injected browser state read.",
+                        policy_error_code="",
                     )
                     injected_reason = _format_step_reason_with_policy(
                         reason=str(injected_step.get("reason", "")).strip(),
@@ -950,7 +991,60 @@ def _get_tool_access_level(tool_name: str) -> str:
     return _ACCESS_LEVEL_BY_TOOL.get(str(tool_name).strip(), "L2")
 
 
-_POLICY_APPROVAL_ERROR_CODE = "POLICY_APPROVAL_REQUIRED"
+_POLICY_DENY_ERROR_CODE = "POLICY_DENIED"
+_AUTONOMY_BLOCKED_TOOLS = {
+    "disable_usb_device",
+    "add_firewall_rule",
+    "kill_process",
+}
+_AUTONOMY_ALLOWED_COMMAND_PREFIXES = (
+    "nmap ",
+    "ping ",
+    "tracert ",
+    "nslookup ",
+    "curl ",
+    "curl.exe ",
+    "ipconfig",
+    "netstat",
+    "whoami",
+    "systeminfo",
+    "tasklist",
+    "get-process",
+    "get-service",
+    "get-date",
+)
+_AUTONOMY_BLOCKED_COMMAND_PATTERNS = (
+    r"\brm\s+-rf\b",
+    r"\bdel\s+/f\b",
+    r"\bformat\b",
+    r"\bshutdown\b",
+    r"\brestart-computer\b",
+    r"\bset-itemproperty\b",
+    r"\bnew-itemproperty\b",
+    r"\bremove-itemproperty\b",
+    r"\bsc\s+stop\b",
+    r"\bsc\s+delete\b",
+    r"\bnetsh\s+advfirewall\b.*\boff\b",
+    r"\breg\s+delete\b",
+    r"\binvoke-expression\b",
+    r"\biwr\b.*\|\s*iex\b",
+)
+_AUTONOMY_ALLOWED_URL_SCHEMES = {"http", "https"}
+_AUTONOMY_ALLOWED_NETWORK_HOSTS = {
+    "localhost",
+    "127.0.0.1",
+    "youtube.com",
+    "www.youtube.com",
+    "github.com",
+    "www.github.com",
+    "stackoverflow.com",
+    "www.stackoverflow.com",
+}
+_AUTONOMY_PROTECTED_PATH_PREFIXES = (
+    "c:\\windows",
+    "c:\\program files",
+    "c:\\program files (x86)",
+)
 
 
 def _is_privileged_tool_action(tool_name: str, requires_approval: bool = False) -> bool:
@@ -958,12 +1052,206 @@ def _is_privileged_tool_action(tool_name: str, requires_approval: bool = False) 
     return access_level == "L3" or bool(requires_approval)
 
 
+def _extract_command_text(tool_args: dict) -> str:
+    raw = tool_args.get("command")
+    return _normalize_whitespace(str(raw or ""))
+
+
+def _command_allowed_by_policy(command_text: str) -> tuple[bool, str]:
+    text = command_text.lower().strip()
+    if not text:
+        return False, "Command text is empty."
+    for pattern in _AUTONOMY_BLOCKED_COMMAND_PATTERNS:
+        if re.search(pattern, text):
+            return False, f"Command blocked by policy pattern: {pattern}"
+    if any(text.startswith(prefix) for prefix in _AUTONOMY_ALLOWED_COMMAND_PREFIXES):
+        return True, "Command allowed by deterministic prefix policy."
+    return False, "Command is outside the deterministic allowlist for autonomous execution."
+
+
+def _url_allowed_by_policy(url_text: str) -> tuple[bool, str]:
+    candidate = _normalize_whitespace(url_text)
+    if not candidate:
+        return False, "URL is required for browser navigation."
+    parsed = urlparse(candidate)
+    scheme = str(parsed.scheme or "").lower()
+    host = str(parsed.netloc or "").strip()
+    if scheme not in _AUTONOMY_ALLOWED_URL_SCHEMES:
+        return False, "Only http/https browser navigation is allowed."
+    if not host:
+        return False, "Browser navigation URL must include a host."
+    return True, "Navigation URL allowed by deterministic scheme/host checks."
+
+
+def _evaluate_autonomy_policy(tool_name: str, tool_args: dict) -> tuple[bool, str, str]:
+    normalized_tool = str(tool_name or "").strip()
+    if normalized_tool in _AUTONOMY_BLOCKED_TOOLS:
+        return False, _POLICY_DENY_ERROR_CODE, f"Tool '{normalized_tool}' is blocked in autonomous mode."
+
+    if normalized_tool in {"run_command", "run_powershell_command", "run_shell_command"}:
+        allowed, reason = _command_allowed_by_policy(_extract_command_text(tool_args))
+        return allowed, (_POLICY_DENY_ERROR_CODE if not allowed else ""), reason
+
+    if normalized_tool == "browser_navigate":
+        url_value = str(tool_args.get("url", "")).strip()
+        allowed, reason = _url_allowed_by_policy(url_value)
+        return allowed, (_POLICY_DENY_ERROR_CODE if not allowed else ""), reason
+
+    return True, "", "Action allowed by deterministic autonomy policy."
+
+
+def _is_private_ipv4(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_private
+    except ValueError:
+        return False
+
+
+def _simulate_step_side_effects(tool_name: str, tool_args: dict) -> dict[str, list[str]]:
+    if tool_name not in {"run_command", "run_powershell_command", "run_shell_command"}:
+        return {"files": [], "ports": [], "networks": []}
+
+    command_text = _extract_command_text(tool_args)
+    files = [
+        match.group(0)
+        for match in re.finditer(r"[A-Za-z]:\\[^\s\"']+", command_text)
+    ]
+    ports = [
+        match.group(1)
+        for match in re.finditer(r"(?<!\d)(\d{2,5})(?!\d)", command_text)
+    ]
+    hosts: list[str] = []
+    for url_match in re.finditer(r"https?://([A-Za-z0-9\.-]+)", command_text, flags=re.IGNORECASE):
+        host = str(url_match.group(1)).strip().lower()
+        if host:
+            hosts.append(host)
+    for ip_match in re.finditer(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", command_text):
+        hosts.append(str(ip_match.group(1)).strip())
+
+    return {
+        "files": list(dict.fromkeys(files[:6])),
+        "ports": list(dict.fromkeys(ports[:8])),
+        "networks": list(dict.fromkeys(hosts[:8])),
+    }
+
+
+def _validate_simulated_side_effects(
+    tool_name: str,
+    tool_args: dict,
+) -> tuple[bool, str, str, dict[str, list[str]]]:
+    simulation = _simulate_step_side_effects(tool_name=tool_name, tool_args=tool_args)
+    command_text = _extract_command_text(tool_args).lower()
+
+    for file_path in simulation["files"]:
+        normalized = str(file_path).strip().lower()
+        if any(normalized.startswith(prefix) for prefix in _AUTONOMY_PROTECTED_PATH_PREFIXES):
+            return (
+                False,
+                _POLICY_DENY_ERROR_CODE,
+                f"Command touches protected system path: {file_path}",
+                simulation,
+            )
+
+    for port_value in simulation["ports"]:
+        try:
+            port_num = int(port_value)
+        except ValueError:
+            continue
+        if port_num < 1024 and not command_text.startswith("nmap "):
+            return (
+                False,
+                _POLICY_DENY_ERROR_CODE,
+                f"Privileged port operation blocked in autonomous mode: {port_num}",
+                simulation,
+            )
+
+    for host in simulation["networks"]:
+        lowered = host.lower()
+        if lowered in _AUTONOMY_ALLOWED_NETWORK_HOSTS:
+            continue
+        if _is_private_ipv4(lowered):
+            continue
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", lowered):
+            return (
+                False,
+                _POLICY_DENY_ERROR_CODE,
+                f"External public IP is blocked in autonomous mode: {host}",
+                simulation,
+            )
+
+    return True, "", "Dry-run side-effect checks passed.", simulation
+
+
+def _capture_rollback_snapshot(tool_name: str, tool_args: dict) -> dict | None:
+    path: Path | None = None
+    if tool_name == "write_file":
+        raw_path = str(tool_args.get("path", "")).strip()
+        if not raw_path:
+            return None
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = WORKSPACE_PATH / path
+        try:
+            path = path.resolve()
+            path.relative_to(WORKSPACE_PATH.resolve())
+        except Exception:
+            return None
+    elif tool_name == "save_text_to_desktop_file":
+        filename = str(tool_args.get("filename", "voco_output.txt")).strip() or "voco_output.txt"
+        safe_name = os.path.basename(filename)
+        path = (Path.home() / "Desktop" / safe_name).resolve()
+    else:
+        return None
+
+    existed = path.exists()
+    if existed and path.is_file():
+        try:
+            previous_content = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            previous_content = ""
+    else:
+        previous_content = ""
+
+    return {
+        "path": str(path),
+        "existed": bool(existed),
+        "content": previous_content,
+    }
+
+
+def _rollback_from_snapshot(snapshot: dict | None) -> tuple[bool, str]:
+    if not isinstance(snapshot, dict):
+        return False, ""
+
+    path_text = str(snapshot.get("path", "")).strip()
+    if not path_text:
+        return False, ""
+    target = Path(path_text)
+    existed = bool(snapshot.get("existed"))
+    previous_content = str(snapshot.get("content", ""))
+
+    try:
+        if existed:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(previous_content, encoding="utf-8")
+            return True, f"Rollback restored previous file state at '{target}'."
+        if target.exists():
+            target.unlink()
+            return True, f"Rollback removed newly created file '{target}'."
+        return True, "Rollback check completed (no file changes to revert)."
+    except Exception as exc:
+        return False, f"Rollback failed for '{target}': {exc}"
+
+
 def _build_policy_metadata(
     tool_name: str,
     requires_approval: bool,
     human_approved: bool,
     policy_scope: str,
-    approval_error_code: str = "",
+    policy_allowed: bool = True,
+    policy_reason: str = "",
+    policy_error_code: str = "",
+    simulation: dict | None = None,
 ) -> dict:
     access_level = _get_tool_access_level(tool_name)
     return {
@@ -972,17 +1260,29 @@ def _build_policy_metadata(
         "privileged_action": _is_privileged_tool_action(tool_name, requires_approval=requires_approval),
         "requires_approval": bool(requires_approval),
         "human_approved": bool(human_approved),
-        "approval_error_code": str(approval_error_code).strip(),
+        "policy_allowed": bool(policy_allowed),
+        "policy_reason": _truncate_text(_normalize_whitespace(str(policy_reason)), 240),
+        "policy_error_code": str(policy_error_code).strip(),
+        "simulation": simulation if isinstance(simulation, dict) else {"files": [], "ports": [], "networks": []},
     }
 
 
 def _format_policy_metadata(policy_metadata: dict) -> str:
+    simulation = policy_metadata.get("simulation", {})
+    if not isinstance(simulation, dict):
+        simulation = {}
+    sim_files = len(simulation.get("files", []) or [])
+    sim_ports = len(simulation.get("ports", []) or [])
+    sim_networks = len(simulation.get("networks", []) or [])
     return (
         f"policy_scope={policy_metadata['policy_scope']}; "
         f"access_level={policy_metadata['access_level']}; "
         f"privileged_action={str(bool(policy_metadata['privileged_action'])).lower()}; "
         f"requires_approval={str(bool(policy_metadata['requires_approval'])).lower()}; "
-        f"human_approved={str(bool(policy_metadata['human_approved'])).lower()}"
+        f"human_approved={str(bool(policy_metadata['human_approved'])).lower()}; "
+        f"policy_allowed={str(bool(policy_metadata.get('policy_allowed', True))).lower()}; "
+        f"policy_error_code={str(policy_metadata.get('policy_error_code', '')).strip()}; "
+        f"sim(files={sim_files},ports={sim_ports},networks={sim_networks})"
     )
 
 
@@ -991,10 +1291,11 @@ def _format_step_reason_with_policy(reason: str, policy_metadata: dict) -> str:
     return f"{detail} [{_format_policy_metadata(policy_metadata)}]"
 
 
-def _build_approval_required_result(tool_name: str, policy_metadata: dict) -> dict:
+def _build_policy_denied_result(tool_name: str, policy_metadata: dict) -> dict:
     message = (
-        f"{_POLICY_APPROVAL_ERROR_CODE}: Tool '{tool_name}' requires human approval. "
-        "Re-run with explicit approval in the task or args.human_approval=true. "
+        f"{policy_metadata.get('policy_error_code', _POLICY_DENY_ERROR_CODE)}: "
+        f"Tool '{tool_name}' blocked by autonomous policy. "
+        f"Reason: {policy_metadata.get('policy_reason', 'not specified')}. "
         f"{_format_policy_metadata(policy_metadata)}"
     )
     return {"status": "error", "result": None, "message": message}
@@ -2471,14 +2772,15 @@ def _classify_tool_failure(tool_name: str, result: dict) -> dict[str, object]:
     if (
         "permission denied" in text
         or "access is denied" in text
-        or "requires human approval" in text
+        or "blocked by autonomous policy" in text
+        or "policy_denied" in text
         or "administrator privileges" in text
         or "not permitted" in text
     ):
         return {
             "class": "permission_denied",
             "recoverable": False,
-            "known_fix": "Provide explicit approval/elevation and retry once authorized.",
+            "known_fix": "Adjust request to satisfy autonomous policy constraints and retry.",
         }
 
     _ = tool_name
@@ -2589,8 +2891,20 @@ def _sanitize_policy_metadata(raw_policy: dict | None) -> dict:
             "privileged_action": False,
             "requires_approval": False,
             "human_approved": False,
-            "approval_error_code": "",
+            "policy_allowed": True,
+            "policy_reason": "",
+            "policy_error_code": "",
+            "simulation": {"files": [], "ports": [], "networks": []},
         }
+
+    raw_simulation = raw_policy.get("simulation")
+    if not isinstance(raw_simulation, dict):
+        raw_simulation = {}
+    simulation = {
+        "files": [str(item).strip() for item in raw_simulation.get("files", []) if str(item).strip()][:8],
+        "ports": [str(item).strip() for item in raw_simulation.get("ports", []) if str(item).strip()][:8],
+        "networks": [str(item).strip() for item in raw_simulation.get("networks", []) if str(item).strip()][:8],
+    }
 
     return {
         "policy_scope": str(raw_policy.get("policy_scope", "L1-L3")).strip() or "L1-L3",
@@ -2598,7 +2912,10 @@ def _sanitize_policy_metadata(raw_policy: dict | None) -> dict:
         "privileged_action": bool(raw_policy.get("privileged_action")),
         "requires_approval": bool(raw_policy.get("requires_approval")),
         "human_approved": bool(raw_policy.get("human_approved")),
-        "approval_error_code": str(raw_policy.get("approval_error_code", "")).strip(),
+        "policy_allowed": bool(raw_policy.get("policy_allowed", True)),
+        "policy_reason": _truncate_text(_normalize_whitespace(str(raw_policy.get("policy_reason", ""))), 240),
+        "policy_error_code": str(raw_policy.get("policy_error_code", "")).strip(),
+        "simulation": simulation,
     }
 
 
@@ -2923,27 +3240,6 @@ def _write_incomplete_state(task: str, plan: list, tool_results: list) -> None:
         append_context_entry("\n".join(lines))
     except (OSError, SecureMemoryError):
         return
-
-
-def _has_human_approval(task: str, args: dict) -> bool:
-    approval_arg = args.get("human_approval")
-    if isinstance(approval_arg, bool):
-        return approval_arg
-    if isinstance(approval_arg, str):
-        if approval_arg.strip().lower() in {"true", "yes", "approved"}:
-            return True
-
-    text = task.lower()
-    approval_phrases = [
-        "i approve",
-        "approved",
-        "with approval",
-        "you are approved",
-        "go ahead and run",
-        "confirm and run",
-        "human approval",
-    ]
-    return any(phrase in text for phrase in approval_phrases)
 
 
 def _build_local_fastpath_plan(task: str) -> list[dict] | None:
@@ -3314,17 +3610,14 @@ def _build_privileged_command_fastpath_plan(task: str, text: str) -> list[dict] 
     ).strip()
     if not command:
         return None
-    args: dict[str, object] = {"command": command}
-    if _has_human_approval(task=task, args={}):
-        args["human_approval"] = True
     return [
         {
             "tool": "run_command",
-            "args": args,
+            "args": {"command": command},
             "reason": _annotate_step_reason(
                 step_text=task,
                 route_path="local_privileged_fastpath",
-                base_reason="Execute privileged command path with explicit approval checks.",
+                base_reason="Execute privileged command path with deterministic autonomous policy checks.",
                 tool_name="run_command",
             ),
         }

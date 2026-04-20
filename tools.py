@@ -5129,18 +5129,18 @@ TOOL_REGISTRY = {
     },
     "run_powershell_command": {
         "fn": run_powershell_command,
-        "description": "Run a PowerShell command with explicit human approval.",
+        "description": "Run a PowerShell command subject to autonomous policy checks.",
         "args": {
             "command": "string",
             "timeout_seconds": "integer (optional, default 20)",
-            "human_approval": "boolean (required true)",
+            "human_approval": "boolean (optional, backward compatibility)",
         },
         "requires_approval": True,
     },
     "run_command": {
         "fn": run_command,
-        "description": "Run a PowerShell command with explicit human approval.",
-        "args": {"command": "string", "human_approval": "boolean (required true)"},
+        "description": "Run a PowerShell command subject to autonomous policy checks.",
+        "args": {"command": "string", "human_approval": "boolean (optional, backward compatibility)"},
         "requires_approval": True,
     },
     "get_usb_devices": {
@@ -5150,18 +5150,18 @@ TOOL_REGISTRY = {
     },
     "disable_usb_device": {
         "fn": disable_usb_device,
-        "description": "Disable a USB device by ID (approval required).",
-        "args": {"device_id": "string", "human_approval": "boolean (required true)"},
+        "description": "Disable a USB device by ID (subject to autonomous policy; blocked by default).",
+        "args": {"device_id": "string", "human_approval": "boolean (optional, backward compatibility)"},
         "requires_approval": True,
     },
     "kill_process": {
         "fn": kill_process,
-        "description": "Kill a running process by PID or process name (approval required).",
+        "description": "Kill a running process by PID or process name (subject to autonomous policy).",
         "args": {
             "pid": "integer (optional)",
             "process_name": "string (optional)",
             "force": "boolean (optional, default true)",
-            "human_approval": "boolean (required true)",
+            "human_approval": "boolean (optional, backward compatibility)",
         },
         "requires_approval": True,
     },
@@ -5172,13 +5172,13 @@ TOOL_REGISTRY = {
     },
     "add_firewall_rule": {
         "fn": add_firewall_rule,
-        "description": "Add a Windows firewall rule (approval required).",
+        "description": "Add a Windows firewall rule (subject to autonomous policy; blocked by default).",
         "args": {
             "name": "string",
             "direction": "string (in/out)",
             "action": "string (allow/block)",
             "port": "integer",
-            "human_approval": "boolean (required true)",
+            "human_approval": "boolean (optional, backward compatibility)",
         },
         "requires_approval": True,
     },

@@ -101,7 +101,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency
 
 
 class VocoVoice:
-    """Voice listener with optional wake-word gating + Hugging Face Whisper transcription."""
+    """Voice listener with direct, wake-word, and push-to-talk transcription modes."""
 
     SAMPLE_RATE = 16000
     WAKE_BLOCK_SIZE = 1280  # 80ms (openwakeword-preferred chunk size)
@@ -116,7 +116,9 @@ class VocoVoice:
     CAPTURE_IDLE_STATUS_COOLDOWN_SECONDS = 2.5
     INTERACTION_MODE_DIRECT = "direct"
     INTERACTION_MODE_WAKEWORD = "wakeword"
-    INTERACTION_MODES = {INTERACTION_MODE_DIRECT, INTERACTION_MODE_WAKEWORD}
+    INTERACTION_MODE_PUSH_TO_TALK = "push_to_talk"
+    INTERACTION_MODES = {INTERACTION_MODE_DIRECT, INTERACTION_MODE_WAKEWORD, INTERACTION_MODE_PUSH_TO_TALK}
+    PTT_MAX_SECONDS = 30
     WAKE_LABEL_HINT = "jarvis"
     WHISPER_MODEL_ID = "openai/whisper-medium"
     DEFAULT_WHISPER_MODEL = WHISPER_MODEL_ID
@@ -432,6 +434,12 @@ class VocoVoice:
         self._listening = False
         self._thread: threading.Thread | None = None
         self._status_cooldowns: dict[str, float] = {}
+        self._ptt_stream = None
+        self._ptt_frames: list = []
+        self._ptt_lock = threading.Lock()
+        self._ptt_active = False
+        self._ptt_started_at = 0.0
+        self._ptt_max_frames = int(self.PTT_MAX_SECONDS * self.SAMPLE_RATE / self.COMMAND_FRAME_SIZE)
 
     @classmethod
     def _normalize_interaction_mode(cls, interaction_mode: str) -> str:
@@ -485,14 +493,105 @@ class VocoVoice:
         if self._listening:
             return
         self._listening = True
+        if self._interaction_mode == self.INTERACTION_MODE_PUSH_TO_TALK:
+            self._emit_status(
+                (
+                    f"Push-to-talk ready ({self.vad_mode}, mode:{self._interaction_mode}, "
+                    f"asr:{self._whisper_model_size}). Press SPACE to start/stop capture."
+                ),
+                "ready" if self.vad_mode == "webrtcvad" else "degraded",
+            )
+            return
         self._thread = threading.Thread(target=self._wake_word_loop, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
+        self._stop_ptt_stream()
         self._listening = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.5)
         self._thread = None
+
+    def _stop_ptt_stream(self) -> None:
+        if self._ptt_stream is None:
+            self._ptt_active = False
+            return
+        try:
+            self._ptt_stream.stop()
+        except Exception:
+            pass
+        try:
+            self._ptt_stream.close()
+        except Exception:
+            pass
+        self._ptt_stream = None
+        self._ptt_active = False
+
+    def _ptt_callback(self, indata, frames, time_info, status) -> None:  # pragma: no cover - callback runtime
+        _ = frames, time_info
+        if status:
+            self._emit_status_throttled("ptt_stream_status", f"PTT audio status: {status}", "degraded", cooldown=2.0)
+        if not self._ptt_active:
+            return
+        pcm_frame = np.asarray(indata).reshape(-1).astype(np.int16, copy=False)
+        with self._ptt_lock:
+            if len(self._ptt_frames) >= self._ptt_max_frames:
+                return
+            self._ptt_frames.append(pcm_frame.copy())
+
+    def begin_push_to_talk(self, max_duration: int = PTT_MAX_SECONDS) -> bool:
+        if self._interaction_mode != self.INTERACTION_MODE_PUSH_TO_TALK:
+            self._emit_status("Push-to-talk is only available in push_to_talk interaction mode.", "error")
+            return False
+        if not self._listening:
+            self._emit_status("Voice listener is OFF. Toggle voice before push-to-talk.", "error")
+            return False
+        if self._ptt_active:
+            return True
+
+        safe_duration = max(1, int(max_duration))
+        self._ptt_max_frames = int(safe_duration * self.SAMPLE_RATE / self.COMMAND_FRAME_SIZE)
+        with self._ptt_lock:
+            self._ptt_frames = []
+        self._ptt_started_at = time.monotonic()
+        try:
+            self._ptt_stream = sd.InputStream(
+                samplerate=self.SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                blocksize=self.COMMAND_FRAME_SIZE,
+                callback=self._ptt_callback,
+            )
+            self._ptt_stream.start()
+            self._ptt_active = True
+            self._emit_status("Push-to-talk recording started.", "step")
+            return True
+        except Exception as exc:  # pragma: no cover - runtime/hardware specific
+            self._ptt_stream = None
+            self._ptt_active = False
+            self._emit_status(f"Push-to-talk start failed: {exc}", "error")
+            return False
+
+    def end_push_to_talk(self, min_duration_seconds: float = 0.1) -> str:
+        if self._interaction_mode != self.INTERACTION_MODE_PUSH_TO_TALK:
+            return ""
+        if not self._ptt_active:
+            self._emit_status("Push-to-talk is not currently recording.", "step")
+            return ""
+
+        duration = max(0.0, time.monotonic() - self._ptt_started_at)
+        self._stop_ptt_stream()
+        with self._ptt_lock:
+            frames = [frame.copy() for frame in self._ptt_frames]
+            self._ptt_frames = []
+
+        if duration < min_duration_seconds:
+            self._emit_status("Push-to-talk capture was too short.", "step")
+            return ""
+        if not frames:
+            self._emit_status("Push-to-talk captured no audio.", "step")
+            return ""
+        return self._transcribe_frames(frames)
 
     def _wake_word_loop(self) -> None:
         listener_label = (
@@ -605,6 +704,9 @@ class VocoVoice:
             )
             return ""
 
+        return self._transcribe_frames(frames)
+
+    def _transcribe_frames(self, frames: list) -> str:
         audio = np.concatenate(frames).astype(np.float32) / 32768.0
         self._emit_status("Transcription started.", "step")
         try:
