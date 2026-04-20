@@ -829,6 +829,8 @@ def _guardrail_rejection(intent: str, text: str, args: dict[str, object]) -> str
             return "browser_terms_detected_for_local_file_search"
         if any(token in lower for token in ("youtube", "video")) and "on my pc" not in lower:
             return "browser_media_request_should_not_route_to_local_search"
+        if any(token in lower for token in ("copy", "paste", "comment", "comments", "notepad", "clipboard")):
+            return "local_file_search_cannot_execute_browser_clipboard_workflow"
 
     if intent == "open_app":
         if not _has_credible_open_app_signal(text, args):

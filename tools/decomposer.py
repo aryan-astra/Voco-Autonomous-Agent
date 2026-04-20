@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Callable
 
@@ -16,10 +17,35 @@ _LINE_NUMBERED_STEP_REGEX = re.compile(r"^\s*(?:step\s*)?\d{1,2}[)\].:-]\s*(.+?)
 _LINE_BULLET_STEP_REGEX = re.compile(r"^\s*[-*•]\s+(.+?)\s*$")
 _CONNECTOR_SPLIT_REGEX = re.compile(r"\b(?:and then|then|after that|afterwards|next|finally)\b|;", flags=re.IGNORECASE)
 _CONNECTOR_TOKEN_REGEX = re.compile(r"\b(?:and then|then|after that|afterwards|next|finally)\b|;", flags=re.IGNORECASE)
+_COMMON_TYPO_CORRECTIONS: tuple[tuple[str, str], ...] = (
+    (r"\bconments\b", "comments"),
+    (r"\bcommments\b", "comments"),
+    (r"\bcoments\b", "comments"),
+    (r"\byoutub\b", "youtube"),
+    (r"\byutube\b", "youtube"),
+    (r"\bnote\s+pad\b", "notepad"),
+)
 
 
 def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def normalize_decomposition_input(text: str) -> tuple[str, list[dict[str, str]]]:
+    """Normalize user text and return typo-correction metadata."""
+    normalized = _normalize_text(text)
+    if not normalized:
+        return "", []
+
+    corrected = normalized
+    corrections: list[dict[str, str]] = []
+    for typo_pattern, replacement in _COMMON_TYPO_CORRECTIONS:
+        regex = re.compile(typo_pattern, flags=re.IGNORECASE)
+        for match in regex.finditer(corrected):
+            found = match.group(0)
+            corrections.append({"from": found, "to": replacement})
+        corrected = regex.sub(replacement, corrected)
+    return _normalize_text(corrected), corrections
 
 
 def _bounded_max_steps(max_steps: int) -> int:
@@ -117,7 +143,7 @@ def _safe_fallback_steps(text: str, max_steps: int) -> list[str]:
 
 
 def needs_decomposition(text: str) -> bool:
-    content = _normalize_text(text)
+    content, _ = normalize_decomposition_input(text)
     if not content:
         return False
     if should_split_task(content):
@@ -135,7 +161,7 @@ def decompose_task(
     llm_decomposer: Callable[[str, int], str] | None = None,
     allow_llm_fallback: bool = True,
 ) -> list[str]:
-    content = _normalize_text(text)
+    content, _ = normalize_decomposition_input(text)
     if not content:
         return []
 
@@ -160,4 +186,98 @@ def decompose_task(
     return fallback_steps if fallback_steps else [content]
 
 
-__all__ = ["needs_decomposition", "decompose_task"]
+def _extract_json_array_payload(raw_output: str) -> list[object]:
+    text = str(raw_output or "").strip()
+    if not text:
+        return []
+    start = text.find("[")
+    end = text.rfind("]")
+    payload = text[start : end + 1] if start >= 0 and end > start else text
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _parse_structured_steps(raw_output: str, max_steps: int) -> list[dict[str, str]]:
+    parsed = _extract_json_array_payload(raw_output)
+    if not parsed:
+        return []
+    bounded = _bounded_max_steps(max_steps)
+    structured: list[dict[str, str]] = []
+    for item in parsed:
+        if isinstance(item, str):
+            step = _clean_step_text(item)
+            if not step:
+                continue
+            structured.append({"step": step, "tool": "unknown", "intent": "route required"})
+        elif isinstance(item, dict):
+            step = _clean_step_text(str(item.get("step", "")))
+            tool = _clean_step_text(str(item.get("tool", ""))) or "unknown"
+            intent = _clean_step_text(str(item.get("intent", ""))) or "route required"
+            if step:
+                structured.append({"step": step, "tool": tool, "intent": intent})
+        if len(structured) >= bounded:
+            break
+    return structured
+
+
+def decompose_task_structured(
+    text: str,
+    *,
+    max_steps: int = MAX_STEPS,
+    llm_decomposer: Callable[[str, int], str] | None = None,
+    allow_llm_fallback: bool = True,
+    route_predictor: Callable[[str], dict[str, object]] | None = None,
+) -> list[dict[str, str]]:
+    """Return decomposed steps enriched with tool and intent hints."""
+    content, _ = normalize_decomposition_input(text)
+    if not content:
+        return []
+
+    bounded_steps = _bounded_max_steps(max_steps)
+    if allow_llm_fallback and llm_decomposer is not None:
+        llm_output = ""
+        try:
+            llm_output = str(llm_decomposer(content, bounded_steps) or "").strip()
+        except Exception:
+            llm_output = ""
+        parsed_structured = _parse_structured_steps(llm_output, max_steps=bounded_steps)
+        if parsed_structured:
+            return parsed_structured
+
+    step_texts = decompose_task(
+        content,
+        max_steps=bounded_steps,
+        llm_decomposer=llm_decomposer,
+        allow_llm_fallback=allow_llm_fallback,
+    )
+    if not step_texts:
+        return []
+
+    predictor = route_predictor
+    if predictor is None:
+        from router import predict_route as predictor
+
+    structured: list[dict[str, str]] = []
+    for step in step_texts:
+        route = predictor(step)
+        tool = str(route.get("tool", "")).strip() or "unknown"
+        intent = str(route.get("intent", "")).strip() or "route required"
+        structured.append(
+            {
+                "step": step,
+                "tool": tool,
+                "intent": intent,
+            }
+        )
+    return structured
+
+
+__all__ = [
+    "needs_decomposition",
+    "decompose_task",
+    "decompose_task_structured",
+    "normalize_decomposition_input",
+]

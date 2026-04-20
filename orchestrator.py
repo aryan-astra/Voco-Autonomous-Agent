@@ -46,6 +46,8 @@ _task_decomposer = importlib.util.module_from_spec(_decomposer_spec)
 _decomposer_spec.loader.exec_module(_task_decomposer)
 needs_decomposition = _task_decomposer.needs_decomposition
 decompose_task = _task_decomposer.decompose_task
+decompose_task_structured = getattr(_task_decomposer, "decompose_task_structured", None)
+normalize_decomposition_input = getattr(_task_decomposer, "normalize_decomposition_input", None)
 
 _USER_PROFILE_MODULE_PATH = Path(__file__).with_name("memory").joinpath("user_profile.py")
 _FS_WATCHER_MODULE_PATH = Path(__file__).with_name("memory").joinpath("fs_watcher.py")
@@ -176,6 +178,13 @@ def summarize_tool_result(result: object, max_tokens: int = _DEFAULT_TOOL_RESULT
     }
 
 
+def summarize_step_outcome(step_index: int, tool_name: str, result: dict) -> str:
+    """Return compact step outcome text for active-context retention."""
+    status = str(result.get("status", "unknown")).strip().lower()
+    message = _truncate_text(_normalize_whitespace(str(result.get("message", ""))), 120)
+    return f"{step_index}: {tool_name} [{status}] - {message}"
+
+
 def _build_memory_summary(context: AgentContext, max_tokens: int = 80) -> str:
     token_budget = _coerce_positive_int(max_tokens, 80)
     char_budget = min(2400, max(180, token_budget * 4))
@@ -192,6 +201,9 @@ def _build_memory_summary(context: AgentContext, max_tokens: int = 80) -> str:
     if isinstance(context.tool_results, list) and context.tool_results:
         last_item = context.tool_results[-1]
         if isinstance(last_item, dict):
+            compact_outcome = _normalize_whitespace(str(last_item.get("compact_outcome", "")))
+            if compact_outcome:
+                segments.append(f"last_step={compact_outcome}")
             last_payload = last_item.get("result")
             if last_payload is not None:
                 last_summary = summarize_tool_result(last_payload, max_tokens=40)
@@ -711,6 +723,7 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 "access_level": policy_metadata["access_level"],
                 "policy": policy_metadata,
                 "result": summarized_result,
+                "compact_outcome": summarize_step_outcome(index, tool_name, result),
                 "retry": retry_metadata,
             }
         )
@@ -786,6 +799,11 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                             "result": summarize_tool_result(
                                 result=injected_result,
                                 max_tokens=_DEFAULT_TOOL_RESULT_SUMMARY_TOKENS,
+                            ),
+                            "compact_outcome": summarize_step_outcome(
+                                injected_step_index,
+                                injected_tool,
+                                injected_result if isinstance(injected_result, dict) else {"message": str(injected_result)},
                             ),
                             "retry": {
                                 "max_retries": 0,
@@ -1350,18 +1368,83 @@ def _llm_decompose_steps(task_text: str, max_steps: int) -> str:
     if not check_ollama_running():
         return ""
     prompt = (
-        "Break the request into atomic executable steps.\n"
-        f"Return ONLY a numbered list with no more than {max_steps} steps.\n"
+        "You are TaskDecomposer v4. Break high-level goals into atomic, tool-routable steps.\n"
+        "Return ONLY a JSON array.\n"
+        "Each item must include: step, tool, intent.\n"
+        f"Limit total items to {max_steps}.\n"
         "Rules:\n"
-        "1) Keep each step as one direct action.\n"
-        "2) Preserve critical details (profile names, file names, destinations).\n"
-        "3) Do not add commentary, markdown, or JSON.\n\n"
-        f"Request: {task_text}"
+        "1) Each step is one executable action.\n"
+        "2) Keep step under 15 words.\n"
+        "3) Preserve critical details (queries, file names, profile names).\n"
+        "4) No markdown, no extra keys, no commentary.\n\n"
+        f"Request: {task_text}\n"
+        "Output JSON only."
     )
     ok, response = generate_conversation(user_message=prompt, temperature=0.0)
     if not ok:
         return ""
     return str(response).strip()
+
+
+_TOOL_INTENT_HINTS: dict[str, set[str]] = {
+    "browser_navigate": {"browser_navigate"},
+    "browser_type": {"browser_type"},
+    "browser_click": {"browser_click"},
+    "browser_get_state": {"browser_get_state"},
+    "get_page_title": {"get_page_title"},
+    "copy_text_to_clipboard": {"copy_text_to_clipboard"},
+    "write_in_notepad": {"write_in_notepad"},
+    "save_text_to_desktop_file": {"save_text_to_desktop_file"},
+    "search_local_paths": {"search_local_paths"},
+    "search_in_explorer": {"search_in_explorer"},
+    "open_app": {"open_app"},
+}
+_BROWSER_SIGNAL_TERMS = (
+    "youtube",
+    "video",
+    "browser",
+    "website",
+    "web",
+    "comment",
+    "comments",
+    "description",
+    "search",
+)
+
+
+def _tool_capability_reject_reason(step_text: str, tool_name: str, intent: str) -> str:
+    normalized_tool = str(tool_name or "").strip()
+    normalized_intent = str(intent or "").strip()
+    lower_step = str(step_text or "").lower()
+    if not normalized_tool:
+        return "empty_tool"
+    if normalized_tool not in TOOL_REGISTRY:
+        return "tool_not_registered"
+
+    allowed_intents = _TOOL_INTENT_HINTS.get(normalized_tool, set())
+    if allowed_intents and normalized_intent and normalized_intent not in allowed_intents:
+        return f"intent_tool_mismatch:{normalized_intent}->{normalized_tool}"
+
+    if normalized_tool == "search_local_paths" and any(term in lower_step for term in _BROWSER_SIGNAL_TERMS):
+        return "local_search_cannot_handle_browser_workflow"
+
+    return ""
+
+
+def _preexec_feasibility_reject_reason(step_text: str, tool_name: str, tool_args: dict[str, object]) -> str:
+    lower_step = str(step_text or "").lower()
+    normalized_tool = str(tool_name or "").strip()
+    args = tool_args if isinstance(tool_args, dict) else {}
+
+    if normalized_tool == "copy_text_to_clipboard":
+        text_value = str(args.get("text", "")).strip()
+        if not text_value and any(token in lower_step for token in ("comment", "comments", "description", "title")):
+            return "clipboard_tool_cannot_extract_browser_content_without_source_text"
+
+    if normalized_tool == "search_local_paths" and any(token in lower_step for token in ("copy", "paste", "comment")):
+        return "local_search_cannot_produce_requested_action"
+
+    return ""
 
 
 def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dict | None:
@@ -1373,21 +1456,61 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
     4) fallback to local fast-path
     5) fallback unresolved steps to Gemma planner
     """
-    if _is_conversational_prompt(task):
+    normalized_task = task
+    typo_corrections: list[dict[str, str]] = []
+    if callable(normalize_decomposition_input):
+        try:
+            normalized_candidate, corrections = normalize_decomposition_input(task)
+            normalized_task = str(normalized_candidate or task)
+            if isinstance(corrections, list):
+                typo_corrections = [item for item in corrections if isinstance(item, dict)]
+        except Exception:
+            normalized_task = task
+            typo_corrections = []
+
+    if _is_conversational_prompt(normalized_task):
         return None
-    task_text = task.lower()
+    task_text = normalized_task.lower()
     # Keep known deterministic YouTube comment workflows on their dedicated fast-path.
-    if _build_youtube_comment_fastpath_plan(task=task, text=task_text) is not None:
+    if _build_youtube_comment_fastpath_plan(task=normalized_task, text=task_text) is not None:
         return None
-    if not needs_decomposition(task):
+    if not needs_decomposition(normalized_task):
         return None
 
-    split_steps = decompose_task(
-        task,
-        max_steps=MAX_STEPS,
-        llm_decomposer=_llm_decompose_steps,
-        allow_llm_fallback=True,
-    )
+    if typo_corrections:
+        corrections_text = ", ".join(
+            f"{item.get('from', '').strip()} -> {item.get('to', '').strip()}"
+            for item in typo_corrections
+            if str(item.get("from", "")).strip() and str(item.get("to", "")).strip()
+        )
+        if corrections_text:
+            emit(f"[VOCO] Normalized input typos before decomposition: {corrections_text}", "info")
+
+    structured_steps: list[dict[str, str]] = []
+    if callable(decompose_task_structured):
+        try:
+            structured_candidate = decompose_task_structured(
+                normalized_task,
+                max_steps=MAX_STEPS,
+                llm_decomposer=_llm_decompose_steps,
+                allow_llm_fallback=True,
+                route_predictor=predict_route,
+            )
+            if isinstance(structured_candidate, list):
+                structured_steps = [item for item in structured_candidate if isinstance(item, dict)]
+        except Exception:
+            structured_steps = []
+
+    if not structured_steps:
+        split_steps = decompose_task(
+            normalized_task,
+            max_steps=MAX_STEPS,
+            llm_decomposer=_llm_decompose_steps,
+            allow_llm_fallback=True,
+        )
+        structured_steps = [{"step": step, "tool": "", "intent": ""} for step in split_steps]
+
+    split_steps = [str(item.get("step", "")).strip() for item in structured_steps if str(item.get("step", "")).strip()]
     if len(split_steps) <= 1:
         return None
 
@@ -1416,6 +1539,7 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
         return {
             "plan": cleaned_plan,
             "split_steps": split_steps,
+            "structured_steps": structured_steps,
             "route_trace": route_trace,
             "decomposition_used": True,
             "confidence": confidence,
@@ -1423,14 +1547,21 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
             "format_failures": format_failures,
             "plan_retries": plan_retries,
             "cleanup_suppressed_steps": suppressed_steps,
+            "typo_corrections": typo_corrections,
             "error": error,
         }
 
-    for step_index, step_text in enumerate(split_steps, start=1):
+    for step_index, structured_step in enumerate(structured_steps, start=1):
+        step_text = str(structured_step.get("step", "")).strip()
+        if not step_text:
+            continue
+        planned_tool = str(structured_step.get("tool", "")).strip()
+        planned_intent = str(structured_step.get("intent", "")).strip()
+
         route = predict_route(step_text)
-        intent = str(route.get("intent", "unknown")).strip()
+        intent = str(route.get("intent", "unknown")).strip() or planned_intent or "unknown"
         confidence = float(route.get("confidence", 0.0) or 0.0)
-        tool_name = str(route.get("tool", "")).strip()
+        tool_name = str(route.get("tool", "")).strip() or planned_tool
         args = route.get("args", {})
         missing_args = route.get("missing_args", [])
         rejected_reason = str(route.get("rejected_reason", "")).strip()
@@ -1440,8 +1571,25 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
         if not isinstance(missing_args, list):
             missing_args = []
 
+        capability_rejected_reason = _tool_capability_reject_reason(
+            step_text=step_text,
+            tool_name=tool_name,
+            intent=intent,
+        )
+        feasibility_rejected_reason = _preexec_feasibility_reject_reason(
+            step_text=step_text,
+            tool_name=tool_name,
+            tool_args=args,
+        )
         route_path = "router_unresolved"
-        has_valid_route = bool(tool_name and tool_name in TOOL_REGISTRY and not missing_args and not rejected_reason)
+        has_valid_route = bool(
+            tool_name
+            and tool_name in TOOL_REGISTRY
+            and not missing_args
+            and not rejected_reason
+            and not capability_rejected_reason
+            and not feasibility_rejected_reason
+        )
         can_route_direct = bool(
             has_valid_route
             and (
@@ -1518,6 +1666,12 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                         },
                         source_step_text=step_text,
                     )
+            elif capability_rejected_reason:
+                route_path = "router_capability_reject"
+                unresolved_steps.append(step_text)
+            elif feasibility_rejected_reason:
+                route_path = "router_feasibility_reject"
+                unresolved_steps.append(step_text)
             elif tool_name and tool_name in TOOL_REGISTRY and missing_args:
                 route_path = "router_missing_args_fallback"
                 unresolved_steps.append(step_text)
@@ -1534,6 +1688,10 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
                 "args": args,
                 "missing_args": missing_args,
                 "rejected_reason": rejected_reason,
+                "planned_tool": planned_tool,
+                "planned_intent": planned_intent,
+                "capability_rejected_reason": capability_rejected_reason,
+                "feasibility_rejected_reason": feasibility_rejected_reason,
                 "path": route_path,
             }
         )
@@ -2855,6 +3013,11 @@ def _build_local_fastpath_plan(task: str) -> list[dict] | None:
     if explorer_search_plan is not None:
         return explorer_search_plan
 
+    # Prioritize deterministic YouTube comment workflows before generic local-path search.
+    youtube_comment_plan = _build_youtube_comment_fastpath_plan(task=task, text=text)
+    if youtube_comment_plan is not None:
+        return youtube_comment_plan
+
     local_path_search_plan = _build_local_path_search_fastpath_plan(task=task, text=text)
     if local_path_search_plan is not None:
         return local_path_search_plan
@@ -2882,10 +3045,6 @@ def _build_local_fastpath_plan(task: str) -> list[dict] | None:
     browser_stress_plan = _build_browser_stress_fastpath_plan(task=task, text=text)
     if browser_stress_plan is not None:
         return browser_stress_plan
-
-    youtube_comment_plan = _build_youtube_comment_fastpath_plan(task=task, text=text)
-    if youtube_comment_plan is not None:
-        return youtube_comment_plan
 
     app_name = _extract_core_app_name(text)
     if app_name is not None:
