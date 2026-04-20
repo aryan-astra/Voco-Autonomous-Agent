@@ -583,7 +583,7 @@ class VocoApp(App):
                 label = f"{tool} - {reason}" if reason else tool
                 steps.append(label)
         if not steps:
-            root.add("[#7E7E81]Waiting for plan...[/]")
+            root.add(Text("Waiting for plan...", style="#7E7E81"))
             tree.refresh()
             return
 
@@ -601,7 +601,7 @@ class VocoApp(App):
                 color = "#E53935"
             elif status == "running":
                 color = "#29B6F6"
-            root.add(f"[{color}][Step {idx}][/color] {step}", expand=True)
+            root.add(Text(f"[Step {idx}] {step}", style=color), expand=True)
         tree.refresh()
 
     def _emit_to_ui(self, message: str, level: str = "info") -> None:
