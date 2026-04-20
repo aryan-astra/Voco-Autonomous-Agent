@@ -108,6 +108,7 @@ class BenchmarkScenario:
     steps: tuple[BenchmarkStep, ...]
     required_tools: tuple[str, ...] = ()
     completion_indicators: tuple[str, ...] = ()
+    disallowed_tools: tuple[str, ...] = ()
     completion_output_markers: tuple[str, ...] = ()
     completion_artifact_paths: tuple[str, ...] = ()
     enforce_no_duplicate_open_app: bool = False
@@ -284,6 +285,41 @@ BENCHMARK_SCENARIOS: tuple[BenchmarkScenario, ...] = (
             ),
         ),
         required_tools=("web_codegen_autofix",),
+    ),
+    BenchmarkScenario(
+        scenario_id="misroute-browser-chatgpt-notepad",
+        category="misroute",
+        description="Guardrail regression: browser-first chat workflow must not route to local path search.",
+        steps=(
+            task_step(
+                "Open Chrome and go to chatgpt.com."
+            ),
+        ),
+        required_tools=("browser_navigate",),
+        completion_indicators=("browser_navigate",),
+        disallowed_tools=("search_local_paths",),
+    ),
+    BenchmarkScenario(
+        scenario_id="misroute-browser-youtube-first-video",
+        category="misroute",
+        description="Guardrail regression: YouTube browser workflow must not be hijacked into local search.",
+        steps=(
+            task_step("Open YouTube, search MKBHD latest video, and open the first result."),
+        ),
+        required_tools=("browser_navigate", "browser_type"),
+        completion_indicators=("browser_navigate",),
+        disallowed_tools=("search_local_paths",),
+    ),
+    BenchmarkScenario(
+        scenario_id="misroute-noisy-browser-prompt",
+        category="misroute",
+        description="Guardrail regression: noisy browser prompt with typo should stay browser-first.",
+        steps=(
+            task_step("Open chorme and go to youtube.com."),
+        ),
+        required_tools=("browser_navigate",),
+        completion_indicators=("browser_navigate",),
+        disallowed_tools=("search_local_paths",),
     ),
 )
 
@@ -1016,12 +1052,13 @@ def _run_benchmark_scenario(scenario: BenchmarkScenario) -> dict:
         tool_sequence = [tool_name for tool_name in executed_tools if tool_name]
     unique_tools = sorted(set(tool_sequence))
     missing_required_tools = sorted(tool for tool in scenario.required_tools if tool not in unique_tools)
+    triggered_disallowed_tools = sorted(tool for tool in scenario.disallowed_tools if tool in unique_tools)
     required_tool_coverage = (
         1.0
         if not scenario.required_tools
         else (len(scenario.required_tools) - len(missing_required_tools)) / len(scenario.required_tools)
     )
-    tool_coverage_passed = len(missing_required_tools) == 0
+    tool_coverage_passed = len(missing_required_tools) == 0 and len(triggered_disallowed_tools) == 0
 
     completion_indicators = scenario.completion_indicators or scenario.required_tools
     successful_tools = {
@@ -1100,6 +1137,10 @@ def _run_benchmark_scenario(scenario: BenchmarkScenario) -> dict:
         completion_oracle_failures.append(
             "Missing completion indicators: " + ", ".join(missing_completion_indicators)
         )
+    if triggered_disallowed_tools:
+        completion_oracle_failures.append(
+            "Disallowed tools were executed: " + ", ".join(triggered_disallowed_tools)
+        )
     if missing_completion_output_markers:
         completion_oracle_failures.append(
             "Missing completion output markers: " + ", ".join(missing_completion_output_markers)
@@ -1121,7 +1162,12 @@ def _run_benchmark_scenario(scenario: BenchmarkScenario) -> dict:
         failure_reason = step_failure_reason
     elif not tool_coverage_passed:
         failure_type = "tool_coverage"
-        failure_reason = "Missing expected tool coverage: " + ", ".join(missing_required_tools)
+        coverage_reasons: list[str] = []
+        if missing_required_tools:
+            coverage_reasons.append("missing expected tools: " + ", ".join(missing_required_tools))
+        if triggered_disallowed_tools:
+            coverage_reasons.append("disallowed tools executed: " + ", ".join(triggered_disallowed_tools))
+        failure_reason = "Tool coverage failed: " + "; ".join(coverage_reasons)
     elif not completion_oracle_passed:
         failure_type = "completion_oracle"
         failure_reason = "Completion oracle failed: " + "; ".join(completion_oracle_failures)
@@ -1136,6 +1182,7 @@ def _run_benchmark_scenario(scenario: BenchmarkScenario) -> dict:
     assertions = {
         "required_tool_coverage": tool_coverage_passed,
         "completion_indicators": len(missing_completion_indicators) == 0,
+        "disallowed_tools_not_executed": len(triggered_disallowed_tools) == 0,
         "completion_output_markers": len(missing_completion_output_markers) == 0,
         "completion_artifact_paths": len(missing_completion_artifact_paths) == 0,
         "no_duplicate_open_app": duplicate_open_app_check_passed,
@@ -1151,12 +1198,14 @@ def _run_benchmark_scenario(scenario: BenchmarkScenario) -> dict:
         "success": success,
         "latency_seconds": latency,
         "required_tools": list(scenario.required_tools),
+        "disallowed_tools": list(scenario.disallowed_tools),
         "completion_indicators": list(completion_indicators),
         "completion_output_markers": list(completion_output_markers),
         "completion_artifact_paths": list(completion_artifact_paths),
         "executed_tools": unique_tools,
         "tool_sequence": tool_sequence,
         "missing_required_tools": missing_required_tools,
+        "triggered_disallowed_tools": triggered_disallowed_tools,
         "missing_completion_indicators": missing_completion_indicators,
         "missing_completion_output_markers": missing_completion_output_markers,
         "missing_completion_artifact_paths": missing_completion_artifact_paths,
@@ -1174,6 +1223,7 @@ def _run_benchmark_scenario(scenario: BenchmarkScenario) -> dict:
             },
             "missing": {
                 "indicators": missing_completion_indicators,
+                "disallowed_tools": triggered_disallowed_tools,
                 "output_markers": missing_completion_output_markers,
                 "artifact_paths": missing_completion_artifact_paths,
             },
@@ -1224,9 +1274,11 @@ def list_benchmark_scenarios() -> None:
     print("Available benchmark scenarios:")
     for scenario in BENCHMARK_SCENARIOS:
         required = ", ".join(scenario.required_tools) if scenario.required_tools else "none"
+        disallowed = ", ".join(scenario.disallowed_tools) if scenario.disallowed_tools else "none"
         print(f"  - {scenario.scenario_id} [{scenario.category}]")
         print(f"      {scenario.description}")
         print(f"      required_tools: {required}")
+        print(f"      disallowed_tools: {disallowed}")
 
 
 def list_stress_capability_baseline() -> None:

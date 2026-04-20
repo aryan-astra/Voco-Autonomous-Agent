@@ -98,6 +98,17 @@ VOCO now reuses existing windows for common desktop actions unless you explicitl
 - `write_in_notepad` reuses the current Notepad window by default
 - decomposition cleanup suppresses redundant `open browser` steps when a `browser_navigate` step already follows
 
+### 3.1) Hybrid route-family guardrails (feature flags)
+
+Route-family contracts are now feature-flagged so rollout can be tuned without code edits:
+
+- `ROUTER_HYBRID_MODE` (default: `true`)
+- `ROUTE_CONTRACTS_ENABLED` (default: `true`)
+- `ROUTE_CLASSIFIER_GUARD_ENABLED` (default: `true`)
+- `ROUTE_CLASSIFIER_MIN_CONFIDENCE` (default: `0.72`)
+
+When enabled, explicit browser-navigation prompts are blocked from incompatible route families (for example, local path search/content generation drift).
+
 ### 4) Browser typing/newline policy
 
 Browser text actions now support explicit submit/newline controls:

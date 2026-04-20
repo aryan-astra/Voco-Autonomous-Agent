@@ -24,6 +24,10 @@ from constants import (
     OLLAMA_MODEL,
     OLLAMA_NUM_CTX_COMPLEX,
     OLLAMA_NUM_CTX_SIMPLE,
+    ROUTE_CLASSIFIER_GUARD_ENABLED,
+    ROUTE_CLASSIFIER_MIN_CONFIDENCE,
+    ROUTE_CONTRACTS_ENABLED,
+    ROUTER_HYBRID_MODE,
     WORKSPACE_PATH,
 )
 from context import AgentContext
@@ -36,7 +40,7 @@ from llm import (
     get_last_num_ctx_used,
 )
 from memory import SecureMemoryError, append_context_entry, append_event, append_memory
-from router import predict_route
+from router import predict_route, predict_route_family
 from tools import TOOL_REGISTRY, dispatch_tool
 from _prompt import build_correction_prompt, build_system_prompt, parse_response
 
@@ -409,6 +413,15 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
         emit("[VOCO] Autonomous mode active: human approval prompts are disabled.", "info")
 
     local_plan = _build_local_fastpath_plan(task)
+    if local_plan is not None and ROUTE_CONTRACTS_ENABLED and ROUTER_HYBRID_MODE:
+        contract_rejection = _route_contract_rejection_reason(task=task, plan=local_plan)
+        if contract_rejection:
+            emit(
+                "[VOCO] Fast-path rejected by route contracts; switching to hybrid routing "
+                f"({contract_rejection}).",
+                "info",
+            )
+            local_plan = None
     tool_first_bundle = None
     if local_plan is None:
         planning_phase_started_at = time.perf_counter()
@@ -802,6 +815,37 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 result = {"status": "error", "result": None, "message": "Step args must be an object."}
             elif tool_name not in TOOL_REGISTRY:
                 result = {"status": "error", "result": None, "message": f"Unknown tool: '{tool_name}'"}
+            elif ROUTE_CONTRACTS_ENABLED and ROUTER_HYBRID_MODE:
+                step_contract_error = _step_contract_violation(task=task, tool_name=tool_name)
+                if step_contract_error:
+                    result = {
+                        "status": "error",
+                        "result": None,
+                        "message": f"Route contract blocked step {index}: {step_contract_error}",
+                    }
+                elif not policy_allowed:
+                    policy_metadata = _build_policy_metadata(
+                        tool_name=tool_name,
+                        requires_approval=requires_approval,
+                        human_approved=human_approved,
+                        policy_scope=context.access_level_policy,
+                        policy_allowed=policy_allowed,
+                        policy_reason=policy_reason,
+                        policy_error_code=policy_error_code,
+                        simulation=policy_simulation,
+                    )
+                    result = _build_policy_denied_result(tool_name=tool_name, policy_metadata=policy_metadata)
+                else:
+                    result = dispatch_tool(tool_name, tool_args)
+                    status = str(result.get("status", "")).strip().lower()
+                    if status != "success":
+                        rolled_back, rollback_message = _rollback_file(rollback_snapshot)
+                        if rollback_message:
+                            result_message = _normalize_whitespace(str(result.get("message", "")))
+                            if rolled_back:
+                                result["message"] = f"{result_message} {rollback_message}".strip()
+                            else:
+                                result["message"] = f"{result_message} {rollback_message}".strip()
             elif not policy_allowed:
                 policy_metadata = _build_policy_metadata(
                     tool_name=tool_name,
@@ -1515,6 +1559,121 @@ def _build_policy_denied_result(tool_name: str, policy_metadata: dict) -> dict:
         f"{_format_policy_metadata(policy_metadata)}"
     )
     return {"status": "error", "result": None, "message": message}
+
+
+_TOOL_ROUTE_FAMILY: dict[str, str] = {
+    "browser_navigate": "browser_automation",
+    "browser_type": "browser_automation",
+    "browser_click": "browser_automation",
+    "browser_press_key": "browser_automation",
+    "browser_get_state": "browser_automation",
+    "browser_switch_profile": "browser_automation",
+    "youtube_comment_pipeline": "browser_automation",
+    "search_local_paths": "local_search",
+    "search_in_explorer": "local_search",
+    "search_file": "local_search",
+    "index_files": "local_search",
+    "open_existing_document": "doc_authoring",
+    "wikipedia_topic_report": "doc_authoring",
+    "ai_story_pipeline": "content_generation",
+    "ai_text_to_file_pipeline": "content_generation",
+    "save_text_to_desktop_file": "content_generation",
+    "save_text_to_sample_file": "content_generation",
+    "write_in_notepad": "content_generation",
+    "odd_even_codegen_pipeline": "code_generation",
+    "web_codegen_autofix": "code_generation",
+    "open_app": "system_control",
+    "mute_audio": "system_control",
+    "take_screenshot": "system_control",
+    "get_running_apps": "system_control",
+    "run_command": "system_control",
+}
+
+
+def _infer_plan_route_family(plan: list[dict]) -> str:
+    family_counts: dict[str, int] = {}
+    for step in plan:
+        if not isinstance(step, dict):
+            continue
+        tool_name = str(step.get("tool", "")).strip()
+        family = _TOOL_ROUTE_FAMILY.get(tool_name, "unknown")
+        family_counts[family] = family_counts.get(family, 0) + 1
+    if not family_counts:
+        return "unknown"
+    return max(family_counts, key=family_counts.get)
+
+
+def _extract_prompt_route_constraints(task: str) -> dict[str, bool]:
+    text = str(task or "").lower()
+    explicit_browser = bool(
+        any(token in text for token in ["open browser", "open chrome", "open edge", "open firefox", "go to ", "visit "])
+        or re.search(r"https?://", text)
+        or re.search(r"\bgo to\s+[a-z0-9\-\.]+\.[a-z]{2,}", text)
+    )
+    explicit_local = bool(
+        any(
+            token in text
+            for token in [
+                "on my pc",
+                "on this pc",
+                "in my pc",
+                "in this pc",
+                "local file",
+                "local folder",
+                "workspace",
+            ]
+        )
+    )
+    explicit_code = bool(any(token in text for token in ["python", ".py", "function", "code", "script"]))
+    explicit_doc = bool(any(token in text for token in ["docx", "word document", "word doc", "report"]))
+    return {
+        "explicit_browser": explicit_browser,
+        "explicit_local": explicit_local,
+        "explicit_code": explicit_code,
+        "explicit_doc": explicit_doc,
+    }
+
+
+def _route_contract_rejection_reason(task: str, plan: list[dict]) -> str:
+    constraints = _extract_prompt_route_constraints(task=task)
+    plan_family = _infer_plan_route_family(plan=plan)
+    if constraints["explicit_browser"] and plan_family in {"content_generation", "local_search", "doc_authoring"}:
+        return f"explicit_browser_navigation_conflicts_with_plan_family:{plan_family}"
+    if constraints["explicit_local"] and plan_family == "browser_automation":
+        return "explicit_local_scope_conflicts_with_browser_plan"
+    if constraints["explicit_code"] and plan_family == "content_generation":
+        return "explicit_code_request_conflicts_with_content_generation_plan"
+    if constraints["explicit_doc"] and plan_family == "content_generation":
+        return "explicit_document_request_conflicts_with_content_generation_plan"
+
+    if ROUTE_CLASSIFIER_GUARD_ENABLED and ROUTER_HYBRID_MODE:
+        family_prediction = predict_route_family(task)
+        predicted_family = str(family_prediction.get("family", "unknown")).strip() or "unknown"
+        predicted_confidence = float(family_prediction.get("confidence", 0.0) or 0.0)
+        if (
+            predicted_confidence >= ROUTE_CLASSIFIER_MIN_CONFIDENCE
+            and predicted_family not in {"", "unknown"}
+            and plan_family not in {"unknown", predicted_family}
+        ):
+            return (
+                "classifier_family_mismatch:"
+                f"plan={plan_family};predicted={predicted_family};confidence={predicted_confidence:.2f}"
+            )
+    return ""
+
+
+def _step_contract_violation(task: str, tool_name: str) -> str:
+    family = _TOOL_ROUTE_FAMILY.get(str(tool_name).strip(), "unknown")
+    constraints = _extract_prompt_route_constraints(task=task)
+    if constraints["explicit_browser"] and family in {"content_generation", "local_search", "doc_authoring"}:
+        return f"explicit_browser_navigation_blocks_tool_family:{family}"
+    if constraints["explicit_local"] and family == "browser_automation":
+        return "explicit_local_scope_blocks_browser_tool_family"
+    if constraints["explicit_code"] and family == "content_generation":
+        return "explicit_code_request_blocks_content_generation_tool_family"
+    if constraints["explicit_doc"] and family == "content_generation":
+        return "explicit_document_request_blocks_content_generation_tool_family"
+    return ""
 
 
 def _annotate_step_reason(step_text: str, route_path: str, base_reason: str, tool_name: str) -> str:
@@ -4473,6 +4632,9 @@ def _build_youtube_comment_fastpath_plan(task: str, text: str) -> list[dict] | N
 
 
 def _build_story_generation_fastpath_plan(task: str, text: str) -> list[dict] | None:
+    if _has_explicit_browser_navigation(task=task, text=text):
+        return None
+
     has_story_hint = "story" in text and any(
         token in text for token in ["write", "generate", "create", "prompt", "ask", "search"]
     )
@@ -4507,6 +4669,8 @@ def _build_story_generation_fastpath_plan(task: str, text: str) -> list[dict] | 
 
 
 def _build_ai_text_generation_fastpath_plan(task: str, text: str) -> list[dict] | None:
+    if _has_explicit_browser_navigation(task=task, text=text):
+        return None
     if "story" in text or _looks_like_codegen_request(text=text):
         return None
 
@@ -4535,6 +4699,20 @@ def _build_ai_text_generation_fastpath_plan(task: str, text: str) -> list[dict] 
             "reason": "Generate requested AI text content and save it to the target output file.",
         }
     ]
+
+
+def _has_explicit_browser_navigation(task: str, text: str) -> bool:
+    navigation_tokens = ["open browser", "open chrome", "open edge", "open firefox", "go to ", "visit ", "navigate "]
+    if any(token in text for token in navigation_tokens):
+        return True
+    if re.search(r"https?://", task, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\bgo to\s+[a-z0-9\-\.]+\.[a-z]{2,}", task, flags=re.IGNORECASE):
+        return True
+    url_candidate = _extract_browser_url(task=task, text=text)
+    if url_candidate and re.search(r"\b(open|go to|visit|navigate|search)\b", text, flags=re.IGNORECASE):
+        return True
+    return False
 
 
 def _build_odd_even_codegen_fastpath_plan(task: str, text: str) -> list[dict] | None:
@@ -4973,7 +5151,7 @@ def _extract_browser_actions(task: str, text: str) -> list[dict]:
     submit_requested = _browser_submit_requested(task)
 
     search_match = re.search(
-        r"\bsearch(?:\s+for)?\s+(.+?)(?=\s+(?:and|then)\s+(?:play|click|open|press|type|write)\b|\s*$)",
+        r"\bsearch(?:\s+for)?\s+(.+?)(?=\s+(?:and|then)\s+(?:play|click|open|press|type|write)\b|\s+(?:whatever\s+output|copy|paste|save)\b|\s*$)",
         task,
         flags=re.IGNORECASE,
     )
@@ -5012,6 +5190,8 @@ def _extract_browser_actions(task: str, text: str) -> list[dict]:
     )
     if type_or_write_match:
         typed_text = _normalize_browser_multiline_text(_clean_browser_action_text(type_or_write_match.group(1)))
+        if re.search(r"\b(?:copy|paste)\b.*\bnotepad\b", task, flags=re.IGNORECASE) and "notepad" in typed_text.lower():
+            typed_text = ""
         if typed_text:
             type_action: dict[str, object] = {
                 "kind": "type",

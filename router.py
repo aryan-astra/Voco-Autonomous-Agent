@@ -171,6 +171,26 @@ INTENT_CATALOG: dict[str, dict] = {
     },
 }
 
+INTENT_ROUTE_FAMILY: dict[str, str] = {
+    "open_file": "local_search",
+    "list_files": "local_search",
+    "open_app": "system_control",
+    "browser_navigate": "browser_automation",
+    "browser_switch_profile": "browser_automation",
+    "browser_type": "browser_automation",
+    "browser_click": "browser_automation",
+    "browser_get_state": "browser_automation",
+    "get_page_title": "browser_automation",
+    "copy_text_to_clipboard": "browser_automation",
+    "search_local_paths": "local_search",
+    "search_in_explorer": "local_search",
+    "write_in_notepad": "content_generation",
+    "save_text_to_desktop_file": "content_generation",
+    "open_existing_document": "doc_authoring",
+    "youtube_comment_pipeline": "browser_automation",
+    "web_codegen_autofix": "code_generation",
+}
+
 
 _BROWSER_KEYWORDS = ("youtube", "video", "browser", "website", "web", "chatgpt", "x.com", "google")
 _APP_ALIASES = (
@@ -419,6 +439,25 @@ def _clean_phrase(raw: str) -> str:
     cleaned = str(raw).strip().strip("\"'").strip()
     cleaned = cleaned.rstrip(".,;:!?")
     return re.sub(r"\s+", " ", cleaned)
+
+
+def _normalize_intent_text(raw: str) -> str:
+    text = str(raw or "").strip()
+    replacements = (
+        (r"\bopn\b", "open"),
+        (r"\bchorme\b", "chrome"),
+        (r"\bnot\s+pad\b", "notepad"),
+        (r"\bfint\b", "find"),
+        (r"\bserch\b", "search"),
+        (r"\bchat\s*g\s*p\s*t\b", "chatgpt"),
+        (r"\bchat\s*zipiti\b", "chatgpt"),
+        (r"\bchat\s*gpti\b", "chatgpt"),
+    )
+    normalized = text
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
 
 
 def _normalize_browser_text(raw: str) -> str:
@@ -935,7 +974,7 @@ class IntentRouter:
         return best_intent, min(0.79, 0.35 + best_score)
 
     def predict(self, text: str) -> RouteDecision:
-        content = str(text or "").strip()
+        content = _normalize_intent_text(text)
         if not content:
             return RouteDecision(
                 intent="unknown",
@@ -1147,6 +1186,78 @@ ROUTER = IntentRouter(INTENT_CATALOG)
 def predict_route(text: str) -> dict[str, object]:
     """Return normalized route decision for one atomic step."""
     return ROUTER.predict(text).to_dict()
+
+
+def predict_route_family(text: str) -> dict[str, object]:
+    """
+    Predict coarse route family for a full prompt.
+    Families: browser_automation | local_search | content_generation |
+    code_generation | doc_authoring | system_control | unknown
+    """
+    content = _normalize_intent_text(text)
+    if not content:
+        return {"family": "unknown", "confidence": 0.0, "source": "empty_input", "intent": "unknown"}
+
+    lower = content.lower()
+    scores = {
+        "browser_automation": 0.0,
+        "local_search": 0.0,
+        "content_generation": 0.0,
+        "code_generation": 0.0,
+        "doc_authoring": 0.0,
+        "system_control": 0.0,
+    }
+
+    browser_tokens = ("browser", "chrome", "edge", "firefox", "youtube", "chatgpt", "website", "go to ", ".com", "http")
+    local_tokens = ("on my pc", "on this pc", "in my pc", "in this pc", "local file", "folder", "directory", "path")
+    content_tokens = ("story", "summarize", "explain", "draft", "write", "generate", "answer", "prompt")
+    code_tokens = ("python", ".py", "code", "function", "script", "program")
+    doc_tokens = ("docx", "word document", "report", "wikipedia")
+    system_tokens = ("open app", "launch", "mute", "unmute", "screenshot", "running apps", "settings")
+
+    if any(token in lower for token in browser_tokens):
+        scores["browser_automation"] += 2.0
+    if any(token in lower for token in local_tokens):
+        scores["local_search"] += 2.0
+    if any(token in lower for token in content_tokens):
+        scores["content_generation"] += 1.6
+    if any(token in lower for token in code_tokens):
+        scores["code_generation"] += 2.0
+    if any(token in lower for token in doc_tokens):
+        scores["doc_authoring"] += 2.0
+    if any(token in lower for token in system_tokens):
+        scores["system_control"] += 1.4
+
+    if re.search(r"\b(?:open|visit|navigate|search|click|type|press)\b", lower):
+        scores["browser_automation"] += 0.8
+    if re.search(r"\b(?:find|locate|search)\b", lower) and any(token in lower for token in local_tokens):
+        scores["local_search"] += 0.9
+    if re.search(r"\b(?:create|generate|write)\b", lower) and any(token in lower for token in code_tokens):
+        scores["code_generation"] += 1.0
+
+    decision = ROUTER.predict(content)
+    mapped_family = INTENT_ROUTE_FAMILY.get(decision.intent, "")
+    if mapped_family:
+        scores[mapped_family] = max(scores[mapped_family], 0.8 + float(decision.confidence))
+
+    family = max(scores, key=scores.get)
+    score = float(scores[family])
+    if score <= 0:
+        return {
+            "family": "unknown",
+            "confidence": 0.0,
+            "source": "none",
+            "intent": decision.intent,
+        }
+
+    confidence = min(0.98, 0.45 + (score / 3.2))
+    source = "intent_router" if mapped_family else "heuristic"
+    return {
+        "family": family,
+        "confidence": round(confidence, 4),
+        "source": source,
+        "intent": decision.intent,
+    }
 
 
 def should_split_task(text: str) -> bool:
