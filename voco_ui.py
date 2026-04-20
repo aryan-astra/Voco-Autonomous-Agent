@@ -624,10 +624,29 @@ class VocoApp(App):
         self.call_from_thread(self._update_output, safe_message, color)
         self.call_from_thread(self._update_task_tree, _agent_context)
 
+    def _safe_emit_to_ui(self, message: str, level: str = "info") -> None:
+        try:
+            self._emit_to_ui(message, level)
+        except Exception:
+            try:
+                print(message)
+            except Exception:
+                pass
+
+    def _ensure_worker_alive(self) -> None:
+        if self._worker_stop.is_set():
+            return
+        if self._worker_thread.is_alive():
+            return
+        self._worker_thread = threading.Thread(target=self._task_worker_loop, daemon=True, name="voco-task-worker")
+        self._worker_thread.start()
+        self._safe_emit_to_ui("[VOCO] Task worker was restarted.", "info")
+
     def _handle_user_input(self, task: str) -> None:
         """Queue user tasks for a single persistent worker thread."""
         if not task.strip():
             return
+        self._ensure_worker_alive()
         self._task_queue.put(task)
         pending = self._task_queue.qsize()
         self._update_output(f"[VOCO] Queued task ({pending} pending).", "white")
@@ -639,8 +658,14 @@ class VocoApp(App):
                 task = self._task_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
+            except Exception as exc:
+                self._safe_emit_to_ui(f"[VOCO] Worker queue error: {exc}", "error")
+                continue
             if task is None:
-                self._task_queue.task_done()
+                try:
+                    self._task_queue.task_done()
+                except ValueError:
+                    pass
                 break
 
             try:
@@ -650,9 +675,12 @@ class VocoApp(App):
                     ui_callback=lambda msg, lvl: self._emit_to_ui(msg, lvl),
                 )
             except Exception as exc:
-                self._emit_to_ui(f"[VOCO] FATAL ERROR: {exc}", "error")
+                self._safe_emit_to_ui(f"[VOCO] FATAL ERROR: {exc}", "error")
             finally:
-                self._task_queue.task_done()
+                try:
+                    self._task_queue.task_done()
+                except ValueError:
+                    pass
 
     def action_voice_toggle(self) -> None:
         chat_log = self._activate_conversation()
