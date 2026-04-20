@@ -3468,9 +3468,27 @@ def _write_incomplete_state(task: str, plan: list, tool_results: list) -> None:
         return
 
 
+def _normalize_fastpath_text(task: str) -> str:
+    normalized = str(task or "").lower().strip()
+    replacements = (
+        (r"\bnot\s+pad\b", "notepad"),
+        (r"\bchat\s*g\s*p\s*t\b", "chatgpt"),
+        (r"\bchat\s*gp\s*t\b", "chatgpt"),
+        (r"\bchat\s*gpti\b", "chatgpt"),
+        (r"\bchat\s*gpti\b", "chatgpt"),
+        (r"\bchat\s*zipiti\b", "chatgpt"),
+        (r"\bchat\s*zpt\b", "chatgpt"),
+        (r"\bfint\b", "find"),
+    )
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
 def _build_local_fastpath_plan(task: str) -> list[dict] | None:
     """Return a direct tool plan for simple commands that do not require LLM planning."""
-    text = task.lower().strip()
+    text = _normalize_fastpath_text(task)
 
     unmute_patterns = [
         r"\bun[-\s]?mute\b",
@@ -3545,6 +3563,10 @@ def _build_local_fastpath_plan(task: str) -> list[dict] | None:
     story_plan = _build_story_generation_fastpath_plan(task=task, text=text)
     if story_plan is not None:
         return story_plan
+
+    ai_text_plan = _build_ai_text_generation_fastpath_plan(task=task, text=text)
+    if ai_text_plan is not None:
+        return ai_text_plan
 
     odd_even_plan = _build_odd_even_codegen_fastpath_plan(task=task, text=text)
     if odd_even_plan is not None:
@@ -4028,12 +4050,25 @@ def _extract_local_path_search_query(task: str, text: str) -> str | None:
 def _looks_like_chat_ai_target(text: str) -> bool:
     if any(
         token in text
-        for token in ["chatgpt", "chat gpt", "free ai", "free ai platform", "ai platform", "openai", "assistant"]
+        for token in [
+            "chatgpt",
+            "chat gpt",
+            "free ai",
+            "free ai platform",
+            "ai platform",
+            "openai",
+            "assistant",
+            "claude",
+            "gemini",
+            "copilot",
+            "perplexity",
+            "grok",
+        ]
     ):
         return True
-    if re.search(r"\bchat[a-z0-9\-]{1,24}\.(?:com|ai|org|net)\b", text):
+    if re.search(r"\b(?:chat|claude|gemini|copilot|perplexity|grok)[a-z0-9\-]{0,24}\.(?:com|ai|org|net)\b", text):
         return True
-    if re.search(r"\bchat[a-z0-9\-]{0,18}(?:gpt|gpti|gpti)\b", text):
+    if re.search(r"\bchat[a-z0-9\-]{0,20}(?:gpt|gpti)\b", text):
         return True
     return False
 
@@ -4464,8 +4499,40 @@ def _build_story_generation_fastpath_plan(task: str, text: str) -> list[dict] | 
                 "prompt": task.strip(),
                 "output_filename": output_filename,
                 "output_dir": _resolve_output_dir_hint(text=text),
+                "open_in_notepad": "notepad" in text,
             },
             "reason": "Generate story content and save it to the requested output directory.",
+        }
+    ]
+
+
+def _build_ai_text_generation_fastpath_plan(task: str, text: str) -> list[dict] | None:
+    if "story" in text or _looks_like_codegen_request(text=text):
+        return None
+
+    has_ai_hint = _looks_like_chat_ai_target(text=text)
+    has_generation_hint = any(
+        token in text
+        for token in ["write", "generate", "create", "draft", "summarize", "explain", "answer", "ask", "prompt"]
+    )
+    has_save_hint = any(
+        token in text
+        for token in ["save", "save it", "copy", "paste", "file", "notepad", "txt", "text file", "directory", "folder"]
+    )
+    if not (has_ai_hint and has_generation_hint and has_save_hint):
+        return None
+
+    output_filename = _extract_txt_filename(task=task) or "ai_output.txt"
+    return [
+        {
+            "tool": "ai_text_to_file_pipeline",
+            "args": {
+                "prompt": task.strip(),
+                "output_filename": output_filename,
+                "output_dir": _resolve_output_dir_hint(text=text),
+                "open_in_notepad": "notepad" in text,
+            },
+            "reason": "Generate requested AI text content and save it to the target output file.",
         }
     ]
 
@@ -4817,6 +4884,11 @@ def _extract_browser_url(task: str, text: str) -> str | None:
         return "https://www.google.com"
     known_sites = {
         "chatgpt": "https://chatgpt.com",
+        "claude": "https://claude.ai",
+        "gemini": "https://gemini.google.com",
+        "copilot": "https://copilot.microsoft.com",
+        "perplexity": "https://www.perplexity.ai",
+        "grok": "https://grok.com",
         "github": "https://github.com",
         "gitlab": "https://gitlab.com",
         "twitter": "https://x.com",

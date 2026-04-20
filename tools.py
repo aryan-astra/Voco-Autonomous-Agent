@@ -2534,6 +2534,45 @@ def ai_story_pipeline(
     return _ok(payload, f"Generated story and saved it to {payload.get('path')}.")
 
 
+def ai_text_to_file_pipeline(
+    prompt: str,
+    output_filename: str | None = None,
+    output_dir: str = "desktop",
+    open_in_notepad: bool = False,
+    temperature: float = 0.35,
+) -> dict:
+    request_text = str(prompt or "").strip()
+    if not request_text:
+        return _err("AI text request cannot be empty.")
+
+    try:
+        temp = float(temperature)
+    except (TypeError, ValueError):
+        temp = 0.35
+    bounded_temp = max(0.05, min(0.95, temp))
+
+    generation_prompt = (
+        "Respond to the user request clearly and completely.\n"
+        "Return plain text only with no markdown fences.\n"
+        f"User request: {request_text}"
+    )
+    ok, ai_text = _run_free_ai_text(generation_prompt, temperature=bounded_temp)
+    if not ok:
+        return _err(f"AI text generation failed: {ai_text}")
+
+    save_result = save_text_to_desktop_file(
+        content=ai_text,
+        filename=output_filename or f"ai_output_{int(time.time())}.txt",
+        target_dir=output_dir,
+        open_in_notepad=open_in_notepad,
+    )
+    if save_result.get("status") != "success":
+        return save_result
+    payload = dict(save_result.get("result", {}))
+    payload["characters"] = len(ai_text)
+    return _ok(payload, f"Generated AI text and saved it to {payload.get('path')}.")
+
+
 def odd_even_codegen_pipeline(
     prompt: str,
     filename: str = "odd_even.py",
@@ -5535,6 +5574,17 @@ TOOL_REGISTRY = {
             "output_filename": "string (optional, .txt)",
             "output_dir": "string (optional: desktop/sample)",
             "open_in_notepad": "boolean (optional, default false)",
+        },
+    },
+    "ai_text_to_file_pipeline": {
+        "fn": ai_text_to_file_pipeline,
+        "description": "Generate general AI text response via local AI path and save it to Desktop/sample directory.",
+        "args": {
+            "prompt": "string",
+            "output_filename": "string (optional, .txt)",
+            "output_dir": "string (optional: desktop/sample)",
+            "open_in_notepad": "boolean (optional, default false)",
+            "temperature": "float (optional, default 0.35)",
         },
     },
     "odd_even_codegen_pipeline": {
