@@ -23,6 +23,7 @@ from typing import Any
 from constants import HISTORY_FILE
 from context import AgentContext
 from orchestrator import run as orchestrator_run
+from startup_check import run_startup_check
 from tools import dispatch_tool
 
 
@@ -75,6 +76,19 @@ TEST_PROMPTS = [
     },
     {"prompt": "set volume", "category": "messy", "expected_path": "os_action"},
     {"prompt": "i need to see youtube", "category": "messy", "expected_path": "os_action"},
+]
+
+FAST_EVAL_PROMPTS = [
+    {"prompt": "mute audio", "category": "fast_path", "expected_path": "os_action"},
+    {"prompt": "what apps are running", "category": "fast_path", "expected_path": "os_action"},
+    {"prompt": "open notepad", "category": "fast_path", "expected_path": "os_action"},
+    {"prompt": "list workspace files", "category": "llm_simple", "expected_path": "llm_task"},
+    {"prompt": "open chrome", "category": "llm_simple", "expected_path": "os_action"},
+    {"prompt": "search youtube for lofi", "category": "llm_multi", "expected_path": "os_action"},
+    {"prompt": "find files in sample-search-space", "category": "file_search", "expected_path": "llm_task"},
+    {"prompt": "take a screenshot", "category": "fast_path", "expected_path": "os_action"},
+    {"prompt": "opn chrome", "category": "typo_test", "expected_path": "os_action"},
+    {"prompt": "search for python file", "category": "file_search", "expected_path": "llm_task"},
 ]
 
 
@@ -631,22 +645,44 @@ def export_learning_data(
     return stats
 
 
-def evaluate() -> dict:
-    """Run the original 20-prompt reliability suite and return the report."""
+def auto_diagnose(results: list[dict]) -> str:
+    """Analyze eval outcomes and surface likely systemic fixes."""
+    if not results:
+        return "No results captured."
+    timeout_count = sum(1 for item in results if "timed out" in str(item.get("final_output", "")).lower())
+    format_fail_count = sum(1 for item in results if bool(item.get("format_failure")))
+    issues: list[str] = []
+    if timeout_count > len(results) * 0.3:
+        issues.append(
+            "HIGH TIMEOUT RATE: Verify startup_check output, reduce num_ctx, and confirm model is warm in Ollama."
+        )
+    if format_fail_count > len(results) * 0.3:
+        issues.append(
+            "HIGH FORMAT FAILURE: Rebuild voco-agent model and validate prompt/system contract outputs."
+        )
+    return "\n".join(issues) if issues else "No obvious systemic issues found."
+
+
+def evaluate(*, prompts: list[dict] | None = None, run_startup: bool = True, pause_seconds: float = 1.0) -> dict:
+    """Run reliability suite and return report."""
+    selected_prompts = prompts if prompts is not None else TEST_PROMPTS
+    if run_startup:
+        run_startup_check(autofix=True, strict=False)
+
     print("=" * 60)
     print("VOCO EVALUATION SUITE")
     print(f"Started: {datetime.datetime.now().isoformat()}")
-    print(f"Total prompts: {len(TEST_PROMPTS)}")
+    print(f"Total prompts: {len(selected_prompts)}")
     print("=" * 60)
 
     results: list[dict] = []
 
-    for index, test in enumerate(TEST_PROMPTS, start=1):
+    for index, test in enumerate(selected_prompts, start=1):
         prompt = test["prompt"]
         category = test["category"]
         expected_path = test["expected_path"]
 
-        print(f"\n[{index}/{len(TEST_PROMPTS)}] Category: {category}")
+        print(f"\n[{index}/{len(selected_prompts)}] Category: {category}")
         print(f"  Prompt: {prompt}")
 
         context = AgentContext()
@@ -695,7 +731,7 @@ def evaluate() -> dict:
             print(f"  FAIL EXCEPTION: {exc}")
 
         results.append(result)
-        time.sleep(1)
+        time.sleep(max(0.0, float(pause_seconds)))
 
     total = len(results)
     successes = sum(1 for result in results if result["success"])
@@ -703,7 +739,8 @@ def evaluate() -> dict:
     avg_elapsed = sum(result["elapsed_seconds"] for result in results) / total
 
     by_category = {}
-    for category in ["easy", "medium", "router_stress", "messy"]:
+    category_order = sorted({str(item.get("category", "unknown")) for item in selected_prompts})
+    for category in category_order:
         category_results = [result for result in results if result["category"] == category]
         success_count = sum(1 for result in category_results if result["success"])
         by_category[category] = {
@@ -753,6 +790,9 @@ def evaluate() -> dict:
         json.dump(report, file_handle, indent=2, ensure_ascii=False)
 
     print(f"\nFull report saved to: {report_file}")
+    if report["success_rate"] < 50.0:
+        print(auto_diagnose(results))
+        print("\nSuggested next action: Run startup_check.py and verify Ollama GPU/context settings.")
     return report
 
 
@@ -1364,7 +1404,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="VOCO evaluation + benchmark runner.")
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("suite", help="Run the original 20-prompt evaluation suite.")
+    suite_parser = subparsers.add_parser("suite", help="Run reliability evaluation suite.")
+    suite_parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Run reduced 10-prompt fast suite.",
+    )
 
     benchmark_parser = subparsers.add_parser("benchmark", help="Run benchmark scenarios with regression gate.")
     benchmark_parser.add_argument(
@@ -1456,7 +1501,12 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command or "suite"
 
     if command == "suite":
-        evaluate()
+        run_fast = bool(getattr(args, "fast", False))
+        evaluate(
+            prompts=FAST_EVAL_PROMPTS if run_fast else TEST_PROMPTS,
+            run_startup=True,
+            pause_seconds=0.3 if run_fast else 1.0,
+        )
         return 0
 
     if command == "benchmark":

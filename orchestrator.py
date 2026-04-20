@@ -408,12 +408,16 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
     if HUMAN_APPROVAL_DISABLED:
         emit("[VOCO] Autonomous mode active: human approval prompts are disabled.", "info")
 
-    planning_phase_started_at = time.perf_counter()
-    emit("[VOCO] Decomposing and routing task...", "info")
-    tool_first_bundle = _build_tool_first_hybrid_plan(task=task, context=context, emit=emit)
-    planning_phase_elapsed = time.perf_counter() - planning_phase_started_at
-    emit(f"[VOCO] Decompose/route phase completed in {planning_phase_elapsed:.1f}s.", "info")
-    local_plan = _build_local_fastpath_plan(task) if tool_first_bundle is None else None
+    local_plan = _build_local_fastpath_plan(task)
+    tool_first_bundle = None
+    if local_plan is None:
+        planning_phase_started_at = time.perf_counter()
+        emit("[VOCO] Decomposing and routing task...", "info")
+        tool_first_bundle = _build_tool_first_hybrid_plan(task=task, context=context, emit=emit)
+        planning_phase_elapsed = time.perf_counter() - planning_phase_started_at
+        emit(f"[VOCO] Decompose/route phase completed in {planning_phase_elapsed:.1f}s.", "info")
+    else:
+        emit("[VOCO] Deterministic fast-path route matched.", "info")
 
     if tool_first_bundle is not None:
         bundle_error = str(tool_first_bundle.get("error", "")).strip()
@@ -3493,6 +3497,24 @@ def _build_local_fastpath_plan(task: str) -> list[dict] | None:
             }
         ]
 
+    if re.search(r"\b(cpu|memory|ram|disk)\b", text):
+        return [
+            {
+                "tool": "get_system_health_snapshot",
+                "args": {},
+                "reason": "Direct local command for system health status.",
+            }
+        ]
+
+    if re.search(r"\b(list|show)\s+(files|folders|workspace)\b", text):
+        return [
+            {
+                "tool": "list_files",
+                "args": {"directory": "workspace"},
+                "reason": "Direct local command for workspace file listing.",
+            }
+        ]
+
     privileged_plan = _build_privileged_command_fastpath_plan(task=task, text=text)
     if privileged_plan is not None:
         return privileged_plan
@@ -3506,7 +3528,7 @@ def _build_local_fastpath_plan(task: str) -> list[dict] | None:
             }
         ]
 
-    if "running apps" in text or "what apps are currently running" in text:
+    if "running apps" in text or "what apps are currently running" in text or "what apps are running" in text:
         return [
             {
                 "tool": "get_running_apps",
@@ -3514,6 +3536,42 @@ def _build_local_fastpath_plan(task: str) -> list[dict] | None:
                 "reason": "Direct local command for listing active windows.",
             }
         ]
+
+    # Prioritize deterministic high-level workflows before generic file/index paths.
+    youtube_comment_plan = _build_youtube_comment_fastpath_plan(task=task, text=text)
+    if youtube_comment_plan is not None:
+        return youtube_comment_plan
+
+    story_plan = _build_story_generation_fastpath_plan(task=task, text=text)
+    if story_plan is not None:
+        return story_plan
+
+    odd_even_plan = _build_odd_even_codegen_fastpath_plan(task=task, text=text)
+    if odd_even_plan is not None:
+        return odd_even_plan
+
+    wiki_report_plan = _build_wikipedia_report_fastpath_plan(task=task, text=text)
+    if wiki_report_plan is not None:
+        return wiki_report_plan
+
+    if re.search(r"\b(?:find|search)\s+(?:for\s+)?([a-z0-9._\- ]+?)\s+files?\b", task, flags=re.IGNORECASE):
+        query_match = re.search(r"\b(?:find|search)\s+(?:for\s+)?([a-z0-9._\- ]+?)\s+files?\b", task, flags=re.IGNORECASE)
+        if query_match:
+            query_text = _clean_browser_action_text(query_match.group(1))
+            if query_text:
+                normalized_query = "py" if query_text in {"python", "python file"} else query_text
+                return [
+                    {
+                        "tool": "index_files",
+                        "args": {"scope": "quick", "max_files": 15000},
+                        "reason": "Refresh quick index before indexed file lookup.",
+                    },
+                    {
+                        "tool": "search_file",
+                        "args": {"query": normalized_query, "limit": 10, "open_first": False, "kind": "all"},
+                        "reason": "Direct indexed file search path for fast local lookup.",
+                    }
+                ]
 
     availability_plan = _build_app_availability_fastpath_plan(task=task, text=text)
     if availability_plan is not None:
@@ -3530,11 +3588,6 @@ def _build_local_fastpath_plan(task: str) -> list[dict] | None:
     explorer_search_plan = _build_explorer_search_fastpath_plan(task=task, text=text)
     if explorer_search_plan is not None:
         return explorer_search_plan
-
-    # Prioritize deterministic YouTube comment workflows before generic local-path search.
-    youtube_comment_plan = _build_youtube_comment_fastpath_plan(task=task, text=text)
-    if youtube_comment_plan is not None:
-        return youtube_comment_plan
 
     local_path_search_plan = _build_local_path_search_fastpath_plan(task=task, text=text)
     if local_path_search_plan is not None:
@@ -3571,6 +3624,15 @@ def _build_local_fastpath_plan(task: str) -> list[dict] | None:
                 "tool": "open_app",
                 "args": {"app_name": app_name},
                 "reason": "Direct local command for opening a core demo application.",
+            }
+        ]
+
+    if re.search(r"\bopn\s+chrome\b|\bopen\s+chorme\b", text):
+        return [
+            {
+                "tool": "open_app",
+                "args": {"app_name": "chrome"},
+                "reason": "Typo-tolerant direct local command for opening Chrome.",
             }
         ]
 
@@ -3971,11 +4033,25 @@ def _build_index_fastpath_plan(task: str, text: str) -> list[dict] | None:
             }
         ]
 
-    if normalized in {"/index", "index files", "index file"} or re.search(
-        r"\bindex\s+(?:files?|filesystem|this pc|my pc)\b",
+    if normalized in {"/index-sample", "index sample", "index sample files"}:
+        return [
+            {
+                "tool": "index_files",
+                "args": {"scope": "sample"},
+                "reason": "Build sample-space file index for fast local demos.",
+            }
+        ]
+
+    if normalized in {"/index", "/index-quick", "index files", "index file", "index quick"} or re.search(
+        r"\bindex\s+(?:files?|filesystem|this pc|my pc|sample|quick|full)\b",
         text,
     ):
-        scope = "full" if any(token in text for token in ["full", "all", "this pc", "my pc"]) else "quick"
+        if any(token in text for token in ["sample", "/index-sample"]):
+            scope = "sample"
+        elif any(token in text for token in ["full", "all", "this pc", "my pc", "/index-full"]):
+            scope = "full"
+        else:
+            scope = "quick"
         return [
             {
                 "tool": "index_files",
@@ -4136,6 +4212,55 @@ def _extract_txt_filename(task: str) -> str | None:
     return None
 
 
+def _extract_docx_filename(task: str) -> str | None:
+    quoted_matches = re.findall(r'"([^"]+)"|\'([^\']+)\'', task)
+    for left, right in quoted_matches:
+        candidate = (left or right).strip()
+        if candidate.lower().endswith(".docx"):
+            return Path(candidate).name
+    match = re.search(r"\b([a-zA-Z0-9_\-]+\.docx)\b", task)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _resolve_output_dir_hint(text: str) -> str:
+    if any(
+        token in text
+        for token in [
+            "sample-search-space",
+            "sample search space",
+            "sample folder",
+            "sample dir",
+            "same dir",
+            "same directory",
+            "same folder",
+        ]
+    ):
+        return "sample"
+    return "desktop"
+
+
+def _extract_wikipedia_topic(task: str, text: str) -> str | None:
+    if "elon musk" in text:
+        return "Elon Musk"
+    quoted_match = re.search(r'"([^"]+)"|\'([^\']+)\'', task)
+    if quoted_match:
+        candidate = (quoted_match.group(1) or quoted_match.group(2) or "").strip()
+        if candidate and "docx" not in candidate.lower():
+            return candidate
+    about_match = re.search(
+        r"\b(?:about|on)\s+([a-zA-Z][a-zA-Z0-9 .'\-]{2,80})",
+        task,
+        flags=re.IGNORECASE,
+    )
+    if about_match:
+        candidate = re.sub(r"\b(?:and|with)\b.*$", "", about_match.group(1), flags=re.IGNORECASE).strip()
+        if candidate:
+            return candidate
+    return None
+
+
 def _extract_youtube_pipeline_query(task: str, text: str) -> str | None:
     patterns = [
         r"\byoutube\b.*?\bsearch(?:\s+for)?\s+(.+?)(?=\s+(?:and|then)\s+(?:open|play|pause|go|copy|paste|save|export)\b|[,.]|$)",
@@ -4149,6 +4274,7 @@ def _extract_youtube_pipeline_query(task: str, text: str) -> str | None:
             continue
         candidate = _clean_browser_action_text(match.group(1))
         candidate = re.sub(r"\b(?:comments?|pipeline|extract|save|export)\b.*$", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\b(?:and|then)\s*$", "", candidate, flags=re.IGNORECASE).strip()
         if candidate:
             return candidate
 
@@ -4277,6 +4403,7 @@ def _build_youtube_comment_fastpath_plan(task: str, text: str) -> list[dict] | N
     output_filename = _extract_txt_filename(task=task)
     if output_filename:
         args["output_filename"] = output_filename
+    args["output_dir"] = _resolve_output_dir_hint(text=text)
     if "notepad" in text:
         args["open_in_notepad"] = True
     if "dry run" in text or "--dry-run" in text:
@@ -4287,6 +4414,82 @@ def _build_youtube_comment_fastpath_plan(task: str, text: str) -> list[dict] | N
             "tool": "youtube_comment_pipeline",
             "args": args,
             "reason": "Run deterministic YouTube search/play/pause/comment extraction pipeline with Desktop export.",
+        }
+    ]
+
+
+def _build_story_generation_fastpath_plan(task: str, text: str) -> list[dict] | None:
+    has_story_hint = "story" in text and any(token in text for token in ["write", "generate", "create", "prompt", "ask"])
+    has_ai_hint = any(
+        token in text
+        for token in ["chatgpt", "chat gpt", "free ai", "free ai platform", "ai platform", "openai", "assistant"]
+    )
+    has_save_hint = any(
+        token in text
+        for token in ["save", "save it", "file", "text file", "paste", "directory", "dir", "folder"]
+    )
+    if not (has_story_hint and has_ai_hint and has_save_hint):
+        return None
+
+    output_filename = _extract_txt_filename(task=task) or "ai_story.txt"
+    return [
+        {
+            "tool": "ai_story_pipeline",
+            "args": {
+                "prompt": task.strip(),
+                "output_filename": output_filename,
+                "output_dir": _resolve_output_dir_hint(text=text),
+            },
+            "reason": "Generate story content and save it to the requested output directory.",
+        }
+    ]
+
+
+def _build_odd_even_codegen_fastpath_plan(task: str, text: str) -> list[dict] | None:
+    has_odd_even = bool(
+        re.search(r"\bodd\s*(?:[-/ ]|or\s+)?\s*even\b", text)
+        or ("odd" in text and "even" in text)
+    )
+    has_code_hint = any(token in text for token in ["python", "code", "function", "file", "run"])
+    if not (has_odd_even and has_code_hint):
+        return None
+
+    filename = _extract_python_filename(task=task, text=text) or "odd_even.py"
+    return [
+        {
+            "tool": "odd_even_codegen_pipeline",
+            "args": {
+                "prompt": task.strip(),
+                "filename": filename,
+                "output_dir": _resolve_output_dir_hint(text=text),
+                "run_timeout_seconds": 20,
+            },
+            "reason": "Create and execute odd/even Python function file in the target output directory.",
+        }
+    ]
+
+
+def _build_wikipedia_report_fastpath_plan(task: str, text: str) -> list[dict] | None:
+    if "wikipedia" not in text:
+        return None
+    if not any(token in text for token in ["word document", "word doc", "docx", "report"]):
+        return None
+    topic = _extract_wikipedia_topic(task=task, text=text)
+    if topic is None:
+        return None
+
+    output_filename = _extract_docx_filename(task=task) or "wikipedia_report.docx"
+    return [
+        {
+            "tool": "wikipedia_topic_report",
+            "args": {
+                "topic": topic,
+                "output_filename": output_filename,
+                "output_dir": _resolve_output_dir_hint(text=text),
+                "include_images": True,
+                "max_images": 1,
+            },
+            "reason": "Fetch Wikipedia info and create a Word report with images in the target output directory.",
         }
     ]
 

@@ -14,6 +14,7 @@ from constants import (
 )
 from context import AgentContext
 from memory import SecureMemoryError, load_user_profile_dict
+from skills.skills_registry import find_matching_skill, format_skill_hint
 
 
 def build_system_prompt(context: AgentContext) -> str:
@@ -37,6 +38,9 @@ USER PROFILE:
 RECENT HISTORY (last 10 actions):
 {history_text}
 """
+    task_text = str(getattr(context, "task", "")).strip()
+    skill = find_matching_skill(task_text)
+    skill_block = f"\n{format_skill_hint(skill)}\n" if skill is not None else ""
 
     system_prompt = f"""You are VOCO, a Windows OS automation agent. You DO NOT chat. You DO NOT explain. You DO NOT ask questions.
 
@@ -60,6 +64,7 @@ NEVER OUTPUT ANYTHING EXCEPT THE JSON ARRAY.
 
 AVAILABLE TOOLS:
 {tool_spec}
+{skill_block}
 {profile_block}{history_block}
 
 RULES:

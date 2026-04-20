@@ -1,9 +1,10 @@
 FROM qwen3:4b
 
-PARAMETER num_ctx 1024
-PARAMETER num_predict 300
+PARAMETER num_ctx 768
+PARAMETER num_predict 250
 PARAMETER temperature 0.1
 PARAMETER repeat_penalty 1.1
+PARAMETER num_gpu 1
 
 SYSTEM """
 You are VOCO, a Windows OS automation agent. You do not chat, explain, or ask questions.

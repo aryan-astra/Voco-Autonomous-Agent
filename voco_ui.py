@@ -3,6 +3,14 @@
 import asyncio
 import queue
 import threading
+
+from startup_check import run_startup_check
+
+try:
+    _STARTUP_STATUS = run_startup_check(autofix=True, strict=False)
+except Exception as _startup_exc:  # pragma: no cover - defensive startup guard
+    _STARTUP_STATUS = {"ok": False, "issues": [f"startup check failed: {_startup_exc}"]}
+
 from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -232,6 +240,8 @@ class VocoApp(App):
         self._voice_enabled = False
         self._voice_degraded = False
         self._ptt_recording = False
+        self._ptt_transcribing = False
+        self._ptt_transcribe_thread: threading.Thread | None = None
         self._fs_watcher_observer = None
 
     def compose(self) -> ComposeResult:
@@ -250,7 +260,7 @@ class VocoApp(App):
                             yield Static(self.MASCOT_FRAMES[0], id="mascot")
                             yield Label(f"Text model: {constants.OLLAMA_MODEL}", id="text-model", classes="meta")
                             yield Label("Voice model: probing...", id="voice-model", classes="meta")
-                            yield Label("/workspace/voco/apps", classes="meta")
+                            yield Label(str(constants.WORKSPACE_PATH), classes="meta")
                             yield Label("Voice: OFF (PTT default)", id="voice-status")
 
                         # Right activity/information column.
@@ -325,7 +335,9 @@ class VocoApp(App):
         chat_log.write(Text("  /agents           Spawn mock sub-agent", style="#D4D4D4"))
         chat_log.write(Text("  /security-review  Start mock security pass", style="#D4D4D4"))
         chat_log.write(Text("  /resume           Continue last workflow", style="#D4D4D4"))
-        chat_log.write(Text("  /index            Build full file index", style="#D4D4D4"))
+        chat_log.write(Text("  /index-sample     Build sample file index", style="#D4D4D4"))
+        chat_log.write(Text("  /index-quick      Build quick file index", style="#D4D4D4"))
+        chat_log.write(Text("  /index-full       Build full file index (slow)", style="#D4D4D4"))
         chat_log.write(Text("  /index-app        Build installed app index", style="#D4D4D4"))
         chat_log.write(Text("  Space             Start/stop push-to-talk capture", style="#D4D4D4"))
         chat_log.write(Text("  C                 Clear conversation log", style="#D4D4D4"))
@@ -357,9 +369,19 @@ class VocoApp(App):
             chat_log.write(Text("Ready for next instruction.", style="#D4D4D4"))
             return True
 
-        if normalized == "/index":
-            chat_log.write(Text("[VOCO] Starting full file index build...", style="#C96B45"))
-            self._handle_user_input("index files on my pc")
+        if normalized == "/index-sample":
+            chat_log.write(Text("[VOCO] Starting sample-space file index build...", style="#C96B45"))
+            self._handle_user_input("index files sample")
+            return True
+
+        if normalized in {"/index", "/index-quick"}:
+            chat_log.write(Text("[VOCO] Starting quick file index build...", style="#C96B45"))
+            self._handle_user_input("index files quick")
+            return True
+
+        if normalized == "/index-full":
+            chat_log.write(Text("[VOCO] Starting full file index build (may take a while)...", style="#C96B45"))
+            self._handle_user_input("index files on my pc full")
             return True
 
         if normalized == "/index-app":
@@ -374,7 +396,7 @@ class VocoApp(App):
         if normalized == "/workspace":
             await asyncio.sleep(0.15)
             chat_log.write(Text("[VOCO] Workspace", style="#C96B45"))
-            chat_log.write(Text("  Root   /workspace/voco/apps", style="#D4D4D4"))
+            chat_log.write(Text(f"  Root   {constants.WORKSPACE_PATH}", style="#D4D4D4"))
             text_model = str(self.query_one("#text-model", Label).renderable).replace("Text model:", "").strip()
             voice_model = str(self.query_one("#voice-model", Label).renderable).replace("Voice model:", "").strip()
             chat_log.write(Text(f"  Text   {text_model}", style="#D4D4D4"))
@@ -700,6 +722,9 @@ class VocoApp(App):
         if not self._voice_enabled or self._voice_agent is None:
             chat_log.write(Text("[VOCO VOICE] Voice is OFF.", style="yellow"))
             return
+        if self._ptt_transcribing:
+            chat_log.write(Text("[VOCO VOICE] Still transcribing the previous capture...", style="yellow"))
+            return
 
         try:
             if not self._ptt_recording:
@@ -712,22 +737,51 @@ class VocoApp(App):
                 chat_log.write(Text("[VOCO VOICE] Recording... press SPACE again to transcribe.", style="#C96B45"))
                 return
 
-            transcript = str(self._voice_agent.end_push_to_talk()).strip()
             self._ptt_recording = False
-            if self._voice_degraded:
-                self._set_voice_status_indicator("DEGRADED", "PTT degraded", "yellow")
-            else:
-                self._set_voice_status_indicator("ON", "PTT", "green")
-
-            if not transcript:
-                chat_log.write(Text("[VOCO VOICE] No speech captured.", style="yellow"))
-                return
-            chat_log.write(Text(f"[VOCO VOICE] {transcript}", style="#D4D4D4"))
-            self._queue_voice_command(transcript)
+            self._ptt_transcribing = True
+            self._set_voice_status_indicator("PROCESSING", "Transcribing...", "#29B6F6")
+            chat_log.write(Text("[VOCO VOICE] Transcribing...", style="#29B6F6"))
+            self._start_ptt_transcription()
         except Exception as exc:
             self._ptt_recording = False
             self._set_voice_status_indicator("DEGRADED", "ptt error", "red")
             chat_log.write(Text(f"[VOCO VOICE] Push-to-talk failed: {exc}", style="red"))
+
+    def _start_ptt_transcription(self) -> None:
+        if self._voice_agent is None:
+            self._finish_ptt_transcription("", "Voice agent is unavailable.")
+            return
+
+        def _worker() -> None:
+            transcript = ""
+            error_message = ""
+            try:
+                transcript = str(self._voice_agent.end_push_to_talk()).strip()
+            except Exception as exc:  # pragma: no cover - runtime-specific failures
+                error_message = str(exc)
+            self.call_from_thread(self._finish_ptt_transcription, transcript, error_message)
+
+        self._ptt_transcribe_thread = threading.Thread(target=_worker, daemon=True)
+        self._ptt_transcribe_thread.start()
+
+    def _finish_ptt_transcription(self, transcript: str, error_message: str) -> None:
+        self._ptt_transcribing = False
+        chat_log = self._activate_conversation()
+        if error_message:
+            self._set_voice_status_indicator("DEGRADED", "ptt error", "red")
+            chat_log.write(Text(f"[VOCO VOICE] Push-to-talk failed: {error_message}", style="red"))
+            return
+
+        if self._voice_degraded:
+            self._set_voice_status_indicator("DEGRADED", "PTT degraded", "yellow")
+        else:
+            self._set_voice_status_indicator("ON", "PTT", "green")
+
+        if not transcript:
+            chat_log.write(Text("[VOCO VOICE] No speech captured.", style="yellow"))
+            return
+        chat_log.write(Text(f"[VOCO VOICE] {transcript}", style="#D4D4D4"))
+        self._queue_voice_command(transcript)
 
     def action_clear_log(self) -> None:
         chat_log = self.query_one("#chat-log", RichLog)

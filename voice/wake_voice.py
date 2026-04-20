@@ -28,13 +28,11 @@ def _bootstrap_voice_cache_env() -> None:
     runtime_root = _default_runtime_root()
     hf_home = str(os.getenv("HF_HOME", "")).strip() or os.path.join(runtime_root, "huggingface")
     hf_hub_cache = str(os.getenv("HF_HUB_CACHE", "")).strip() or os.path.join(hf_home, "hub")
-    transformers_cache = str(os.getenv("TRANSFORMERS_CACHE", "")).strip() or os.path.join(hf_home, "transformers")
 
     paths = [
         _normalize_bootstrap_path(runtime_root),
         _normalize_bootstrap_path(hf_home),
         _normalize_bootstrap_path(hf_hub_cache),
-        _normalize_bootstrap_path(transformers_cache),
     ]
     for path_value in paths:
         try:
@@ -45,7 +43,6 @@ def _bootstrap_voice_cache_env() -> None:
     os.environ["VOCO_RUNTIME_ROOT"] = _normalize_bootstrap_path(runtime_root)
     os.environ["HF_HOME"] = _normalize_bootstrap_path(hf_home)
     os.environ["HF_HUB_CACHE"] = _normalize_bootstrap_path(hf_hub_cache)
-    os.environ["TRANSFORMERS_CACHE"] = _normalize_bootstrap_path(transformers_cache)
 
 
 _bootstrap_voice_cache_env()
@@ -61,9 +58,9 @@ except ImportError:  # pragma: no cover - optional runtime dependency
     sd = None
 
 try:
-    from transformers import pipeline as transformers_pipeline
+    from faster_whisper import WhisperModel as FasterWhisperModel
 except ImportError:  # pragma: no cover - optional runtime dependency
-    transformers_pipeline = None
+    FasterWhisperModel = None
 
 
 class VocoVoice:
@@ -74,16 +71,16 @@ class VocoVoice:
     INTERACTION_MODE_PUSH_TO_TALK = "push_to_talk"
     INTERACTION_MODES = {INTERACTION_MODE_PUSH_TO_TALK}
     DEFAULT_WHISPER_MODEL = constants.VOICE_MODEL_ID
-    VOICE_BASE_INSTALL_HINT = "pip install sounddevice numpy transformers torch"
+    VOICE_BASE_INSTALL_HINT = "pip install sounddevice numpy faster-whisper"
     VOCO_RUNTIME_ROOT_ENV = "VOCO_RUNTIME_ROOT"
     HF_HOME_ENV = "HF_HOME"
     HF_HUB_CACHE_ENV = "HF_HUB_CACHE"
-    TRANSFORMERS_CACHE_ENV = "TRANSFORMERS_CACHE"
+    WHISPER_COMPUTE_TYPE = constants.VOICE_COMPUTE_TYPE
 
     _DEPENDENCY_PACKAGE_MAP = {
         "sounddevice": "sounddevice",
         "numpy": "numpy",
-        "transformers": "transformers",
+        "faster_whisper": "faster-whisper",
     }
 
     @classmethod
@@ -99,22 +96,16 @@ class VocoVoice:
         runtime_root = str(os.getenv(cls.VOCO_RUNTIME_ROOT_ENV, "")).strip() or _default_runtime_root()
         hf_home = str(os.getenv(cls.HF_HOME_ENV, "")).strip() or os.path.join(runtime_root, "huggingface")
         hf_hub_cache = str(os.getenv(cls.HF_HUB_CACHE_ENV, "")).strip() or os.path.join(hf_home, "hub")
-        transformers_cache = str(os.getenv(cls.TRANSFORMERS_CACHE_ENV, "")).strip() or os.path.join(
-            hf_home,
-            "transformers",
-        )
         paths = {
             "runtime_root": _normalize_bootstrap_path(runtime_root),
             "hf_home": _normalize_bootstrap_path(hf_home),
             "hf_hub_cache": _normalize_bootstrap_path(hf_hub_cache),
-            "transformers_cache": _normalize_bootstrap_path(transformers_cache),
         }
         for value in paths.values():
             os.makedirs(value, exist_ok=True)
         os.environ[cls.VOCO_RUNTIME_ROOT_ENV] = paths["runtime_root"]
         os.environ[cls.HF_HOME_ENV] = paths["hf_home"]
         os.environ[cls.HF_HUB_CACHE_ENV] = paths["hf_hub_cache"]
-        os.environ[cls.TRANSFORMERS_CACHE_ENV] = paths["transformers_cache"]
         return paths
 
     @classmethod
@@ -124,8 +115,8 @@ class VocoVoice:
             missing.append("sounddevice")
         if np is None:
             missing.append("numpy")
-        if transformers_pipeline is None:
-            missing.append("transformers")
+        if FasterWhisperModel is None:
+            missing.append("faster_whisper")
 
         status: dict[str, object] = {
             "available": len(missing) == 0,
@@ -169,7 +160,7 @@ class VocoVoice:
             self._whisper_model_size = self.DEFAULT_WHISPER_MODEL
         self._interaction_mode = self._normalize_interaction_mode(interaction_mode)
         self._asr_loaded = False
-        self._asr_pipeline = None
+        self._fw_model = None
         self.on_command = on_command_callback
         self._on_status = on_status_callback
         self.vad_mode = "ptt-only"
@@ -201,13 +192,14 @@ class VocoVoice:
     def _ensure_asr_loaded(self) -> None:
         if self._asr_loaded:
             return
-        if transformers_pipeline is None:
-            raise RuntimeError("transformers is not available for ASR pipeline initialization.")
-        self._asr_pipeline = transformers_pipeline(
-            "automatic-speech-recognition",
-            model=self._whisper_model_size,
-            device=-1,
-            model_kwargs={"cache_dir": self._runtime_paths["hf_hub_cache"]},
+        if FasterWhisperModel is None:
+            raise RuntimeError("faster-whisper is not available for ASR initialization.")
+        self._fw_model = FasterWhisperModel(
+            self._whisper_model_size,
+            device="cpu",
+            compute_type=self.WHISPER_COMPUTE_TYPE,
+            num_workers=1,
+            download_root=self._runtime_paths["runtime_root"],
         )
         self._asr_loaded = True
 
@@ -254,7 +246,7 @@ class VocoVoice:
     def stop(self) -> None:
         self._stop_ptt_stream()
         self._listening = False
-        self._asr_pipeline = None
+        self._fw_model = None
         self._asr_loaded = False
         gc.collect()
 
@@ -321,9 +313,15 @@ class VocoVoice:
         self._ensure_asr_loaded()
         audio = np.concatenate(frames).astype(np.float32) / 32768.0
         try:
-            result = self._asr_pipeline({"raw": audio, "sampling_rate": self.SAMPLE_RATE})
+            segments, _ = self._fw_model.transcribe(
+                audio,
+                language=constants.VOICE_TRANSCRIBE_LANGUAGE,
+                beam_size=1,
+                vad_filter=True,
+                condition_on_previous_text=False,
+            )
         except Exception as exc:  # pragma: no cover - runtime/model specific
             self._emit_status(f"Transcription failed ({self._whisper_model_size}): {exc}", "error")
             return ""
         gc.collect()
-        return str(result.get("text", "")).strip()
+        return " ".join(str(segment.text).strip() for segment in segments).strip()

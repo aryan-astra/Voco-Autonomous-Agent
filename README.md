@@ -216,6 +216,12 @@ Or run with admin elevation helper:
 run_voco_admin.bat
 ```
 
+## Build VOCO XML training data
+
+```powershell
+python build_voco_training_data.py --target 200 --output-dir voco_training_data
+```
+
 ### Runtime storage policy (O: drive)
 
 `run_voco_admin.bat` now enforces O-drive runtime paths for mutable caches/artifacts when available:

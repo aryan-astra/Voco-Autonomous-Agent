@@ -2,11 +2,15 @@
 
 import gc
 import json
+import os
+import subprocess
 import time
 
 import requests
 
 from constants import (
+    GPU_LAYERS,
+    GPU_LAYERS_ENV,
     OLLAMA_CTX_FALLBACK_LEVELS,
     OLLAMA_FAST_MODEL_CANDIDATES,
     OLLAMA_HEAVY_MODEL_CANDIDATES,
@@ -28,6 +32,42 @@ _last_num_ctx_used = OLLAMA_NUM_CTX_SIMPLE
 _model_cache: list[str] = []
 _model_cache_expires_at = 0.0
 _MODEL_CACHE_TTL_SECONDS = 5
+
+
+def _detect_gpu_layers() -> int:
+    """Detect a safe Ollama num_gpu setting for this machine."""
+    override = os.environ.get(GPU_LAYERS_ENV, "").strip()
+    if override:
+        try:
+            return max(0, int(override))
+        except ValueError:
+            pass
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode == 0 and str(result.stdout).strip():
+            return 999
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.LoadLibrary("OpenCL.dll")
+            return 1
+        except OSError:
+            pass
+
+    return max(0, int(GPU_LAYERS))
+
+
+_GPU_LAYERS = 0 if OLLAMA_CPU_ONLY else _detect_gpu_layers()
 
 
 def _failure_plan(reason: str, failure_reason: str = "connection error") -> str:
@@ -168,11 +208,12 @@ def _post_chat(
 ) -> requests.Response:
     options = {
         "temperature": temperature,
+        "top_p": 0.9,
+        "repeat_penalty": 1.1,
         "num_predict": 1024 if num_predict is None else num_predict,
         "num_ctx": num_ctx,
+        "num_gpu": _GPU_LAYERS,
     }
-    if OLLAMA_CPU_ONLY:
-        options["num_gpu"] = 0
     payload = {
         "model": model_name,
         "messages": messages,

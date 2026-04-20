@@ -30,14 +30,16 @@ OLLAMA_FAST_MODEL_CANDIDATES = [
 OLLAMA_HEAVY_MODEL_CANDIDATES = [
     "qwen3:4b",
 ]
-OLLAMA_NUM_CTX_SIMPLE = 2048
-OLLAMA_NUM_CTX_COMPLEX = 2048
-OLLAMA_NUM_CTX_MIN = 512
-OLLAMA_NUM_CTX_CONVERSATION = 2048
-OLLAMA_CTX_FALLBACK_LEVELS = [8192, 6144, 4096, 3072, 2048, 1536, 1024, 768, 512]
-OLLAMA_REQUEST_TIMEOUT_SECONDS = 120
-OLLAMA_CONVERSATION_TIMEOUT_SECONDS = 90
-OLLAMA_CPU_ONLY = True
+OLLAMA_NUM_CTX_SIMPLE = 512
+OLLAMA_NUM_CTX_COMPLEX = 1024
+OLLAMA_NUM_CTX_MIN = 256
+OLLAMA_NUM_CTX_CONVERSATION = 512
+OLLAMA_CTX_FALLBACK_LEVELS = [1024, 768, 512, 384, 256]
+OLLAMA_REQUEST_TIMEOUT_SECONDS = 45
+OLLAMA_CONVERSATION_TIMEOUT_SECONDS = 60
+OLLAMA_CPU_ONLY = False
+GPU_LAYERS = 0
+GPU_LAYERS_ENV = "VOCO_NUM_GPU_LAYERS"
 
 # Backward-compatible aliases
 MODEL_NAME = OLLAMA_MODEL
@@ -60,12 +62,52 @@ HUMAN_APPROVAL_DISABLED = True
 # ── Voice ──────────────────────────────────────────────────────────────────────
 PTT_KEY = "space"
 PTT_DEBOUNCE_MS = 100
-VOICE_MODEL_ID = "distil-whisper/distil-small.en"
+VOICE_MODEL_ID = "tiny"
+VOICE_TRANSCRIBE_LANGUAGE = "en"
+VOICE_COMPUTE_TYPE = "int8"
 VOICE_PREALLOCATE_BUFFER_SEC = 30
 
 # ── Persistence/runtime ────────────────────────────────────────────────────────
 DB_WAL_MODE = True
 WATCHDOG_DEBOUNCE_SEC = 5
+
+# ── Indexing / search scope ────────────────────────────────────────────────────
+SAMPLE_SEARCH_SPACE = BASE_DIR.parent / "sample-search-space"
+INDEX_SCOPE_DEFAULT = "sample"  # sample | quick | full
+INDEX_QUICK_USER_FOLDERS = ("Desktop", "Documents", "Downloads")
+CONTENT_READABLE_EXTENSIONS = frozenset(
+    {
+        ".py",
+        ".txt",
+        ".md",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".csv",
+        ".html",
+        ".js",
+        ".ts",
+        ".css",
+        ".xml",
+        ".toml",
+        ".ini",
+        ".bat",
+        ".ps1",
+        ".sh",
+        ".log",
+        ".rst",
+        ".cfg",
+    }
+)
+MAX_CONTENT_READ_BYTES = 4096
+MAX_INDEXABLE_FILE_BYTES = 10 * 1024 * 1024
+
+# ── MCP sidecar configuration ──────────────────────────────────────────────────
+MCP_ENABLED = True
+MCP_PLAYWRIGHT_PORT = 8931
+MCP_PLAYWRIGHT_URL = f"http://localhost:{MCP_PLAYWRIGHT_PORT}"
+MCP_DEVTOOLS_PORT = 8932
+MCP_DEVTOOLS_URL = f"http://localhost:{MCP_DEVTOOLS_PORT}"
 
 # ── Sandbox ───────────────────────────────────────────────────────────────────
 ALLOWED_EXTENSIONS = {".py", ".txt", ".md", ".json", ".csv", ".yaml", ".yml"}

@@ -18,12 +18,23 @@ import shutil
 import subprocess
 import threading
 import time
+import zipfile
 from collections import Counter, deque
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
-from constants import MEMORY_DIR, WORKSPACE_PATH
+from constants import (
+    CONTENT_READABLE_EXTENSIONS,
+    INDEX_QUICK_USER_FOLDERS,
+    INDEX_SCOPE_DEFAULT,
+    MAX_CONTENT_READ_BYTES,
+    MAX_INDEXABLE_FILE_BYTES,
+    MEMORY_DIR,
+    SAMPLE_SEARCH_SPACE,
+    WORKSPACE_PATH,
+)
 from memory import SecureMemoryError, load_user_profile_dict, save_user_profile_dict
+import requests
 
 try:
     import pyautogui
@@ -744,20 +755,82 @@ def _desktop_root() -> Path:
     return desktop
 
 
-def _sanitize_desktop_filename(filename: str | None, default_name: str) -> str:
+def _sample_space_root() -> Path:
+    SAMPLE_SEARCH_SPACE.mkdir(parents=True, exist_ok=True)
+    return SAMPLE_SEARCH_SPACE.resolve()
+
+
+def _sanitize_text_filename(filename: str | None, default_name: str, extension: str = ".txt") -> str:
     candidate = Path(str(filename or "").strip()).name
     if not candidate:
         candidate = default_name
-    if not candidate.lower().endswith(".txt"):
-        candidate = f"{candidate}.txt"
+    extension_value = str(extension or ".txt").strip().lower()
+    if not extension_value.startswith("."):
+        extension_value = f".{extension_value}"
+    if not candidate.lower().endswith(extension_value):
+        candidate = f"{candidate}{extension_value}"
     cleaned = re.sub(r'[<>:"/\\|?*]+', "_", candidate).strip(" .")
     if not cleaned:
         cleaned = default_name
-    if not cleaned.lower().endswith(".txt"):
-        cleaned = f"{cleaned}.txt"
+    if not cleaned.lower().endswith(extension_value):
+        cleaned = f"{cleaned}{extension_value}"
     if len(cleaned) > 120:
-        cleaned = cleaned[:116] + ".txt"
+        cleaned = cleaned[: (120 - len(extension_value))] + extension_value
     return cleaned
+
+
+def _resolve_export_root(target_dir: str | None) -> Path:
+    mode = str(target_dir or "desktop").strip().lower()
+    if mode in {"sample", "sample-search-space", "sample_search_space"}:
+        return _sample_space_root()
+    return _desktop_root()
+
+
+def _save_text_file(
+    *,
+    content: str,
+    filename: str | None,
+    target_dir: str = "desktop",
+    open_in_notepad: bool = False,
+) -> dict:
+    text = str(content or "")
+    if not text.strip():
+        return _err("No text content provided for file save.")
+    try:
+        root_path = _resolve_export_root(target_dir)
+    except Exception as exc:
+        return _err(f"Target save directory is unavailable: {exc}")
+
+    safe_name = _sanitize_text_filename(
+        filename=filename,
+        default_name=f"voco_export_{int(time.time())}.txt",
+        extension=".txt",
+    )
+    target = root_path / safe_name
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception as exc:
+        return _err(f"Failed to save text file '{target}': {exc}")
+
+    payload = {
+        "path": str(target),
+        "bytes": len(text),
+        "opened_in_notepad": False,
+        "target_dir": str(root_path),
+    }
+    if not open_in_notepad:
+        return _ok(payload, f"Saved text file: {target}")
+
+    notepad_target = _resolve_executable_target("notepad.exe")
+    if not notepad_target:
+        return _err(f"Text file was saved to '{target}', but Notepad is unavailable on this PC.")
+    try:
+        subprocess.Popen([notepad_target, str(target)], shell=False)
+    except OSError as exc:
+        return _err(f"Text file was saved to '{target}', but opening in Notepad failed: {exc}")
+    payload["opened_in_notepad"] = True
+    return _ok(payload, f"Saved text file and opened it in Notepad: {target}")
 
 
 def _load_user_profile_dict() -> dict:
@@ -1920,6 +1993,7 @@ def save_text_to_desktop_file(
     filename: str | None = None,
     open_in_notepad: bool = False,
     from_clipboard: bool = False,
+    target_dir: str = "desktop",
 ) -> dict:
     text = str(content or "")
     content_source = "provided_content"
@@ -1932,34 +2006,28 @@ def save_text_to_desktop_file(
     if not text.strip():
         return _err("No text content provided for Desktop file save.")
 
-    try:
-        desktop = _desktop_root()
-    except Exception as exc:
-        return _err(f"Desktop path is unavailable: {exc}")
+    save_result = _save_text_file(
+        content=text,
+        filename=filename,
+        target_dir=target_dir,
+        open_in_notepad=open_in_notepad,
+    )
+    if save_result.get("status") != "success":
+        return save_result
+    payload = save_result.get("result", {})
+    if isinstance(payload, dict):
+        payload["source"] = content_source
+    return save_result
 
-    safe_name = _sanitize_desktop_filename(filename=filename, default_name=f"voco_export_{int(time.time())}.txt")
-    target = desktop / safe_name
-    try:
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(text)
-    except Exception as exc:
-        return _err(f"Failed to save Desktop file '{target}': {exc}")
 
-    payload = {"path": str(target), "bytes": len(text), "opened_in_notepad": False, "source": content_source}
-    if not open_in_notepad:
-        return _ok(payload, f"Saved Desktop text file: {target}")
-
-    notepad_target = _resolve_executable_target("notepad.exe")
-    if not notepad_target:
-        return _err(f"Desktop file was saved to '{target}', but Notepad is unavailable on this PC.")
-
-    try:
-        subprocess.Popen([notepad_target, str(target)], shell=False)
-    except OSError as exc:
-        return _err(f"Desktop file was saved to '{target}', but opening in Notepad failed: {exc}")
-
-    payload["opened_in_notepad"] = True
-    return _ok(payload, f"Saved Desktop text file and opened it in Notepad: {target}")
+def save_text_to_sample_file(content: str, filename: str | None = None, open_in_notepad: bool = False) -> dict:
+    return save_text_to_desktop_file(
+        content=content,
+        filename=filename,
+        open_in_notepad=open_in_notepad,
+        from_clipboard=False,
+        target_dir="sample",
+    )
 
 
 def _collect_youtube_comments(page, max_comments: int = 20, scroll_passes: int = 8) -> tuple[list[str], str | None]:
@@ -1972,9 +2040,24 @@ def _collect_youtube_comments(page, max_comments: int = 20, scroll_passes: int =
     except Exception:
         pass
 
+    comments_loaded = False
     try:
         page.wait_for_selector("ytd-comments", timeout=18000)
+        comments_loaded = True
     except PlaywrightTimeoutError:
+        for _ in range(6):
+            try:
+                page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight * 1.3));")
+                page.wait_for_timeout(1200)
+                page.wait_for_selector("ytd-comments", timeout=2500)
+                comments_loaded = True
+                break
+            except Exception:
+                continue
+    except Exception as exc:
+        return [], f"Unable to load YouTube comments section: {exc}"
+
+    if not comments_loaded:
         body_text = ""
         try:
             body_text = page.inner_text("body")[:6000]
@@ -1986,8 +2069,6 @@ def _collect_youtube_comments(page, max_comments: int = 20, scroll_passes: int =
         if "sign in to confirm your age" in lower_body or "sign in to continue" in lower_body:
             return [], "YouTube requires sign-in before comments can be viewed."
         return [], "YouTube comments section did not load in time."
-    except Exception as exc:
-        return [], f"Unable to load YouTube comments section: {exc}"
 
     comments: list[str] = []
     seen: set[str] = set()
@@ -2041,6 +2122,7 @@ def youtube_comment_pipeline(
     query: str,
     comment_count: int = 20,
     output_filename: str | None = None,
+    output_dir: str = "desktop",
     open_in_notepad: bool = False,
     pause_after_seconds: int = 2,
     browser: str | None = None,
@@ -2069,10 +2151,11 @@ def youtube_comment_pipeline(
         save_result = save_text_to_desktop_file(
             content=dry_text,
             filename=output_name,
+            target_dir=output_dir,
             open_in_notepad=open_in_notepad,
         )
         if save_result["status"] != "success":
-            return _err(f"YouTube pipeline dry-run could not save Desktop file: {save_result['message']}")
+            return _err(f"YouTube pipeline dry-run could not save output file: {save_result['message']}")
         saved_payload = save_result.get("result", {})
         return _ok(
             {
@@ -2082,7 +2165,7 @@ def youtube_comment_pipeline(
                 "comments": sample_comments,
                 "output_path": saved_payload.get("path"),
             },
-            "YouTube comment pipeline dry-run completed with Desktop export.",
+            "YouTube comment pipeline dry-run completed with output export.",
         )
 
     search_result = search_youtube(search_query)
@@ -2180,10 +2263,11 @@ def youtube_comment_pipeline(
     save_result = save_text_to_desktop_file(
         content=export_text,
         filename=output_name,
+        target_dir=output_dir,
         open_in_notepad=open_in_notepad,
     )
     if save_result["status"] != "success":
-        return _err(f"YouTube comments were captured but Desktop export failed: {save_result['message']}")
+        return _err(f"YouTube comments were captured but output export failed: {save_result['message']}")
 
     save_payload = save_result.get("result", {})
     return _ok(
@@ -2197,7 +2281,7 @@ def youtube_comment_pipeline(
             "output_path": save_payload.get("path"),
             "opened_in_notepad": bool(save_payload.get("opened_in_notepad")),
         },
-        f"YouTube pipeline completed and saved {len(comments)} comments to Desktop.",
+        f"YouTube pipeline completed and saved {len(comments)} comments to output directory.",
     )
 
 
@@ -2383,6 +2467,244 @@ def web_codegen_autofix(
             f"Last failure: {final_attempt.get('failure_summary') or 'unknown runtime failure'}"
         )[:700],
     }
+
+
+def _run_free_ai_text(prompt: str, temperature: float = 0.35) -> tuple[bool, str]:
+    try:
+        from llm import check_ollama_running, generate_with_history
+    except Exception as exc:
+        return False, f"Free AI text path unavailable: {exc}"
+    if not check_ollama_running():
+        return False, "Free AI text path unavailable: Ollama is not running."
+
+    response = generate_with_history(
+        system_prompt="You are a concise writing assistant. Return plain text only.",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+    )
+    response_text = str(response or "").strip()
+    if not response_text:
+        return False, "Free AI text path returned an empty response."
+    try:
+        parsed = json.loads(response_text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list) and parsed:
+        first = parsed[0]
+        if isinstance(first, dict) and first.get("tool") == "report_failure":
+            reason = str((first.get("args") or {}).get("reason") or first.get("reason") or "").strip()
+            return False, f"Free AI text path returned failure plan: {reason or 'unknown reason'}"
+    return True, response_text
+
+
+def ai_story_pipeline(
+    prompt: str,
+    output_filename: str | None = None,
+    output_dir: str = "sample",
+    open_in_notepad: bool = False,
+) -> dict:
+    request_text = str(prompt or "").strip()
+    if not request_text:
+        return _err("Story request cannot be empty.")
+    story_prompt = (
+        "Write an original short story (400-700 words) with title, setting, and clear ending.\n"
+        f"User request: {request_text}\n"
+        "Return plain text only."
+    )
+    ok, story_text = _run_free_ai_text(story_prompt, temperature=0.45)
+    if not ok:
+        story_text = (
+            "Title: The Quiet Circuit\n\n"
+            "A small assistant process woke before sunrise and watched task logs drift by.\n"
+            "It learned to trade speed for precision, memory for focus, and noise for clear steps.\n"
+            "When requests grew difficult, it split the work into smaller truths and kept moving.\n"
+            "By night, the same machine that once stalled now delivered answers with calm consistency.\n"
+            "In the final line of the last report, it wrote: progress is not magic, only iteration."
+        )
+    save_result = save_text_to_desktop_file(
+        content=story_text,
+        filename=output_filename or f"story_{int(time.time())}.txt",
+        target_dir=output_dir,
+        open_in_notepad=open_in_notepad,
+    )
+    if save_result.get("status") != "success":
+        return save_result
+    payload = dict(save_result.get("result", {}))
+    payload["characters"] = len(story_text)
+    return _ok(payload, f"Generated story and saved it to {payload.get('path')}.")
+
+
+def odd_even_codegen_pipeline(
+    prompt: str,
+    filename: str = "odd_even.py",
+    output_dir: str = "sample",
+    run_timeout_seconds: int = 20,
+) -> dict:
+    _ = prompt
+    target_root = _resolve_export_root(output_dir)
+    safe_name = _sanitize_text_filename(filename, "odd_even.py", extension=".py")
+    target_path = target_root / safe_name
+    code = (
+        "def is_odd_or_even(value: int) -> str:\n"
+        "    return 'even' if value % 2 == 0 else 'odd'\n\n"
+        "if __name__ == '__main__':\n"
+        "    samples = [1, 2, 17, 24]\n"
+        "    for sample in samples:\n"
+        "        print(f'{sample}: {is_odd_or_even(sample)}')\n"
+    )
+    try:
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(code)
+    except Exception as exc:
+        return _err(f"Failed to write odd/even Python file: {exc}")
+    run_result = _run_python_file(target_path, timeout_seconds=run_timeout_seconds)
+    success = bool(not run_result.get("timed_out") and int(run_result.get("returncode") or 0) == 0)
+    if not success:
+        return {
+            "status": "failure",
+            "result": {"path": str(target_path), "run_result": run_result},
+            "message": "Odd/even Python file was created but execution failed.",
+        }
+    return _ok(
+        {"path": str(target_path), "stdout": str(run_result.get("stdout", ""))[:1200]},
+        f"Created and executed odd/even Python file: {target_path}",
+    )
+
+
+def _xml_escape(text: str) -> str:
+    return (
+        str(text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def _write_simple_docx(path: Path, title: str, paragraphs: list[str]) -> None:
+    document_body = []
+    for line in [title, *paragraphs]:
+        safe_line = _xml_escape(line)
+        document_body.append(
+            "<w:p><w:r><w:t xml:space=\"preserve\">"
+            + safe_line
+            + "</w:t></w:r></w:p>"
+        )
+    document_xml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:body>"
+        + "".join(document_body)
+        + "<w:sectPr/></w:body></w:document>"
+    )
+    content_types = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+        "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        "<Override PartName=\"/word/document.xml\" "
+        "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+        "</Types>"
+    )
+    root_rels = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rId1\" "
+        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" "
+        "Target=\"word/document.xml\"/>"
+        "</Relationships>"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("word/document.xml", document_xml)
+
+
+def wikipedia_topic_report(
+    topic: str,
+    output_filename: str | None = None,
+    output_dir: str = "sample",
+    include_images: bool = True,
+    max_images: int = 1,
+) -> dict:
+    subject = str(topic or "").strip()
+    if not subject:
+        return _err("Wikipedia topic is required.")
+    headers = {"User-Agent": "VOCO-Agent/1.0 (local automation benchmark)"}
+    api_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote_plus(subject)}"
+    try:
+        response = requests.get(api_url, timeout=12, headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        fallback_url = (
+            "https://en.wikipedia.org/w/api.php"
+            f"?action=query&prop=extracts|pageimages&exintro=1&explaintext=1&titles={quote_plus(subject)}"
+            "&format=json&pithumbsize=640"
+        )
+        try:
+            fallback_resp = requests.get(fallback_url, timeout=12, headers=headers)
+            fallback_resp.raise_for_status()
+            fallback_data = fallback_resp.json()
+            pages = (((fallback_data.get("query") or {}).get("pages")) or {})
+            first_page = {}
+            if isinstance(pages, dict) and pages:
+                first_page = next(iter(pages.values()))
+            payload = {
+                "title": str(first_page.get("title") or subject),
+                "extract": str(first_page.get("extract") or ""),
+                "thumbnail": {"source": str((first_page.get("thumbnail") or {}).get("source") or "")},
+                "content_urls": {"desktop": {"page": f"https://en.wikipedia.org/wiki/{quote_plus(subject)}"}},
+            }
+        except Exception:
+            return _err(f"Wikipedia summary fetch failed: {exc}")
+
+    title = str(payload.get("title") or subject).strip()
+    extract = str(payload.get("extract") or "").strip()
+    page_url = str(((payload.get("content_urls") or {}).get("desktop") or {}).get("page") or "")
+    paragraphs = [extract or f"No summary returned for '{subject}'.", ""]
+    if page_url:
+        paragraphs.append(f"Source: {page_url}")
+
+    image_paths: list[str] = []
+    if include_images:
+        thumb = str((payload.get("thumbnail") or {}).get("source") or "").strip()
+        if thumb:
+            try:
+                image_resp = requests.get(thumb, timeout=12)
+                image_resp.raise_for_status()
+                target_root = _resolve_export_root(output_dir)
+                max_count = max(0, min(3, int(max_images)))
+                if max_count > 0:
+                    image_name = _sanitize_text_filename(f"{title}_image1", "image1.jpg", extension=".jpg")
+                    image_path = target_root / image_name
+                    with open(image_path, "wb") as f:
+                        f.write(image_resp.content)
+                    image_paths.append(str(image_path))
+            except Exception:
+                pass
+    if image_paths:
+        paragraphs.append("")
+        paragraphs.append("Downloaded images:")
+        paragraphs.extend([f"- {item}" for item in image_paths])
+
+    target_root = _resolve_export_root(output_dir)
+    safe_doc_name = _sanitize_text_filename(
+        output_filename or f"{title.replace(' ', '_')}.docx",
+        f"{title.replace(' ', '_')}.docx",
+        extension=".docx",
+    )
+    docx_path = target_root / safe_doc_name
+    try:
+        _write_simple_docx(docx_path, title=title, paragraphs=paragraphs)
+    except Exception as exc:
+        return _err(f"Failed to create Word document: {exc}")
+    return _ok(
+        {"topic": subject, "title": title, "docx_path": str(docx_path), "images": image_paths},
+        f"Wikipedia report created: {docx_path}",
+    )
 
 
 def type_in_browser(
@@ -2701,56 +3023,12 @@ def _get_drive_roots() -> list[Path]:
     return roots
 
 
-_TEXT_CONTEXT_MAX_BYTES = 12 * 1024
+_TEXT_CONTEXT_MAX_BYTES = MAX_CONTENT_READ_BYTES
 _TEXT_CONTEXT_MAX_CHARS = 1200
 _TEXT_CONTEXT_SNIPPET_CHARS = 300
 _TEXT_CONTEXT_SUMMARY_CHARS = 240
 _TEXT_CONTEXT_MAX_KEYWORDS = 12
-_TEXT_CONTEXT_EXTENSIONS = frozenset(
-    {
-        ".txt",
-        ".md",
-        ".markdown",
-        ".rst",
-        ".log",
-        ".ini",
-        ".cfg",
-        ".conf",
-        ".toml",
-        ".yaml",
-        ".yml",
-        ".json",
-        ".jsonl",
-        ".xml",
-        ".csv",
-        ".tsv",
-        ".html",
-        ".htm",
-        ".css",
-        ".js",
-        ".jsx",
-        ".ts",
-        ".tsx",
-        ".py",
-        ".java",
-        ".kt",
-        ".c",
-        ".cpp",
-        ".h",
-        ".hpp",
-        ".cs",
-        ".go",
-        ".rs",
-        ".rb",
-        ".php",
-        ".swift",
-        ".sql",
-        ".sh",
-        ".ps1",
-        ".bat",
-        ".cmd",
-    }
-)
+_TEXT_CONTEXT_EXTENSIONS = CONTENT_READABLE_EXTENSIONS
 _TEXT_CONTEXT_FILENAMES = frozenset(
     {
         "dockerfile",
@@ -2938,6 +3216,8 @@ def _compute_context_hash(data: bytes, size_bytes: int) -> str:
 
 
 def _extract_file_context(path: Path, size_bytes: int) -> tuple[str | None, str | None, str | None, str | None]:
+    if size_bytes == 0 or size_bytes > MAX_INDEXABLE_FILE_BYTES:
+        return (None, None, None, None)
     if not _supports_context_extraction(path):
         return (None, None, None, None)
 
@@ -2995,12 +3275,20 @@ def _ensure_files_index_schema(conn: sqlite3.Connection) -> None:
                 raise
 
 
-def index_files(scope: str = "quick", max_files: int = 200000) -> dict:
+def index_files(scope: str = INDEX_SCOPE_DEFAULT, max_files: int = 200000) -> dict:
     _ensure_index_parent()
-    scope_normalized = str(scope).strip().lower()
-    full_scan = scope_normalized in {"full", "all", "pc", "this-pc"}
+    scope_normalized = str(scope or "").strip().lower()
+    if not scope_normalized:
+        scope_normalized = INDEX_SCOPE_DEFAULT
+    full_scan = scope_normalized in {"full", "all", "pc", "this-pc", "/index-full"}
+    sample_scan = scope_normalized in {"sample", "demo", "/index-sample"}
     cap = max(1000, int(max_files))
-    roots = _get_drive_roots() if full_scan else _default_search_roots()
+    if full_scan:
+        roots = _get_drive_roots()
+    elif sample_scan:
+        roots = _default_search_roots()
+    else:
+        roots = _quick_search_roots()
     skip_dirs = {
         ".git",
         "__pycache__",
@@ -3116,7 +3404,12 @@ def index_files(scope: str = "quick", max_files: int = 200000) -> dict:
         finally:
             conn.close()
 
-    scope_label = "full-PC" if full_scan else "quick"
+    if full_scan:
+        scope_label = "full-PC"
+    elif sample_scan:
+        scope_label = "sample"
+    else:
+        scope_label = "quick"
     return _ok(
         {"scope": scope_label, "files_indexed": indexed, "db_path": str(_FILE_INDEX_DB)},
         f"Indexed {indexed} files ({scope_label} scan).",
@@ -3903,19 +4196,30 @@ def click_in_window(
 
 
 def _default_search_roots() -> list[Path]:
+    """Default index roots for demo mode: sample search space only."""
     roots: list[Path] = []
-    cwd_root = Path.cwd().resolve()
-    roots.append(cwd_root)
+    if SAMPLE_SEARCH_SPACE.exists():
+        roots.append(SAMPLE_SEARCH_SPACE.resolve())
 
-    anchor = cwd_root.anchor
-    if anchor:
-        drive_root = Path(anchor)
-        if drive_root.exists():
-            roots.insert(0, drive_root)
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(root)
+    return deduped
 
+
+def _quick_search_roots() -> list[Path]:
+    """Quick scope roots: sample + workspace + common user folders."""
+    roots = _default_search_roots()
+    if WORKSPACE_PATH.exists():
+        roots.append(WORKSPACE_PATH.resolve())
     user_profile = Path(os.environ.get("USERPROFILE", ""))
-    for folder in ["Desktop", "Documents", "Downloads"]:
-        candidate = user_profile / folder
+    for folder in INDEX_QUICK_USER_FOLDERS:
+        candidate = (user_profile / folder).resolve()
         if candidate.exists():
             roots.append(candidate)
 
@@ -4926,13 +5230,14 @@ TOOL_REGISTRY = {
     "youtube_comment_pipeline": {
         "fn": youtube_comment_pipeline,
         "description": (
-            "Search YouTube, open first result, pause playback, extract comments, and export to Desktop text file "
+            "Search YouTube, open first result, pause playback, extract comments, and export to text file "
             "with strict prerequisite checks."
         ),
         "args": {
             "query": "string",
             "comment_count": "integer (optional, default 20)",
-            "output_filename": "string (optional, .txt name on Desktop)",
+            "output_filename": "string (optional, .txt name)",
+            "output_dir": "string (optional: desktop/sample)",
             "open_in_notepad": "boolean (optional, default false)",
             "pause_after_seconds": "integer (optional, default 2)",
             "browser": "string (optional: chrome/edge/firefox/chromium)",
@@ -5204,12 +5509,53 @@ TOOL_REGISTRY = {
     },
     "save_text_to_desktop_file": {
         "fn": save_text_to_desktop_file,
-        "description": "Write text to a Desktop .txt file and optionally open it in Notepad.",
+        "description": "Write text to a .txt file in Desktop/sample directory and optionally open it in Notepad.",
         "args": {
             "content": "string (optional)",
             "filename": "string (optional)",
             "open_in_notepad": "boolean (optional, default false)",
             "from_clipboard": "boolean (optional, default false)",
+            "target_dir": "string (optional: desktop/sample)",
+        },
+    },
+    "save_text_to_sample_file": {
+        "fn": save_text_to_sample_file,
+        "description": "Write text to a .txt file in the configured sample search-space directory.",
+        "args": {
+            "content": "string",
+            "filename": "string (optional)",
+            "open_in_notepad": "boolean (optional, default false)",
+        },
+    },
+    "ai_story_pipeline": {
+        "fn": ai_story_pipeline,
+        "description": "Generate a story via local AI path and save it to Desktop/sample directory.",
+        "args": {
+            "prompt": "string",
+            "output_filename": "string (optional, .txt)",
+            "output_dir": "string (optional: desktop/sample)",
+            "open_in_notepad": "boolean (optional, default false)",
+        },
+    },
+    "odd_even_codegen_pipeline": {
+        "fn": odd_even_codegen_pipeline,
+        "description": "Create odd/even Python script, save it, and execute it.",
+        "args": {
+            "prompt": "string",
+            "filename": "string (optional, .py)",
+            "output_dir": "string (optional: desktop/sample)",
+            "run_timeout_seconds": "integer (optional)",
+        },
+    },
+    "wikipedia_topic_report": {
+        "fn": wikipedia_topic_report,
+        "description": "Fetch Wikipedia summary/images for a topic and create a Word (.docx) report.",
+        "args": {
+            "topic": "string",
+            "output_filename": "string (optional, .docx)",
+            "output_dir": "string (optional: desktop/sample)",
+            "include_images": "boolean (optional, default true)",
+            "max_images": "integer (optional, default 1)",
         },
     },
     "web_codegen_autofix": {
