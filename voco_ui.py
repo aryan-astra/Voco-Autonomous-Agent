@@ -551,10 +551,24 @@ class VocoApp(App):
         tree = self.query_one("#task-tree", Tree)
         tree.clear()
         root = tree.root
-        for idx, step in enumerate(context.decomposed_steps or [], start=1):
+        steps = list(context.decomposed_steps or [])
+        if not steps:
+            for item in context.steps:
+                if not isinstance(item, dict):
+                    continue
+                tool = str(item.get("tool", "")).strip() or "step"
+                reason = str(item.get("reason", "")).strip()
+                label = f"{tool} - {reason}" if reason else tool
+                steps.append(label)
+        if not steps:
+            root.add("[#7E7E81]Waiting for plan...[/]")
+            tree.refresh()
+            return
+
+        for idx, step in enumerate(steps, start=1):
             status = "pending"
             color = "#F4C96A"
-            for res in context.tool_results:
+            for res in reversed(context.tool_results):
                 if res.get("step") == idx:
                     nested = res.get("result", {}) if isinstance(res.get("result"), dict) else {}
                     status = str(nested.get("status", res.get("status", "unknown")))

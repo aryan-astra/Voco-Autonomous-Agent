@@ -408,7 +408,11 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
     if HUMAN_APPROVAL_DISABLED:
         emit("[VOCO] Autonomous mode active: human approval prompts are disabled.", "info")
 
+    planning_phase_started_at = time.perf_counter()
+    emit("[VOCO] Decomposing and routing task...", "info")
     tool_first_bundle = _build_tool_first_hybrid_plan(task=task, context=context, emit=emit)
+    planning_phase_elapsed = time.perf_counter() - planning_phase_started_at
+    emit(f"[VOCO] Decompose/route phase completed in {planning_phase_elapsed:.1f}s.", "info")
     local_plan = _build_local_fastpath_plan(task) if tool_first_bundle is None else None
 
     if tool_first_bundle is not None:
@@ -680,11 +684,64 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
     max_steps_to_run = len(bounded_plan)
     max_step_retries = max(0, int(MAX_RETRIES))
     emit(f"[VOCO] Plan has {len(plan)} steps. Executing up to {max_steps_to_run}.", "info")
+    if not context.decomposed_steps and bounded_plan:
+        seeded_steps: list[str] = []
+        for plan_step in bounded_plan:
+            if not isinstance(plan_step, dict):
+                continue
+            seeded_tool = str(plan_step.get("tool", "")).strip() or "step"
+            seeded_args = plan_step.get("args", {})
+            if not isinstance(seeded_args, dict):
+                seeded_args = {}
+            seeded_reason = _normalize_whitespace(str(plan_step.get("reason", "")).strip())
+            seeded_label = f"{seeded_tool}({_format_args_preview(seeded_tool, seeded_args)})"
+            if seeded_reason:
+                seeded_label = f"{seeded_label} - {seeded_reason}"
+            seeded_steps.append(seeded_label)
+        if seeded_steps:
+            context.decomposed_steps = seeded_steps
 
     steps_completed = 0
     injected_step_counter = 0
     execution_failed = False
     final_output = ""
+
+    def _upsert_step_result_entry(
+        *,
+        step_index: int,
+        tool_name: str,
+        safe_args: dict,
+        policy_metadata: dict,
+        retry_metadata: dict,
+        result_payload: dict,
+        compact_outcome: str,
+    ) -> None:
+        target_index = None
+        for idx in range(len(context.tool_results) - 1, -1, -1):
+            candidate = context.tool_results[idx]
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                candidate_step = int(candidate.get("step", -1))
+            except (TypeError, ValueError):
+                continue
+            if candidate_step == step_index and not bool(candidate.get("_injected")):
+                target_index = idx
+                break
+        entry = {
+            "step": step_index,
+            "tool": tool_name,
+            "args": safe_args,
+            "access_level": policy_metadata["access_level"],
+            "policy": policy_metadata,
+            "result": result_payload,
+            "compact_outcome": compact_outcome,
+            "retry": retry_metadata,
+        }
+        if target_index is None:
+            context.tool_results.append(entry)
+        else:
+            context.tool_results[target_index] = entry
 
     for index, step in enumerate(bounded_plan, start=1):
         requires_approval = False
@@ -782,6 +839,28 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 f"{tool_name}({_format_args_preview(tool_name, tool_args)}) - {step_reason}"
             ),
             "step",
+        )
+        safe_tool_args = _sanitize_tool_args(tool_name=tool_name, args=tool_args)
+        initial_retry_metadata = {
+            "max_retries": max_step_retries,
+            "retry_count": 0,
+            "retries_exhausted": False,
+            "trigger_failure_class": "",
+            "known_fix": "",
+            "attempts": [],
+        }
+        _upsert_step_result_entry(
+            step_index=index,
+            tool_name=tool_name,
+            safe_args=safe_tool_args,
+            policy_metadata=policy_metadata,
+            retry_metadata=initial_retry_metadata,
+            result_payload={
+                "status": "running",
+                "result": None,
+                "message": f"Running step {index}/{max_steps_to_run}.",
+            },
+            compact_outcome=f"Step {index}: {tool_name} running",
         )
 
         retry_attempts: list[dict] = []
@@ -908,7 +987,6 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 }
             )
 
-        safe_tool_args = _sanitize_tool_args(tool_name=tool_name, args=tool_args)
         context.steps.append(
             {
                 "step": index,
@@ -926,17 +1004,14 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
             result=result,
             max_tokens=_DEFAULT_TOOL_RESULT_SUMMARY_TOKENS,
         )
-        context.tool_results.append(
-            {
-                "step": index,
-                "tool": tool_name,
-                "args": safe_tool_args,
-                "access_level": policy_metadata["access_level"],
-                "policy": policy_metadata,
-                "result": summarized_result,
-                "compact_outcome": summarize_step_outcome(index, tool_name, result),
-                "retry": retry_metadata,
-            }
+        _upsert_step_result_entry(
+            step_index=index,
+            tool_name=tool_name,
+            safe_args=safe_tool_args,
+            policy_metadata=policy_metadata,
+            retry_metadata=retry_metadata,
+            result_payload=summarized_result,
+            compact_outcome=summarize_step_outcome(index, tool_name, result),
         )
         _record_user_profile_step(
             tool_name=tool_name,
@@ -1934,6 +2009,7 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
     structured_steps: list[dict[str, str]] = []
     if callable(decompose_task_structured):
         try:
+            emit("[VOCO] Running structured decomposition...", "info")
             structured_candidate = decompose_task_structured(
                 normalized_task,
                 max_steps=MAX_STEPS,
@@ -1947,6 +2023,7 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
             structured_steps = []
 
     if not structured_steps:
+        emit("[VOCO] Structured decomposition unavailable, using fallback splitter...", "info")
         split_steps = decompose_task(
             normalized_task,
             max_steps=MAX_STEPS,
@@ -2142,6 +2219,7 @@ def _build_tool_first_hybrid_plan(task: str, context: AgentContext, emit) -> dic
         )
 
     if unresolved_steps:
+        emit(f"[VOCO] Planning {len(unresolved_steps)} unresolved step(s) with {OLLAMA_MODEL}...", "info")
         if not check_ollama_running():
             return _finalize_bundle(
                 confidence=0.82,
