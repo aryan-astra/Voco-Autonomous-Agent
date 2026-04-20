@@ -8,6 +8,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.widgets import Footer, Input, Label, RichLog, Rule, Static, Tree
 
 import constants
@@ -299,7 +300,10 @@ class VocoApp(App):
             self._voice_agent = None
             self._voice_enabled = False
             self._ptt_recording = False
-        self._set_voice_status_indicator("OFF")
+        try:
+            self._set_voice_status_indicator("OFF")
+        except NoMatches:
+            pass
 
     def _animate_mascot(self) -> None:
         """Animate mascot while dashboard is visible for subtle liveliness."""
@@ -416,18 +420,27 @@ class VocoApp(App):
         color: str = "#7E7E81",
     ) -> None:
         suffix = f" ({detail})" if detail else ""
-        indicator = self.query_one("#voice-status", Label)
+        try:
+            indicator = self.query_one("#voice-status", Label)
+        except NoMatches:
+            return
         indicator.update(f"Voice: {status}{suffix}")
         indicator.styles.color = color
 
     def _set_text_model_indicator(self, model_name: str, color: str = "#7E7E81") -> None:
-        indicator = self.query_one("#text-model", Label)
+        try:
+            indicator = self.query_one("#text-model", Label)
+        except NoMatches:
+            return
         resolved = str(model_name or constants.OLLAMA_MODEL).strip() or constants.OLLAMA_MODEL
         indicator.update(f"Text model: {resolved}")
         indicator.styles.color = color
 
     def _set_voice_model_indicator(self, model_name: str, color: str = "#7E7E81") -> None:
-        indicator = self.query_one("#voice-model", Label)
+        try:
+            indicator = self.query_one("#voice-model", Label)
+        except NoMatches:
+            return
         resolved = str(model_name or "unknown").strip() or "unknown"
         indicator.update(f"Voice model: {resolved}")
         indicator.styles.color = color
