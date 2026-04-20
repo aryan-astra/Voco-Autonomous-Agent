@@ -17,7 +17,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
-from textual.widgets import Footer, Input, Label, RichLog, Rule, Static, Tree
+from textual.widgets import Footer, Input, Label, RichLog, Rule, Static
 
 import constants
 from context import AgentContext
@@ -35,6 +35,7 @@ class VocoApp(App):
         Binding("c", "clear_log", "Clear", show=True),
         Binding("q", "quit", "Quit", show=True),
     ]
+    TASK_SPINNER_FRAMES = ["|", "/", "-", "\\"]
 
     # Mascot — 2 frames: eyes open / blink.
     MASCOT_FRAMES = [
@@ -132,12 +133,12 @@ class VocoApp(App):
         margin: 0 0 1 0;
     }
 
-    #task-tree {
+    #task-progress-panel {
         width: 100%;
         height: 1fr;
         color: #D4D4D4;
         border: dashed #3A3A3A;
-        padding: 0 1;
+        padding: 1 1;
     }
 
     .section-title {
@@ -233,6 +234,7 @@ class VocoApp(App):
     def __init__(self) -> None:
         super().__init__()
         self._mascot_index = 0
+        self._task_anim_index = 0
         self._task_queue: queue.Queue[str | None] = queue.Queue()
         self._worker_stop = threading.Event()
         self._worker_thread = threading.Thread(target=self._task_worker_loop, daemon=True)
@@ -266,7 +268,7 @@ class VocoApp(App):
                         # Right activity/information column.
                         with Vertical(id="right-column"):
                             yield Label("Task Progress", classes="section-title")
-                            yield Tree("Task Progress", id="task-tree")
+                            yield Static("Task engine active\n\nStatus: Idle\nWaiting for plan...", id="task-progress-panel")
 
                 # Conversation log remains visible and scrollable under dashboard.
                 with Container(id="conversation"):
@@ -287,6 +289,7 @@ class VocoApp(App):
         self.query_one("#command-input", Input).focus()
         self._set_text_model_indicator(constants.OLLAMA_MODEL)
         self.set_interval(1.2, self._animate_mascot)
+        self.set_interval(0.18, self._tick_task_animation)
         self._fs_watcher_observer = start_fs_watcher()
         if not self._worker_thread.is_alive():
             self._worker_thread.start()
@@ -569,10 +572,16 @@ class VocoApp(App):
             return
         self.call_from_thread(self._handle_user_input, command)
 
+    def _tick_task_animation(self) -> None:
+        self._task_anim_index = (self._task_anim_index + 1) % len(self.TASK_SPINNER_FRAMES)
+        self._update_task_tree(_agent_context)
+
     def _update_task_tree(self, context: AgentContext) -> None:
-        tree = self.query_one("#task-tree", Tree)
-        tree.clear()
-        root = tree.root
+        try:
+            panel = self.query_one("#task-progress-panel", Static)
+        except NoMatches:
+            return
+
         steps = list(context.decomposed_steps or [])
         if not steps:
             for item in context.steps:
@@ -582,27 +591,34 @@ class VocoApp(App):
                 reason = str(item.get("reason", "")).strip()
                 label = f"{tool} - {reason}" if reason else tool
                 steps.append(label)
-        if not steps:
-            root.add(Text("Waiting for plan...", style="#7E7E81"))
-            tree.refresh()
-            return
 
-        for idx, step in enumerate(steps, start=1):
+        lines: list[str] = []
+        any_running = False
+        for idx, raw_step in enumerate(steps, start=1):
             status = "pending"
-            color = "#F4C96A"
             for res in reversed(context.tool_results):
                 if res.get("step") == idx:
                     nested = res.get("result", {}) if isinstance(res.get("result"), dict) else {}
                     status = str(nested.get("status", res.get("status", "unknown")))
                     break
+            step = " ".join(str(raw_step).split())
+            if len(step) > 62:
+                step = step[:59] + "..."
             if status == "success":
-                color = "#4CAF50"
+                prefix = "OK "
             elif status in ("error", "failure"):
-                color = "#E53935"
+                prefix = "ERR"
             elif status == "running":
-                color = "#29B6F6"
-            root.add(Text(f"[Step {idx}] {step}", style=color), expand=True)
-        tree.refresh()
+                any_running = True
+                prefix = f"{self.TASK_SPINNER_FRAMES[self._task_anim_index]}  "
+            else:
+                prefix = "... "
+            lines.append(f"[{idx:02}] {prefix} {step}")
+
+        headline_spinner = self.TASK_SPINNER_FRAMES[self._task_anim_index] if any_running else "*"
+        header = f"{headline_spinner} Task engine active"
+        body = lines if lines else ["Status: Idle", "Waiting for plan..."]
+        panel.update(Text("\n".join([header, "", *body]), style="#D4D4D4"))
 
     def _emit_to_ui(self, message: str, level: str = "info") -> None:
         """
