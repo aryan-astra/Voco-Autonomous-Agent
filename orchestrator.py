@@ -21,6 +21,8 @@ from constants import (
     MAX_RETRIES,
     MAX_STEPS,
     OLLAMA_MODEL,
+    OLLAMA_NUM_CTX_COMPLEX,
+    OLLAMA_NUM_CTX_SIMPLE,
     WORKSPACE_PATH,
 )
 from context import AgentContext
@@ -40,6 +42,9 @@ from _prompt import build_correction_prompt, build_system_prompt, parse_response
 
 _MINIMAL_CONTEXT_MAX_CHARS = 2200
 _DEFAULT_TOOL_RESULT_SUMMARY_TOKENS = 120
+_CONTEXT_COMPACTION_FAST_THRESHOLD = 0.85
+_CONTEXT_COMPACTION_MASK_THRESHOLD = 0.90
+_CONTEXT_COMPACTION_FULL_THRESHOLD = 0.99
 
 _DECOMPOSER_MODULE_PATH = Path(__file__).with_name("tools").joinpath("decomposer.py")
 _decomposer_spec = importlib.util.spec_from_file_location("task_decomposer", _DECOMPOSER_MODULE_PATH)
@@ -104,6 +109,117 @@ def _estimate_text_size(value: object) -> int:
     if isinstance(value, str):
         return len(value)
     return len(_safe_json_dumps(value))
+
+
+def _estimate_tokens(value: object) -> int:
+    chars = max(0, _estimate_text_size(value))
+    return max(1, (chars + 3) // 4)
+
+
+def _context_compaction_stage(ratio: float) -> str:
+    if ratio >= _CONTEXT_COMPACTION_FULL_THRESHOLD:
+        return "full_compaction"
+    if ratio >= _CONTEXT_COMPACTION_MASK_THRESHOLD:
+        return "observation_masking"
+    if ratio >= _CONTEXT_COMPACTION_FAST_THRESHOLD:
+        return "fast_pruning"
+    return "normal"
+
+
+def _compaction_profile_for_stage(stage: str) -> dict[str, object]:
+    if stage == "full_compaction":
+        return {
+            "memory_tokens": 42,
+            "last_result_tokens": 30,
+            "max_chars": 1280,
+            "history_depth": 1,
+            "include_last_tool": False,
+        }
+    if stage == "observation_masking":
+        return {
+            "memory_tokens": 58,
+            "last_result_tokens": 40,
+            "max_chars": 1560,
+            "history_depth": 2,
+            "include_last_tool": True,
+        }
+    if stage == "fast_pruning":
+        return {
+            "memory_tokens": 72,
+            "last_result_tokens": 55,
+            "max_chars": 1840,
+            "history_depth": 2,
+            "include_last_tool": True,
+        }
+    return {
+        "memory_tokens": 90,
+        "last_result_tokens": 80,
+        "max_chars": _MINIMAL_CONTEXT_MAX_CHARS,
+        "history_depth": 3,
+        "include_last_tool": True,
+    }
+
+
+def _estimate_context_pressure_tokens(
+    context: AgentContext,
+    task: str,
+    step: str | None,
+    last_result: object,
+) -> int:
+    total = 0
+    total += _estimate_tokens(task)
+    total += _estimate_tokens(step or "")
+    total += _estimate_tokens(last_result) if last_result is not None else 0
+
+    if isinstance(context.memory, dict) and context.memory:
+        total += _estimate_tokens(context.memory)
+    if isinstance(context.history, list) and context.history:
+        total += _estimate_tokens(context.history[-10:])
+    if isinstance(context.tool_results, list) and context.tool_results:
+        total += _estimate_tokens(context.tool_results[-8:])
+    return total
+
+
+def _build_compacted_context(
+    context: AgentContext,
+    task: str,
+    step: str | None,
+    last_result: object,
+    target_ctx_tokens: int,
+) -> tuple[str, str, dict[str, object]]:
+    max_ctx = max(512, int(target_ctx_tokens))
+    estimated_tokens = _estimate_context_pressure_tokens(
+        context=context,
+        task=task,
+        step=step,
+        last_result=last_result,
+    )
+    pressure_ratio = estimated_tokens / max_ctx
+    stage = _context_compaction_stage(pressure_ratio)
+    profile = _compaction_profile_for_stage(stage)
+
+    memory_summary = _build_memory_summary(
+        context=context,
+        max_tokens=int(profile["memory_tokens"]),
+        history_depth=int(profile["history_depth"]),
+        include_last_tool=bool(profile["include_last_tool"]),
+    )
+    prompt_context = build_minimal_context(
+        task=task,
+        step=step,
+        last_result=last_result,
+        memory_summary=memory_summary,
+        max_chars=int(profile["max_chars"]),
+        last_result_max_tokens=int(profile["last_result_tokens"]),
+    )
+    metadata = {
+        "stage": stage,
+        "estimated_tokens": estimated_tokens,
+        "target_ctx_tokens": max_ctx,
+        "pressure_ratio": round(pressure_ratio, 4),
+        "profile": profile,
+    }
+    return prompt_context, memory_summary, metadata
 
 
 def _compact_value(value: object, char_budget: int, depth: int = 0) -> object:
@@ -188,7 +304,12 @@ def summarize_step_outcome(step_index: int, tool_name: str, result: dict) -> str
     return f"{step_index}: {tool_name} [{status}] - {message}"
 
 
-def _build_memory_summary(context: AgentContext, max_tokens: int = 80) -> str:
+def _build_memory_summary(
+    context: AgentContext,
+    max_tokens: int = 80,
+    history_depth: int = 3,
+    include_last_tool: bool = True,
+) -> str:
     token_budget = _coerce_positive_int(max_tokens, 80)
     char_budget = min(2400, max(180, token_budget * 4))
     segments: list[str] = []
@@ -198,7 +319,8 @@ def _build_memory_summary(context: AgentContext, max_tokens: int = 80) -> str:
         segments.append(f"memory={_safe_json_dumps(memory_snapshot)}")
 
     if isinstance(context.history, list) and context.history:
-        history_snapshot = _compact_value(context.history[-3:], char_budget // 2)
+        depth = max(1, int(history_depth))
+        history_snapshot = _compact_value(context.history[-depth:], char_budget // 2)
         segments.append(f"history={_safe_json_dumps(history_snapshot)}")
 
     if isinstance(context.tool_results, list) and context.tool_results:
@@ -207,17 +329,25 @@ def _build_memory_summary(context: AgentContext, max_tokens: int = 80) -> str:
             compact_outcome = _normalize_whitespace(str(last_item.get("compact_outcome", "")))
             if compact_outcome:
                 segments.append(f"last_step={compact_outcome}")
-            last_payload = last_item.get("result")
-            if last_payload is not None:
-                last_summary = summarize_tool_result(last_payload, max_tokens=40)
-                segments.append(f"last_tool={_safe_json_dumps(last_summary)}")
+            if include_last_tool:
+                last_payload = last_item.get("result")
+                if last_payload is not None:
+                    last_summary = summarize_tool_result(last_payload, max_tokens=40)
+                    segments.append(f"last_tool={_safe_json_dumps(last_summary)}")
 
     if not segments:
         return "none"
     return _truncate_text(_normalize_whitespace(" | ".join(segments)), char_budget)
 
 
-def build_minimal_context(task: str, step: str | None, last_result: object, memory_summary: str) -> str:
+def build_minimal_context(
+    task: str,
+    step: str | None,
+    last_result: object,
+    memory_summary: str,
+    max_chars: int = _MINIMAL_CONTEXT_MAX_CHARS,
+    last_result_max_tokens: int = 80,
+) -> str:
     task_text = _truncate_text(_normalize_whitespace(task), 700)
     step_text = _truncate_text(_normalize_whitespace(step or ""), 340)
     memory_text = _truncate_text(_normalize_whitespace(memory_summary), 540)
@@ -227,12 +357,12 @@ def build_minimal_context(task: str, step: str | None, last_result: object, memo
         parts.append(f"CURRENT_STEP: {step_text}")
         parts.append("FOCUS: Resolve CURRENT_STEP while staying consistent with TASK.")
     if last_result is not None:
-        last_summary = summarize_tool_result(last_result, max_tokens=80)
+        last_summary = summarize_tool_result(last_result, max_tokens=last_result_max_tokens)
         parts.append(f"LAST_RESULT: {_truncate_text(_safe_json_dumps(last_summary), 900)}")
     if memory_text and memory_text != "none":
         parts.append(f"MEMORY: {memory_text}")
     parts.append("OUTPUT: Return only a JSON array of tool steps.")
-    return _truncate_text("\n".join(parts), _MINIMAL_CONTEXT_MAX_CHARS)
+    return _truncate_text("\n".join(parts), max(512, int(max_chars)))
 
 
 def run(task: str, context: AgentContext, ui_callback=None) -> str:
@@ -436,13 +566,22 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
 
         emit("[VOCO] Building context...", "info")
         system_prompt = build_system_prompt(context)
-        memory_summary = _build_memory_summary(context=context, max_tokens=90)
-        planning_context = build_minimal_context(
+        planning_context, memory_summary, compaction_meta = _build_compacted_context(
+            context=context,
             task=task,
             step="Generate a deterministic execution plan for the full task.",
             last_result=context.tool_results[-1].get("result") if context.tool_results else None,
-            memory_summary=memory_summary,
+            target_ctx_tokens=OLLAMA_NUM_CTX_COMPLEX,
         )
+        if compaction_meta["stage"] != "normal":
+            emit(
+                (
+                    "[VOCO] Context compaction applied: "
+                    f"stage={compaction_meta['stage']} "
+                    f"usage={compaction_meta['estimated_tokens']}/{compaction_meta['target_ctx_tokens']}"
+                ),
+                "info",
+            )
 
         emit("[VOCO] Generating action plan...", "info")
         raw_response = generate(system_prompt=system_prompt, user_message=planning_context)
@@ -463,6 +602,8 @@ def run(task: str, context: AgentContext, ui_callback=None) -> str:
                 step="Correct the planner output into one valid JSON array.",
                 last_result=correction_signal,
                 memory_summary=memory_summary,
+                max_chars=int(compaction_meta["profile"]["max_chars"]),
+                last_result_max_tokens=int(compaction_meta["profile"]["last_result_tokens"]),
             )
             correction_messages = [
                 {"role": "user", "content": correction_context},
@@ -1462,17 +1603,17 @@ def _resolve_click_from_state(click_step: dict, state_result: dict) -> dict:
 def _plan_single_step_with_llm(step_task: str, context: AgentContext) -> dict:
     """Use Gemma as per-step fallback planner for unresolved atomic steps."""
     system_prompt = build_system_prompt(context)
-    memory_summary = _build_memory_summary(context=context, max_tokens=80)
     last_result = None
     if context.tool_results:
         last_tool_entry = context.tool_results[-1]
         if isinstance(last_tool_entry, dict):
             last_result = last_tool_entry.get("result")
-    step_context = build_minimal_context(
+    step_context, memory_summary, compaction_meta = _build_compacted_context(
+        context=context,
         task=context.task or step_task,
         step=step_task,
         last_result=last_result,
-        memory_summary=memory_summary,
+        target_ctx_tokens=OLLAMA_NUM_CTX_SIMPLE,
     )
     raw_response = generate(system_prompt=system_prompt, user_message=step_context)
     model_used = get_last_model_used()
@@ -1492,6 +1633,8 @@ def _plan_single_step_with_llm(step_task: str, context: AgentContext) -> dict:
             step=f"Correct planner output for step: {step_task}",
             last_result=correction_signal,
             memory_summary=memory_summary,
+            max_chars=int(compaction_meta["profile"]["max_chars"]),
+            last_result_max_tokens=int(compaction_meta["profile"]["last_result_tokens"]),
         )
         correction_messages = [
             {"role": "user", "content": correction_context},
