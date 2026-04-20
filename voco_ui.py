@@ -501,7 +501,8 @@ class VocoApp(App):
         self._update_output(f"[VOCO VOICE] {message}", color_map.get(level, "white"))
 
         if level == "ready":
-            if self._voice_agent is not None and getattr(self._voice_agent, "vad_mode", "") == "webrtcvad":
+            vad_mode = str(getattr(self._voice_agent, "vad_mode", "")).strip().lower() if self._voice_agent else ""
+            if vad_mode in {"webrtcvad", "ptt-only"}:
                 self._voice_degraded = False
                 suffix = "PTT recording" if self._ptt_recording else "PTT"
                 color = "#C96B45" if self._ptt_recording else "green"
@@ -552,7 +553,7 @@ class VocoApp(App):
             elif status == "running":
                 color = "#29B6F6"
             root.add(f"[{color}][Step {idx}][/color] {step}", expand=True)
-        tree.reload()
+        tree.refresh()
 
     def _emit_to_ui(self, message: str, level: str = "info") -> None:
         """
@@ -645,7 +646,8 @@ class VocoApp(App):
             self._voice_agent.start()
             self._voice_enabled = True
             self._ptt_recording = False
-            self._voice_degraded = getattr(self._voice_agent, "vad_mode", "") != "webrtcvad"
+            vad_mode = str(getattr(self._voice_agent, "vad_mode", "")).strip().lower()
+            self._voice_degraded = vad_mode not in {"webrtcvad", "ptt-only"}
             if self._voice_degraded:
                 self._set_voice_status_indicator("DEGRADED", "PTT degraded", "yellow")
                 chat_log.write(
