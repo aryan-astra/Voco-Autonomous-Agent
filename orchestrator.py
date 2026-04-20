@@ -3967,6 +3967,12 @@ def _build_local_path_search_fastpath_plan(task: str, text: str) -> list[dict] |
         ]
     )
     file_hint = any(token in text for token in ["file", "folder", "directory", "path"])
+    web_scope_hint = any(
+        token in text
+        for token in ["chrome", "browser", "website", ".com", "http://", "https://", "chat ", "chatgpt"]
+    )
+    if web_scope_hint and not local_scope_hint:
+        return None
     if not local_scope_hint and not file_hint:
         return None
 
@@ -4017,6 +4023,19 @@ def _extract_local_path_search_query(task: str, text: str) -> str | None:
         if query:
             return query
     return None
+
+
+def _looks_like_chat_ai_target(text: str) -> bool:
+    if any(
+        token in text
+        for token in ["chatgpt", "chat gpt", "free ai", "free ai platform", "ai platform", "openai", "assistant"]
+    ):
+        return True
+    if re.search(r"\bchat[a-z0-9\-]{1,24}\.(?:com|ai|org|net)\b", text):
+        return True
+    if re.search(r"\bchat[a-z0-9\-]{0,18}(?:gpt|gpti|gpti)\b", text):
+        return True
+    return False
 
 
 def _build_index_fastpath_plan(task: str, text: str) -> list[dict] | None:
@@ -4419,16 +4438,22 @@ def _build_youtube_comment_fastpath_plan(task: str, text: str) -> list[dict] | N
 
 
 def _build_story_generation_fastpath_plan(task: str, text: str) -> list[dict] | None:
-    has_story_hint = "story" in text and any(token in text for token in ["write", "generate", "create", "prompt", "ask"])
-    has_ai_hint = any(
-        token in text
-        for token in ["chatgpt", "chat gpt", "free ai", "free ai platform", "ai platform", "openai", "assistant"]
+    has_story_hint = "story" in text and any(
+        token in text for token in ["write", "generate", "create", "prompt", "ask", "search"]
     )
+    has_ai_hint = _looks_like_chat_ai_target(text=text)
+    has_web_hint = any(token in text for token in ["chrome", "browser", "website", ".com", "http://", "https://", "go to"])
     has_save_hint = any(
         token in text
         for token in ["save", "save it", "file", "text file", "paste", "directory", "dir", "folder"]
     )
-    if not (has_story_hint and has_ai_hint and has_save_hint):
+    local_scope_hint = any(
+        token in text
+        for token in ["on my pc", "on my computer", "in my pc", "in my computer", "in this pc", "on this pc", "workspace"]
+    )
+    if not (has_story_hint and has_save_hint and (has_ai_hint or has_web_hint)):
+        return None
+    if local_scope_hint and not has_ai_hint:
         return None
 
     output_filename = _extract_txt_filename(task=task) or "ai_story.txt"
