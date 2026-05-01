@@ -4,10 +4,19 @@ updated-till-now.md
 # Local runtime/debug artifacts
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 report.*.json
 eval_report_*.json
 workspace/screenshot_*.png
 workspace/misroute_benchmark*.json
+logs/
 
 # Local memory/state artifacts
 memory/*.db
@@ -23,3 +32,11 @@ memory/vault/*
 !memory/vault/*.template.yaml
 !memory/vault/*.template.md
 !memory/vault/*.template.jsonl
+
+# Local environments
+.venv/
+venv/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
