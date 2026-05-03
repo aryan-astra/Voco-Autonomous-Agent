@@ -260,6 +260,7 @@ class VocoApp(App):
                         with Vertical(id="left-column"):
                             yield Label("Welcome back, Developer!", classes="welcome")
                             yield Static(self.MASCOT_FRAMES[0], id="mascot")
+                            yield Label(f"Version: {constants.PROJECT_VERSION}", classes="meta")
                             yield Label(f"Text model: {constants.OLLAMA_MODEL}", id="text-model", classes="meta")
                             yield Label("Voice model: probing...", id="voice-model", classes="meta")
                             yield Label(str(constants.WORKSPACE_PATH), classes="meta")
@@ -285,7 +286,7 @@ class VocoApp(App):
 
     def on_mount(self) -> None:
         # Border title is set at runtime to keep string formatting explicit.
-        self.query_one("#dashboard", Container).border_title = " VOCO v1.0.0 "
+        self.query_one("#dashboard", Container).border_title = f" VOCO v{constants.PROJECT_VERSION} "
         self.query_one("#command-input", Input).focus()
         self._set_text_model_indicator(constants.OLLAMA_MODEL)
         self.set_interval(1.2, self._animate_mascot)

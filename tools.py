@@ -4603,6 +4603,10 @@ def search_local_paths(
     timed_out = False
 
     for root in roots:
+        if kind_normalized in {"all", "folder"} and term_lower in root.name.lower():
+            matches.append({"type": "folder", "path": str(root)})
+            if len(matches) >= capped_results:
+                break
         for current, dirs, files in os.walk(root):
             if time.time() > deadline:
                 timed_out = True

@@ -1653,13 +1653,52 @@ def _route_contract_rejection_reason(task: str, plan: list[dict]) -> str:
         if (
             predicted_confidence >= ROUTE_CLASSIFIER_MIN_CONFIDENCE
             and predicted_family not in {"", "unknown"}
-            and plan_family not in {"unknown", predicted_family}
+            and not _is_classifier_family_compatible(
+                task=task,
+                plan_family=plan_family,
+                predicted_family=predicted_family,
+            )
         ):
             return (
                 "classifier_family_mismatch:"
                 f"plan={plan_family};predicted={predicted_family};confidence={predicted_confidence:.2f}"
             )
     return ""
+
+
+def _is_classifier_family_compatible(task: str, plan_family: str, predicted_family: str) -> bool:
+    normalized_plan_family = str(plan_family or "").strip()
+    normalized_predicted_family = str(predicted_family or "").strip()
+
+    if normalized_plan_family in {"", "unknown"}:
+        return True
+    if normalized_predicted_family in {"", "unknown"}:
+        return True
+    if normalized_plan_family == normalized_predicted_family:
+        return True
+
+    compatibility_pairs = {
+        ("system_control", "browser_automation"),
+        ("browser_automation", "system_control"),
+    }
+    if (normalized_plan_family, normalized_predicted_family) in compatibility_pairs:
+        return True
+
+    normalized_task = _normalize_fastpath_text(task)
+    if (
+        normalized_plan_family == "local_search"
+        and normalized_predicted_family == "code_generation"
+        and re.search(r"\b(search|find|locate|index)\b", normalized_task)
+    ):
+        return True
+    if (
+        normalized_plan_family == "code_generation"
+        and normalized_predicted_family == "local_search"
+        and re.search(r"\b(generate|create|write|run|fix)\b", normalized_task)
+    ):
+        return True
+
+    return False
 
 
 def _step_contract_violation(task: str, tool_name: str) -> str:
@@ -3630,14 +3669,16 @@ def _write_incomplete_state(task: str, plan: list, tool_results: list) -> None:
 def _normalize_fastpath_text(task: str) -> str:
     normalized = str(task or "").lower().strip()
     replacements = (
+        (r"\bopn\b", "open"),
+        (r"\bchorme\b", "chrome"),
         (r"\bnot\s+pad\b", "notepad"),
         (r"\bchat\s*g\s*p\s*t\b", "chatgpt"),
         (r"\bchat\s*gp\s*t\b", "chatgpt"),
         (r"\bchat\s*gpti\b", "chatgpt"),
-        (r"\bchat\s*gpti\b", "chatgpt"),
         (r"\bchat\s*zipiti\b", "chatgpt"),
         (r"\bchat\s*zpt\b", "chatgpt"),
         (r"\bfint\b", "find"),
+        (r"\bserch\b", "search"),
     )
     for pattern, replacement in replacements:
         normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
@@ -4185,8 +4226,17 @@ def _extract_local_path_search_query(task: str, text: str) -> str | None:
     _ = text
     def _clean_local_query(raw: str) -> str:
         cleaned = _clean_browser_action_text(raw)
+        cleaned = re.sub(
+            r"^(?:the\s+)?(?:file|files|folder|folders|directory|directories)\s+(?:in|on)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
         cleaned = re.sub(r"\b(file|files|folder|folders|directory|directories)\b$", "", cleaned, flags=re.IGNORECASE)
-        return cleaned.strip()
+        cleaned = cleaned.strip()
+        if cleaned.lower() in {"file", "files", "folder", "folders", "directory", "directories"}:
+            return ""
+        return cleaned
 
     pattern = (
         r"\b(?:search|find|locate)\s+(?:for\s+)?(.+?)"

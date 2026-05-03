@@ -9,6 +9,7 @@
 ![Runtime](https://img.shields.io/badge/Runtime-Ollama-black?style=flat-square)
 ![Model](https://img.shields.io/badge/Model-qwen3%3A4b-111827?style=flat-square)
 ![UI](https://img.shields.io/badge/UI-Textual-7C3AED?style=flat-square)
+![Version](https://img.shields.io/badge/Version-1.1.0-2563EB?style=flat-square)
 ![Status](https://img.shields.io/badge/Status-Production%20Hardening-16A34A?style=flat-square)
 
 ![VOCO UI](assets/ui-screenshot.png)
@@ -32,6 +33,8 @@ The runtime is designed around **hybrid routing**:
 2. route-family contracts and classifier guardrails
 3. tool-first decomposition
 4. LLM fallback only when needed
+
+Current release: **v1.1.0**
 
 ---
 

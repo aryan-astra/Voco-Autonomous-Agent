@@ -4,6 +4,7 @@ from pathlib import Path
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.resolve()
+PROJECT_VERSION = "1.1.0"
 WORKSPACE_PATH = BASE_DIR / "workspace"
 WORKSPACE_DIR = str(WORKSPACE_PATH)
 LOGS_DIR = BASE_DIR / "logs"
