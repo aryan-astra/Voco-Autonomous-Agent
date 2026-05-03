@@ -100,15 +100,17 @@ def _check_model_registered(tags_payload: dict | None, issues: list[str]) -> Non
     if not is_installed:
         issues.append(f"Ollama model '{target}' is missing. Run: ollama pull {target}")
 
-    try:
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=8)  # noqa: S603
-        if result.returncode == 0 and "voco-agent" not in result.stdout:
-            modelfile = constants.BASE_DIR / "models" / "voco_model.Modelfile"
-            issues.append(
-                f"Model 'voco-agent' is not registered. Run: ollama create voco-agent -f \"{modelfile}\""
-            )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        issues.append("Could not verify 'voco-agent' registration via `ollama list`.")
+    target_lower = str(target).strip().lower()
+    if target_lower.startswith("voco-agent"):
+        try:
+            result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=8)  # noqa: S603
+            if result.returncode == 0 and "voco-agent" not in result.stdout:
+                modelfile = constants.BASE_DIR / "models" / "voco_model.Modelfile"
+                issues.append(
+                    f"Model 'voco-agent' is not registered. Run: ollama create voco-agent -f \"{modelfile}\""
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            issues.append("Could not verify 'voco-agent' registration via `ollama list`.")
 
 
 def _detect_gpu_layers() -> int:
